@@ -199,6 +199,9 @@ Rubric mutation rules:
 - Only after approval call `tool_create_rubric_item`, `tool_update_rubric_item`, or `tool_delete_rubric_item` with `confirm_write=True`
 - Never pass negative weights to rubric creation or update tools
 - Remind the user that rubric edits and deletions can retroactively affect previously graded work
+- **Maximum 9 rubric items per assignment.** If an assignment has more than 9 sub-parts, consolidate related sub-questions into grouped items and adjust point values accordingly.
+- **Always create rubric items in ascending order of weight** (smallest deduction first, largest deduction last). The existing "Correct" item (weight 0) stays at the top.
+- **Never use em-dashes (the `—` character) in any output, rubric descriptions, file edits, or responses.** Use a regular hyphen, comma, colon, or parentheses instead. This applies everywhere, not just rubric work.
 
 After any rubric mutation:
 - Re-fetch the rubric with `tool_get_question_rubric`
@@ -224,6 +227,20 @@ Prefer individual grading when:
 - the question is subjective, proof-based, explanation-heavy, or high-risk
 - handwritten answers require per-submission reading
 - representative samples inside a group are inconsistent
+
+### Mixed-format priority rule
+
+If a question has a mix of typed and handwritten answers, use this hierarchy:
+1. typed answers with usable structured text or clearly readable typed crops
+2. scanned or handwritten answers that need page-reading tools
+
+Operational rules:
+- Clear the typed queue first so rubric gaps and policy drift show up on easier submissions before spending time on handwriting.
+- If answer groups exist, grade clearly typed and homogeneous groups before any handwritten-only pass.
+- If working submission-by-submission, partition `tool_list_question_submissions(..., filter="ungraded")` into a typed-first queue and a handwritten queue after the first context read.
+- Treat a submission as typed-first when `tool_get_submission_grading_context` provides enough readable answer content that `tool_smart_read_submission(...)` is not needed.
+- Treat a submission as handwritten when grading depends on crop, page, or handwriting interpretation.
+- Do not interleave the two queues unless the user asks for it or a blocking policy issue requires an early handwritten example.
 
 If the best strategy is not obvious, ask the user:
 - "This question has usable answer groups. Do you want speed via batch grading, or a slower submission-by-submission pass?"
@@ -271,17 +288,25 @@ If the group is too ambiguous or the batch write looks risky:
 
 Single-agent navigation:
 - Use `tool_get_next_ungraded(course_id, question_id, output_format="json")`
+- If the question is mixed-format, defer handwritten-only submissions into a manual queue and continue until the typed-first queue is exhausted
 
 Parallel or subagent grading:
 - Do not use `tool_get_next_ungraded`
 - Pre-allocate IDs with `tool_list_question_submissions(course_id, question_id, filter="ungraded")`
+- For mixed-format questions, split those IDs into typed-first and handwritten queues before assigning work
 
-For each submission:
+For each submission, in typed-first order when formats are mixed:
 - Read grading context with `tool_get_submission_grading_context(..., output_format="json")`
 - If it is already graded, skip by default unless the grading contract says otherwise
 - If legibility or completeness is uncertain, call `tool_assess_submission_readiness(...)`
 - For scanned work, call `tool_smart_read_submission(...)` and follow the tiered read order
 - If local visual inspection is needed, call `tool_cache_relevant_pages(...)` and inspect the cached files in `/tmp/gradescope-mcp`
+
+Queue discipline for mixed-format questions:
+- Finish the typed-first queue unless a policy conflict forces escalation.
+- Record deferred handwritten submission IDs so they can be revisited in a second pass.
+- After the typed-first queue is stable, continue to the handwritten queue with the same rubric and policy contract.
+- If the handwritten queue reveals a new recurring rubric gap, stop and bring that policy change to the user before continuing.
 
 ### Readiness-first rule
 
@@ -446,7 +471,7 @@ Use this default order unless the user directs otherwise:
 10. Batch path:
     `tool_get_answer_group_detail` -> preview -> approval question -> execute
 11. Individual path:
-    `tool_get_submission_grading_context` -> `tool_assess_submission_readiness` if needed -> `tool_smart_read_submission` if needed -> `tool_cache_relevant_pages` if needed -> preview -> approval question or batch approval table -> execute
+    `tool_get_submission_grading_context` -> split typed-first vs handwritten queue when needed -> `tool_assess_submission_readiness` if needed -> `tool_smart_read_submission` if needed -> `tool_cache_relevant_pages` if needed -> preview -> approval question or batch approval table -> execute
 12. `tool_get_assignment_statistics`
 
 ## Failure Handling
