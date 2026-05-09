@@ -380,7 +380,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.14.0" },
-    { name = "gradescopeapi", specifier = ">=1.7.0" },
+    { name = "gradescopeapi", specifier = ">=1.8.0" },
     { name = "mcp", specifier = ">=1.26.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
 ]
@@ -390,7 +390,7 @@ dev = [{ name = "pytest", specifier = ">=9.0" }]
 
 [[package]]
 name = "gradescopeapi"
-version = "1.7.0"
+version = "1.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -402,9 +402,9 @@ dependencies = [
     { name = "requests-toolbelt" },
     { name = "tzdata" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/76/e5e630020f6e23370d788d47f3078493d3bb99e5e25352d46463309d1e49/gradescopeapi-1.7.0.tar.gz", hash = "sha256:021d20a7207506f28d92e569cbb499c19b088bbe7467159bba9abaa6d87ff35a", size = 148664, upload-time = "2025-12-19T00:59:09.306Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3d/d5/f84dd9b70fc50790e6cd06f4eea58e43fa71c0a0e6f715973f160d52cd30/gradescopeapi-1.8.0.tar.gz", hash = "sha256:3a304547e45ecba2f4abfc7dd29ef71daa0d32c3a55b43e4f1cac7db2fae4bf1", size = 125936, upload-time = "2026-04-12T05:02:59.514Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/55/f0/c797493804a341bc8e4327497d3fffeac9e6b549b69f700c0752aaa79123/gradescopeapi-1.7.0-py3-none-any.whl", hash = "sha256:c423f92de2c5f561724330eef480bf6eb541d48c663a24e0f10521bdcac2d6d1", size = 25774, upload-time = "2025-12-19T00:59:08.501Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/56/c3f428085b386d6b26ea4268b2e50aa09eb720b0c759f0a0220ece9fb29e/gradescopeapi-1.8.0-py3-none-any.whl", hash = "sha256:79430374d8d792717ce153c914ebb86f1598821da660356bbf3b7a8349e4026f", size = 24085, upload-time = "2026-04-12T05:02:58.426Z" },
 ]
 
 [[package]]

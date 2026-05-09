@@ -12,6 +12,13 @@ build/
 # Environment variables
 .env
 
+# Per-project Claude Code MCP server registration (may embed credentials
+# inline as `env` entries — see `claude mcp add ... --env`).
+.mcp.json
+
+# Ad-hoc debug logs from local tooling
+tea_debug.log
+
 # IDE
 .vscode/
 .idea/
