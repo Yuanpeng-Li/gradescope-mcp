@@ -273,6 +273,9 @@ def test_apply_grade_sends_json_payload(monkeypatch) -> None:
     )
 
     assert "Grade saved" in result
+    # Negative scoring with weight 5 and rubric 100 (weight 5 deduction) → 0/5.
+    # Score is computed locally and must appear in the result instead of "?".
+    assert "**New score:** 0/5" in result
 
     # Verify JSON payload structure
     payload = captured["kwargs"]["json"]
@@ -289,6 +292,206 @@ def test_apply_grade_sends_json_payload(monkeypatch) -> None:
 
     # Verify json= was used (not data=)
     assert "data" not in captured["kwargs"]
+
+
+def _make_fake_batch_ctx_builder(posts: list, status_by_sid: dict | None = None):
+    """Build a _get_grading_context substitute that records POSTs per submission.
+
+    Returns a callable suitable for monkeypatching ``_get_grading_context``.
+    """
+    status_by_sid = status_by_sid or {}
+
+    def _builder(_course_id, _question_id, submission_id):
+        class _Session:
+            def post(self, url, **kwargs):
+                posts.append({"submission_id": submission_id, "url": url, **kwargs})
+                status = status_by_sid.get(submission_id, 200)
+                return SimpleNamespace(
+                    status_code=status,
+                    json=lambda: {"score": 1.0 if status == 200 else None},
+                    text="" if status == 200 else "boom",
+                )
+
+        return {
+            "props": {
+                "question": {"weight": 1},
+                "submission": {"score": None},
+                "evaluation": {"points": None, "comments": None},
+                "rubric_items": [
+                    {"id": 100, "description": "Correct", "weight": 0},
+                    {"id": 200, "description": "Not attempted", "weight": 1},
+                ],
+                "rubric_item_evaluations": [],
+                "urls": {"save_grade": f"/save/{submission_id}"},
+            },
+            "csrf_token": "csrf",
+            "session": _Session(),
+            "base_url": "https://example.com",
+        }
+
+    return _builder
+
+
+def test_apply_grade_batch_preview_returns_table_without_posting(monkeypatch) -> None:
+    posts: list = []
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _make_fake_batch_ctx_builder(posts),
+    )
+
+    result = grading_ops.apply_grade_batch(
+        course_id="1",
+        question_id="2",
+        grades=[
+            {"submission_id": "aa", "rubric_item_ids": ["100"], "confidence": 0.9},
+            {"submission_id": "bb", "rubric_item_ids": ["200"], "confidence": 0.95},
+        ],
+    )
+
+    assert "Write confirmation required" in result
+    assert "apply_grade_batch" in result
+    assert "rows=2" in result
+    assert "`aa`" in result and "`bb`" in result
+    assert posts == []  # no POSTs in preview mode
+
+
+def test_apply_grade_batch_applies_all_approved_rows(monkeypatch) -> None:
+    posts: list = []
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _make_fake_batch_ctx_builder(posts),
+    )
+
+    result = grading_ops.apply_grade_batch(
+        course_id="1",
+        question_id="2",
+        grades=[
+            {"submission_id": "aa", "rubric_item_ids": ["100"], "confidence": 0.9},
+            {"submission_id": "bb", "rubric_item_ids": ["200"], "confidence": 0.95},
+        ],
+        confirm_write=True,
+    )
+
+    assert "**succeeded:** 2" in result
+    assert "**failed:** 0" in result
+    assert "**skipped (confidence < 0.6):** 0" in result
+    # Real scores must appear in the result, not the legacy ``?/1`` placeholder.
+    # Negative scoring with weight 1: rubric 100 (weight 0) → 1; rubric 200 (weight 1) → 0.
+    assert "`aa`: 1/1" in result
+    assert "`bb`: 0/1" in result
+    assert "?/1" not in result
+    assert len(posts) == 2
+    sids = sorted(p["submission_id"] for p in posts)
+    assert sids == ["aa", "bb"]
+    # Verify payload structure for one row
+    payload_aa = next(p for p in posts if p["submission_id"] == "aa")["json"]
+    assert payload_aa["rubric_items"]["100"] == {"score": "true"}
+    assert payload_aa["rubric_items"]["200"] == {"score": "false"}
+
+
+def test_apply_grade_batch_surfaces_unknown_rubric_ids(monkeypatch) -> None:
+    """A row that references a rubric ID not present in the question must be flagged."""
+    posts: list = []
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _make_fake_batch_ctx_builder(posts),
+    )
+
+    result = grading_ops.apply_grade_batch(
+        course_id="1",
+        question_id="2",
+        grades=[
+            {"submission_id": "aa", "rubric_item_ids": ["100"], "confidence": 0.9},
+            # 999 does not exist on the question; should still POST and warn.
+            {"submission_id": "bb", "rubric_item_ids": ["100", "999"], "confidence": 0.9},
+        ],
+        confirm_write=True,
+    )
+
+    assert "**succeeded:** 2" in result
+    assert "Unknown rubric IDs" in result
+    # Only the bb row had unknowns — aa must not appear in the warning section.
+    warning_section = result.split("Unknown rubric IDs", 1)[1]
+    assert "`bb`" in warning_section
+    assert "'999'" in warning_section
+    assert "`aa`" not in warning_section
+
+
+def test_apply_grade_batch_low_confidence_rows_are_skipped(monkeypatch) -> None:
+    posts: list = []
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _make_fake_batch_ctx_builder(posts),
+    )
+
+    result = grading_ops.apply_grade_batch(
+        course_id="1",
+        question_id="2",
+        grades=[
+            {"submission_id": "aa", "rubric_item_ids": ["100"], "confidence": 0.9},
+            {"submission_id": "bb", "rubric_item_ids": ["100"], "confidence": 0.5},
+        ],
+        confirm_write=True,
+    )
+
+    assert "**succeeded:** 1" in result
+    assert "**skipped (confidence < 0.6):** 1" in result
+    assert [p["submission_id"] for p in posts] == ["aa"]
+    assert "`bb`: confidence=0.50" in result
+
+
+def test_apply_grade_batch_reports_http_failures(monkeypatch) -> None:
+    posts: list = []
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _make_fake_batch_ctx_builder(posts, status_by_sid={"bb": 500}),
+    )
+
+    result = grading_ops.apply_grade_batch(
+        course_id="1",
+        question_id="2",
+        grades=[
+            {"submission_id": "aa", "rubric_item_ids": ["100"]},
+            {"submission_id": "bb", "rubric_item_ids": ["100"]},
+        ],
+        confirm_write=True,
+    )
+
+    assert "**succeeded:** 1" in result
+    assert "**failed:** 1" in result
+    assert "`bb`: HTTP 500" in result
+
+
+def test_apply_grade_batch_rejects_invalid_input() -> None:
+    # Empty list.
+    assert "non-empty list" in grading_ops.apply_grade_batch("1", "2", [])
+
+    # Row with no submission_id.
+    missing_sid = grading_ops.apply_grade_batch(
+        "1", "2", [{"rubric_item_ids": ["100"]}]
+    )
+    assert "submission_id is required" in missing_sid
+
+    # Row with out-of-range confidence.
+    bad_conf = grading_ops.apply_grade_batch(
+        "1",
+        "2",
+        [
+            {"submission_id": "aa", "rubric_item_ids": ["100"], "confidence": 2.0},
+        ],
+    )
+    assert "confidence must be between 0.0 and 1.0" in bad_conf
+
+    # Row with no rubric/points/comment.
+    all_none = grading_ops.apply_grade_batch(
+        "1", "2", [{"submission_id": "aa"}]
+    )
+    assert "at least one of" in all_none
 
 
 def test_positive_scoring_context_shows_add_hint(monkeypatch) -> None:
@@ -362,23 +565,39 @@ def test_get_next_ungraded_falls_back_to_submission_listing_when_nav_is_empty(mo
     assert result == "CTX 1 2 105 json"
 
 
-def test_list_question_submissions_ungraded_filter_excludes_integer_scored_rows(
-    monkeypatch,
-) -> None:
-    submissions_html = """
+def _gradescope_table_html(rows: list[tuple[str, str, str, str]]) -> str:
+    """Build a table that mirrors Gradescope's real submissions page layout.
+
+    Columns: row index, User, Last Graded By, Sections, Score, Graded?.
+    Each ``rows`` entry is ``(idx, user, score, graded_flag)`` plus a
+    submission ID embedded in the grade link.
+    """
+    body_rows = []
+    for idx, user, score, graded_flag, sid in rows:
+        body_rows.append(
+            f"<tr>"
+            f"<td>{idx}</td>"
+            f"<td>{user}</td>"
+            f"<td>Yuanpeng Li</td>"
+            f"<td>section-a</td>"
+            f"<td>{score}</td>"
+            f"<td>{graded_flag}</td>"
+            f"<td><a href=\"/courses/1/questions/2/submissions/{sid}/grade\">grade</a></td>"
+            f"</tr>"
+        )
+    return f"""
     <table>
-      <tr>
-        <td>Alice Example</td>
-        <td>5</td>
-        <td><a href="/courses/1/questions/2/submissions/101/grade">grade</a></td>
-      </tr>
-      <tr>
-        <td>Bob Example</td>
-        <td>—</td>
-        <td><a href="/courses/1/questions/2/submissions/102/grade">grade</a></td>
-      </tr>
+      <thead>
+        <tr><th></th><th>User</th><th>Last Graded By</th><th>Sections</th><th>Score</th><th>Graded?</th><th></th></tr>
+      </thead>
+      <tbody>
+        {''.join(body_rows)}
+      </tbody>
     </table>
     """
+
+
+def _stub_grading_ops_get(monkeypatch, html: str) -> None:
     monkeypatch.setattr(
         grading_ops,
         "get_connection",
@@ -387,68 +606,211 @@ def test_list_question_submissions_ungraded_filter_excludes_integer_scored_rows(
             session=SimpleNamespace(
                 get=lambda *_args, **_kwargs: SimpleNamespace(
                     status_code=200,
-                    text=submissions_html,
+                    text=html,
                 )
             ),
         ),
     )
+
+
+def test_list_question_submissions_ungraded_filter_excludes_scored_rows(
+    monkeypatch,
+) -> None:
+    html = _gradescope_table_html([
+        ("1", "Alice Example (alice@uci.edu)", "1.0", "", "101"),
+        ("2", "Bob Example (bob@uci.edu)", "", "", "102"),
+    ])
+    _stub_grading_ops_get(monkeypatch, html)
 
     result = json.loads(grading_ops.list_question_submissions("1", "2", filter="ungraded"))
 
     assert [sub["submission_id"] for sub in result["submissions"]] == ["102"]
 
 
-def test_graded_heuristic_matches_fractional_and_integer_scores(monkeypatch) -> None:
-    """The heuristic should detect N/N scores, integer scores, and not false-positive on names."""
-    submissions_html = """
-    <table>
-      <tr>
-        <td>Alice 3rd</td>
-        <td>8/10</td>
-        <td><a href="/courses/1/questions/2/submissions/201/grade">grade</a></td>
-      </tr>
-      <tr>
-        <td>Bob Example</td>
-        <td>5</td>
-        <td><a href="/courses/1/questions/2/submissions/202/grade">grade</a></td>
-      </tr>
-      <tr>
-        <td>Carol Example</td>
-        <td>—</td>
-        <td><a href="/courses/1/questions/2/submissions/203/grade">grade</a></td>
-      </tr>
-      <tr>
-        <td>Dave 42nd</td>
-        <td></td>
-        <td><a href="/courses/1/questions/2/submissions/204/grade">grade</a></td>
-      </tr>
-    </table>
-    """
-    monkeypatch.setattr(
-        grading_ops,
-        "get_connection",
-        lambda: SimpleNamespace(
-            gradescope_base_url="https://example.com",
-            session=SimpleNamespace(
-                get=lambda *_args, **_kwargs: SimpleNamespace(
-                    status_code=200,
-                    text=submissions_html,
-                )
-            ),
-        ),
-    )
+def test_list_question_submissions_returns_real_student_names(monkeypatch) -> None:
+    """Regression: row-index column must not be returned as student_name."""
+    html = _gradescope_table_html([
+        ("1", "Adithya Rajendra (arajend3@uci.edu)", "", "", "777"),
+    ])
+    _stub_grading_ops_get(monkeypatch, html)
+
+    result = json.loads(grading_ops.list_question_submissions("1", "2"))
+
+    assert result["submissions"] == [
+        {"submission_id": "777", "student_name": "Adithya Rajendra", "graded": False}
+    ]
+
+
+def test_graded_detection_uses_score_column_not_row_index(monkeypatch) -> None:
+    """Regression: row index ``1``, ``2``, ... must not be parsed as a score."""
+    html = _gradescope_table_html([
+        ("1", "Alice (a@uci.edu)", "1.0", "", "201"),
+        ("2", "Bob (b@uci.edu)", "0.5", "", "202"),
+        ("3", "Carol (c@uci.edu)", "—", "", "203"),
+        ("4", "Dave 42nd (d@uci.edu)", "", "", "204"),
+    ])
+    _stub_grading_ops_get(monkeypatch, html)
 
     entries = grading_ops._fetch_question_submission_entries("1", "2")
     graded_map = {e["submission_id"]: e["graded"] for e in entries}
 
-    # "8/10" → graded
-    assert graded_map["201"] is True
-    # "5" → graded (integer score)
-    assert graded_map["202"] is True
-    # "—" → not graded
-    assert graded_map["203"] is False
-    # empty → not graded (name "Dave 42nd" must not false-positive)
-    assert graded_map["204"] is False
+    assert graded_map == {
+        "201": True,   # explicit numeric score
+        "202": True,   # fractional score
+        "203": False,  # em-dash placeholder
+        "204": False,  # empty score and a name containing digits — must not false-positive
+    }
+
+
+def test_compute_new_score_negative_scoring_subtracts_deductions() -> None:
+    props = {
+        "question": {"weight": 1.0, "scoring_type": "negative", "floor": True, "ceiling": True},
+        "rubric_items": [
+            {"id": "100", "weight": 0},   # "Correct" — 0 deduction
+            {"id": "200", "weight": 0.5}, # "Partial" — 0.5 deduction
+            {"id": "300", "weight": 1.0}, # "Blank" — 1.0 deduction
+        ],
+    }
+    assert grading_ops._compute_new_score(props, ["100"], None) == (1.0, set())
+    assert grading_ops._compute_new_score(props, ["200"], None) == (0.5, set())
+    assert grading_ops._compute_new_score(props, ["300"], None) == (0.0, set())
+    # Empty selection → no deduction → full credit
+    assert grading_ops._compute_new_score(props, [], None) == (1.0, set())
+    # Point adjustment stacks on top of rubric
+    assert grading_ops._compute_new_score(props, ["200"], -0.25) == (0.25, set())
+
+
+def test_compute_new_score_negative_sums_multiple_deductions() -> None:
+    """Multiple rubric items applied at once must be summed, then clamped."""
+    props = {
+        "question": {"weight": 1.0, "scoring_type": "negative", "floor": True, "ceiling": True},
+        "rubric_items": [
+            {"id": "200", "weight": 0.5},
+            {"id": "300", "weight": 1.0},
+            {"id": "400", "weight": 0.25},
+        ],
+    }
+    # 1 - (0.5 + 0.25) = 0.25
+    assert grading_ops._compute_new_score(props, ["200", "400"], None) == (0.25, set())
+    # 1 - (0.5 + 1.0) = -0.5 → floor to 0
+    assert grading_ops._compute_new_score(props, ["200", "300"], None) == (0.0, set())
+    # All three: 1 - 1.75 = -0.75 → floor to 0
+    assert grading_ops._compute_new_score(
+        props, ["200", "300", "400"], None
+    ) == (0.0, set())
+
+
+def test_compute_new_score_positive_scoring_sums_credits() -> None:
+    props = {
+        "question": {"weight": 5.0, "scoring_type": "positive", "floor": True, "ceiling": True},
+        "rubric_items": [
+            {"id": "10", "weight": 2.0},
+            {"id": "20", "weight": 3.0},
+        ],
+    }
+    assert grading_ops._compute_new_score(props, ["10"], None) == (2.0, set())
+    assert grading_ops._compute_new_score(props, ["10", "20"], None) == (5.0, set())
+    assert grading_ops._compute_new_score(props, [], None) == (0.0, set())
+
+
+def test_compute_new_score_clamps_to_floor_and_ceiling() -> None:
+    props = {
+        "question": {"weight": 1.0, "scoring_type": "negative", "floor": True, "ceiling": True},
+        "rubric_items": [
+            {"id": "200", "weight": 0.5},
+        ],
+    }
+    # Without clamps the math would be 1 - 0.5 + (-2) = -1.5; floor pulls it to 0.
+    assert grading_ops._compute_new_score(props, ["200"], -2.0) == (0.0, set())
+    # 1 - 0.5 + 5 = 5.5; ceiling caps it at the question weight.
+    assert grading_ops._compute_new_score(props, ["200"], 5.0) == (1.0, set())
+
+
+def test_compute_new_score_returns_none_without_weight() -> None:
+    assert grading_ops._compute_new_score({"question": {}}, ["100"], None) == (
+        None,
+        set(),
+    )
+
+
+def test_compute_new_score_flags_unknown_rubric_ids() -> None:
+    """Unknown IDs contribute 0 to the local sum and are surfaced for the caller."""
+    props = {
+        "question": {"weight": 2.0, "scoring_type": "negative", "floor": True, "ceiling": True},
+        "rubric_items": [
+            {"id": "100", "weight": 0.5},
+        ],
+    }
+    score, unknown = grading_ops._compute_new_score(
+        props, ["100", "999", "stale-uuid"], None
+    )
+    # Local computation sees only the known item: 2 - 0.5 = 1.5.
+    assert score == 1.5
+    # The two unknown IDs must be returned so the caller can warn the user.
+    assert unknown == {"999", "stale-uuid"}
+
+
+def test_student_name_without_email_paren_is_returned_verbatim(monkeypatch) -> None:
+    """If the User cell has no ``(email)`` suffix, return the cell as-is."""
+    html = _gradescope_table_html([
+        ("1", "Plain Name No Email", "", "", "111"),
+    ])
+    _stub_grading_ops_get(monkeypatch, html)
+
+    entries = grading_ops._fetch_question_submission_entries("1", "2")
+
+    assert entries[0]["student_name"] == "Plain Name No Email"
+
+
+def test_graded_flag_column_only_treats_affirmative_tokens_as_graded(monkeypatch) -> None:
+    """Em-dash, ``No``, ``Pending``, etc. in the Graded? column must NOT false-positive.
+
+    Regression for the case where Gradescope leaves the Graded? column empty
+    or filled with placeholder text on rows that are otherwise ungraded.
+    """
+    html = _gradescope_table_html([
+        # Graded? = "Yes" → graded even if Score is empty
+        ("1", "Alice (a@uci.edu)", "", "Yes", "401"),
+        # Graded? = "✓" → graded
+        ("2", "Bob (b@uci.edu)", "", "✓", "402"),
+        # Graded? = "—" → must NOT be treated as graded; Score is empty too
+        ("3", "Carol (c@uci.edu)", "", "—", "403"),
+        # Graded? = "Pending" → must NOT be treated as graded
+        ("4", "Dave (d@uci.edu)", "", "Pending", "404"),
+        # Graded? = "No" → must NOT be treated as graded
+        ("5", "Eve (e@uci.edu)", "", "No", "405"),
+        # Graded? empty + Score non-empty → graded via Score fallback
+        ("6", "Frank (f@uci.edu)", "0.5", "", "406"),
+    ])
+    _stub_grading_ops_get(monkeypatch, html)
+
+    entries = grading_ops._fetch_question_submission_entries("1", "2")
+    graded_map = {e["submission_id"]: e["graded"] for e in entries}
+
+    assert graded_map == {
+        "401": True,   # affirmative token
+        "402": True,   # ✓
+        "403": False,  # em-dash placeholder
+        "404": False,  # status word, not affirmative
+        "405": False,  # explicit negative
+        "406": True,   # Score-column fallback
+    }
+
+
+def test_graded_heuristic_handles_headerless_tables(monkeypatch) -> None:
+    """Fallback path: when no <thead>, scanning still skips the leading row-index cell."""
+    html = """
+    <table>
+      <tr><td>1</td><td>Alice 3rd</td><td>8/10</td><td><a href="/courses/1/questions/2/submissions/301/grade">grade</a></td></tr>
+      <tr><td>2</td><td>Bob Example</td><td></td><td><a href="/courses/1/questions/2/submissions/302/grade">grade</a></td></tr>
+    </table>
+    """
+    _stub_grading_ops_get(monkeypatch, html)
+
+    entries = grading_ops._fetch_question_submission_entries("1", "2")
+    graded_map = {e["submission_id"]: e["graded"] for e in entries}
+
+    assert graded_map == {"301": True, "302": False}
 
 
 def test_get_next_ungraded_uses_props_sid_after_auto_discovery(monkeypatch) -> None:

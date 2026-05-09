@@ -36,6 +36,7 @@ from gradescope_mcp.tools.statistics import get_assignment_statistics
 from gradescope_mcp.tools.grading_ops import (
     get_submission_grading_context,
     apply_grade,
+    apply_grade_batch,
     create_rubric_item,
     update_rubric_item,
     delete_rubric_item,
@@ -437,6 +438,45 @@ def tool_apply_grade(
 
 
 @mcp.tool()
+def tool_apply_grade_batch(
+    course_id: str,
+    question_id: str,
+    grades: list[dict],
+    confirm_write: bool = False,
+) -> str:
+    """Apply grades to many submissions for one question in a single call.
+
+    Use this after the user approves a batch of previews. Subagents cannot call
+    write-gated tools in the Claude Code harness, so all writes funnel through
+    the main agent — batching cuts round-trips for large grading runs.
+
+    Each entry in ``grades`` is a dict:
+
+    - ``submission_id``: str (required)
+    - ``rubric_item_ids``: list[str] | None (same semantics as ``apply_grade``;
+      ``None`` keeps current rubric state, ``[]`` clears all items)
+    - ``point_adjustment``: float | None (``None`` keeps current)
+    - ``comment``: str | None (``None`` keeps current)
+    - ``confidence``: float | None (per-row gate; < 0.6 is skipped)
+
+    Behavior:
+    - ``confirm_write=False``: returns a compact preview table; no writes.
+    - ``confirm_write=True``: executes per-row; returns succeeded / failed /
+      skipped-by-confidence counts plus per-row details.
+
+    After execution, the agent is still expected to spot-check a submission
+    via ``tool_get_submission_grading_context`` to confirm live state.
+
+    Args:
+        course_id: The Gradescope course ID.
+        question_id: The question ID that every entry in ``grades`` targets.
+        grades: List of per-submission grade entries (see above).
+        confirm_write: Must be True to save. Default False returns a preview.
+    """
+    return apply_grade_batch(course_id, question_id, grades, confirm_write)
+
+
+@mcp.tool()
 def tool_get_question_rubric(
     course_id: str,
     question_id: str,
@@ -691,6 +731,7 @@ def tool_cache_relevant_pages(
     assignment_id: str | None = None,
     question_id: str = "",
     submission_id: str = "",
+    include_all_pages: bool = False,
 ) -> str:
     """Download the crop page and neighboring pages to `/tmp/gradescope-mcp` for local review.
 
@@ -703,9 +744,14 @@ def tool_cache_relevant_pages(
             will try to resolve the owning assignment from question_id.
         question_id: The question ID.
         submission_id: The question submission ID.
+        include_all_pages: Default ``False`` caches only the crop page and its
+            immediate neighbors (driven by the student's tagging). Set
+            ``True`` to download every page of the submission — use when the
+            student tagged the wrong page for this question and the work is
+            on a page the normal filter would miss.
     """
     return cache_relevant_pages(
-        course_id, assignment_id, question_id, submission_id
+        course_id, assignment_id, question_id, submission_id, include_all_pages
     )
 
 

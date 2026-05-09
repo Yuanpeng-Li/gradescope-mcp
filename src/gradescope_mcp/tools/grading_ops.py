@@ -10,6 +10,7 @@ All write operations require CSRF tokens extracted from the grading page.
 import json
 import logging
 import re
+from typing import Iterable
 
 from bs4 import BeautifulSoup
 
@@ -32,6 +33,78 @@ def _is_placeholder_page(page: dict) -> bool:
     """Check if a page is a placeholder/missing PDF image."""
     url = page.get("url", "")
     return _MISSING_PDF_MARKER in url or not url
+
+
+def _compute_new_score(
+    props: dict,
+    apply_ids: Iterable[str] | None,
+    point_adjustment: float | int | None,
+) -> tuple[float | None, set[str]]:
+    """Compute the resulting score from rubric items + adjustment.
+
+    Mirrors Gradescope's scoring semantics so callers can report the real
+    post-write score without an extra round-trip. The save endpoint does not
+    consistently echo the new score back, so deriving it locally is more
+    reliable than parsing the response.
+
+    Returns a ``(score, unknown_ids)`` tuple. ``score`` is ``None`` if the
+    question weight is unknown. ``unknown_ids`` contains any IDs in
+    ``apply_ids`` that don't exist in the question's current rubric — those
+    contribute 0 to the local sum but Gradescope may reject them server-side,
+    so callers should surface them to the user.
+    """
+    question = props.get("question", {}) or {}
+    weight = question.get("weight")
+    if weight is None:
+        return None, set()
+    try:
+        weight_f = float(weight)
+    except (TypeError, ValueError):
+        return None, set()
+
+    scoring_type = question.get("scoring_type", "negative")
+    floor = question.get("floor")
+    ceiling = question.get("ceiling")
+    # Gradescope defaults floor and ceiling to True when unspecified.
+    floor = True if floor is None else bool(floor)
+    ceiling = True if ceiling is None else bool(ceiling)
+
+    rubric_items = props.get("rubric_items", []) or []
+    weight_by_id: dict[str, float] = {}
+    for ri in rubric_items:
+        try:
+            weight_by_id[str(ri["id"])] = float(ri.get("weight") or 0)
+        except (TypeError, ValueError):
+            weight_by_id[str(ri["id"])] = 0.0
+
+    apply_set = {str(rid) for rid in (apply_ids or [])}
+    unknown_ids = apply_set - weight_by_id.keys()
+    applied_sum = sum(weight_by_id.get(rid, 0.0) for rid in apply_set)
+
+    try:
+        pa = float(point_adjustment) if point_adjustment is not None else 0.0
+    except (TypeError, ValueError):
+        pa = 0.0
+
+    if scoring_type == "positive":
+        score = applied_sum + pa
+    else:
+        score = weight_f - applied_sum + pa
+
+    if floor and score < 0:
+        score = 0.0
+    if ceiling and score > weight_f:
+        score = weight_f
+    return score, unknown_ids
+
+
+def _format_score(score: float | None) -> str:
+    """Render a score for display: drop ``.0`` for integer-valued floats."""
+    if score is None:
+        return "?"
+    if float(score).is_integer():
+        return str(int(score))
+    return f"{score:g}"
 
 
 def _get_grading_context(course_id: str, question_id: str, submission_id: str) -> dict:
@@ -390,11 +463,50 @@ def get_question_rubric(course_id: str, question_id: str) -> str:
     return "\n".join(lines)
 
 
+_SCORE_HEADER_NAMES = ("score", "points", "grade")
+_USER_HEADER_NAMES = ("user", "student", "name")
+_GRADED_FLAG_HEADER_NAMES = ("graded?", "graded", "status")
+_NONEMPTY_SCORE_RE = re.compile(
+    r"^\s*"
+    r"(?:\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?"  # N/N or N.N/N.N
+    r"|\d+(?:\.\d+)?"                         # plain number
+    r"|Graded|✓|✅)"
+    r"\s*$"
+)
+_INDEX_LIKE_RE = re.compile(r"^\d{1,4}$")
+# Affirmative values that the "Graded?" column is known to use. Anything else
+# (em-dash placeholders, "No", "Pending", ...) must NOT be parsed as graded.
+_GRADED_AFFIRMATIVE = frozenset({"yes", "y", "true", "graded", "done", "✓", "✅"})
+
+
+def _resolve_header_index(headers: list[str], wanted: tuple[str, ...]) -> int | None:
+    """Return the first column index whose lowercased header matches a wanted name."""
+    for idx, name in enumerate(headers):
+        norm = (name or "").strip().lower()
+        if norm in wanted:
+            return idx
+    return None
+
+
+def _strip_email_paren(text: str) -> str:
+    """Drop a trailing ``(email@host)`` parenthetical from a user-cell string."""
+    return re.sub(r"\s*\([^)]*@[^)]*\)\s*$", "", text).strip()
+
+
 def _fetch_question_submission_entries(
     course_id: str,
     question_id: str,
 ) -> list[dict[str, str | bool]]:
-    """Return parsed question-submission entries from the submissions page."""
+    """Return parsed question-submission entries from the submissions page.
+
+    Real Gradescope submission tables include a leading row-index column
+    (just bare integers ``1``, ``2``, ...). Earlier heuristic-based parsing
+    treated those integers as both ``student_name`` *and* a ``score``
+    indicator, so every row appeared graded with a numeric "name". This
+    parser instead uses the table headers to identify the User, Score, and
+    Graded? columns explicitly, and falls back to a column-index-aware
+    heuristic only when headers are missing.
+    """
     conn = get_connection()
     url = (
         f"{conn.gradescope_base_url}/courses/{course_id}"
@@ -413,7 +525,34 @@ def _fetch_question_submission_entries(
         rf"/submissions/(\d+)/grade"
     )
 
-    seen = set()
+    # Map each table that contains grade links to its header row indices.
+    table_columns: dict[int, dict[str, int | None]] = {}
+
+    def columns_for(table) -> dict[str, int | None]:
+        cached = table_columns.get(id(table))
+        if cached is not None:
+            return cached
+        headers: list[str] = []
+        thead = table.find("thead")
+        if thead is not None:
+            header_row = thead.find("tr")
+            if header_row is not None:
+                headers = [th.get_text(strip=True) for th in header_row.find_all(["th", "td"])]
+        if not headers:
+            first_row = table.find("tr")
+            if first_row is not None:
+                ths = first_row.find_all("th")
+                if ths:
+                    headers = [th.get_text(strip=True) for th in ths]
+        cols = {
+            "user": _resolve_header_index(headers, _USER_HEADER_NAMES),
+            "score": _resolve_header_index(headers, _SCORE_HEADER_NAMES),
+            "graded_flag": _resolve_header_index(headers, _GRADED_FLAG_HEADER_NAMES),
+        }
+        table_columns[id(table)] = cols
+        return cols
+
+    seen: set[str] = set()
     entries: list[dict[str, str | bool]] = []
     for link in soup.find_all("a", href=pattern):
         match = pattern.search(link.get("href", ""))
@@ -426,31 +565,59 @@ def _fetch_question_submission_entries(
 
         row = link.find_parent("tr")
         student_name = ""
-        if row:
-            for td in row.find_all("td"):
-                text = td.get_text(strip=True)
-                if text and not text.startswith("/") and text != sid:
-                    student_name = text
+        graded = False
+
+        if row is not None:
+            tds = row.find_all("td")
+            cell_texts = [td.get_text(strip=True) for td in tds]
+
+            table = row.find_parent("table")
+            cols = columns_for(table) if table is not None else {
+                "user": None, "score": None, "graded_flag": None,
+            }
+
+            # Student name resolution.
+            user_idx = cols["user"]
+            if user_idx is not None and user_idx < len(cell_texts):
+                student_name = _strip_email_paren(cell_texts[user_idx])
+            if not student_name:
+                # Fallback: first cell that looks name-like (not a row index,
+                # not the submission ID, not a URL).
+                for text in cell_texts:
+                    if not text or text == sid or text.startswith("/"):
+                        continue
+                    if _INDEX_LIKE_RE.match(text):
+                        continue
+                    student_name = _strip_email_paren(text)
                     break
 
-        graded = False
-        if row:
-            # Scan <td> cells in reverse to find the score cell, which is
-            # typically the last or second-to-last column.  Checking cells
-            # individually avoids false positives from student names or IDs
-            # that happen to contain digits.
-            score_pattern = re.compile(
-                r"^\s*"
-                r"(?:\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?"  # N/N or N.N/N.N
-                r"|\d+(?:\.\d+)?"                         # plain number
-                r"|Graded|✓|✅)"
-                r"\s*$"
-            )
-            for td in reversed(row.find_all("td")):
-                cell_text = td.get_text(strip=True)
-                if cell_text and score_pattern.match(cell_text):
+            # Graded resolution: prefer the explicit Graded? column, then the
+            # Score column, then the heuristic — but never against the row
+            # index column.
+            score_idx = cols["score"]
+            graded_idx = cols["graded_flag"]
+
+            if graded_idx is not None and graded_idx < len(cell_texts):
+                flag = cell_texts[graded_idx].strip().lower()
+                if flag in _GRADED_AFFIRMATIVE:
                     graded = True
-                    break
+
+            if not graded and score_idx is not None and score_idx < len(cell_texts):
+                cell = cell_texts[score_idx].strip()
+                if cell and cell not in {"-", "—", "–"}:
+                    graded = bool(_NONEMPTY_SCORE_RE.match(cell))
+
+            if not graded and score_idx is None and graded_idx is None:
+                # Headerless fallback: scan cells from the right but skip the
+                # leading column (which Gradescope uses for row indices).
+                start = 1 if len(cell_texts) > 1 else 0
+                for cell in reversed(cell_texts[start:]):
+                    cell = cell.strip()
+                    if not cell:
+                        continue
+                    if _NONEMPTY_SCORE_RE.match(cell):
+                        graded = True
+                        break
 
         entries.append(
             {
@@ -673,21 +840,264 @@ def apply_grade(
         return f"Error saving grade: {e}"
 
     if resp.status_code == 200:
-        # Parse response
-        try:
-            result = resp.json()
-            new_score = result.get("score", "?")
-            return (
-                f"✅ Grade saved successfully!\n"
-                f"**New score:** {new_score}/{props.get('question', {}).get('weight', '?')}\n"
-                f"**Rubric items applied:** {list(apply_ids)}\n"
-                f"**Point adjustment:** {point_adjustment}\n"
-                f"**Comment:** {comment or '(unchanged)'}"
+        new_score, unknown_ids = _compute_new_score(props, apply_ids, point_adjustment)
+        warning = ""
+        if unknown_ids:
+            warning = (
+                f"\n⚠️ **Unknown rubric IDs (ignored locally, may be rejected by "
+                f"Gradescope):** {sorted(unknown_ids)}"
             )
-        except Exception:
-            return f"✅ Grade saved (status 200). Response: {resp.text[:200]}"
+        return (
+            f"✅ Grade saved successfully!\n"
+            f"**New score:** {_format_score(new_score)}/"
+            f"{props.get('question', {}).get('weight', '?')}\n"
+            f"**Rubric items applied:** {list(apply_ids)}\n"
+            f"**Point adjustment:** {point_adjustment}\n"
+            f"**Comment:** {comment or '(unchanged)'}"
+            f"{warning}"
+        )
     else:
         return f"Error: Grade save failed (status {resp.status_code}). Response: {resp.text[:300]}"
+
+
+def apply_grade_batch(
+    course_id: str,
+    question_id: str,
+    grades: list[dict],
+    confirm_write: bool = False,
+) -> str:
+    """Apply grades to many submissions for one question in a single call.
+
+    Each ``grades`` entry is a dict:
+        - ``submission_id``: str (required)
+        - ``rubric_item_ids``: list[str] | None — same semantics as apply_grade
+        - ``point_adjustment``: float | None
+        - ``comment``: str | None
+        - ``confidence``: float | None — per-row gate (<0.6 is rejected)
+
+    All entries are applied to the same ``question_id``. Confidence gating is
+    per-row. On ``confirm_write=False`` returns a compact preview table.
+    On ``confirm_write=True`` returns an execution summary (succeeded /
+    failed / skipped-by-confidence) with per-row details.
+
+    This is meant for the main agent's post-approval execution phase. Subagents
+    cannot call write-gated tools in the Claude Code harness, so all writes
+    must funnel through the main agent; a batch variant cuts round-trips
+    dramatically for large grading runs.
+    """
+    if not course_id or not question_id:
+        return "Error: course_id and question_id are required."
+    if not isinstance(grades, list) or not grades:
+        return "Error: grades must be a non-empty list."
+
+    normalized: list[dict] = []
+    errors: list[str] = []
+    for i, g in enumerate(grades):
+        if not isinstance(g, dict):
+            errors.append(f"row {i}: entry must be an object")
+            continue
+        sid = g.get("submission_id")
+        if not sid:
+            errors.append(f"row {i}: submission_id is required")
+            continue
+        rids = g.get("rubric_item_ids")
+        if isinstance(rids, str):
+            rids = [rids]
+        pa = g.get("point_adjustment")
+        cm = g.get("comment")
+        cf = g.get("confidence")
+        if cf is not None and not (0.0 <= cf <= 1.0):
+            errors.append(f"row {i} ({sid}): confidence must be between 0.0 and 1.0")
+            continue
+        if rids is None and pa is None and cm is None:
+            errors.append(
+                f"row {i} ({sid}): at least one of rubric_item_ids, "
+                "point_adjustment, or comment is required"
+            )
+            continue
+        normalized.append(
+            {
+                "submission_id": str(sid),
+                "rubric_item_ids": rids,
+                "point_adjustment": pa,
+                "comment": cm,
+                "confidence": cf,
+            }
+        )
+    if errors:
+        return "Error: invalid batch input:\n" + "\n".join(f"- {e}" for e in errors)
+
+    if not confirm_write:
+        preview_lines = [
+            "| # | submission_id | rubric_item_ids | point_adj | comment | confidence |",
+            "|---|---------------|-----------------|-----------|---------|------------|",
+        ]
+        for i, g in enumerate(normalized, 1):
+            rids_disp = (
+                str(sorted(g["rubric_item_ids"]))
+                if g["rubric_item_ids"] is not None
+                else "(keep current)"
+            )
+            pa_disp = (
+                str(g["point_adjustment"])
+                if g["point_adjustment"] is not None
+                else "(keep current)"
+            )
+            cm_disp = g["comment"] if g["comment"] is not None else "(none)"
+            cf_disp = (
+                f"{g['confidence']:.2f}" if g["confidence"] is not None else "(none)"
+            )
+            preview_lines.append(
+                f"| {i} | `{g['submission_id']}` | {rids_disp} | "
+                f"{pa_disp} | {cm_disp} | {cf_disp} |"
+            )
+        details = [
+            f"course_id=`{course_id}`",
+            f"question_id=`{question_id}`",
+            f"rows={len(normalized)}",
+        ]
+        return (
+            write_confirmation_required("apply_grade_batch", details)
+            + "\n\n"
+            + "\n".join(preview_lines)
+        )
+
+    succeeded: list[tuple[str, object, object, set[str]]] = []
+    failed: list[tuple[str, str]] = []
+    skipped_confidence: list[tuple[str, float]] = []
+
+    for g in normalized:
+        sid = g["submission_id"]
+        cf = g["confidence"]
+        if cf is not None and cf < 0.6:
+            skipped_confidence.append((sid, cf))
+            continue
+
+        try:
+            ctx = _get_grading_context(course_id, question_id, sid)
+        except AuthError as e:
+            failed.append((sid, f"Authentication error: {e}"))
+            continue
+        except ValueError as e:
+            failed.append((sid, str(e)))
+            continue
+        except Exception as e:
+            failed.append((sid, f"Error fetching grading context: {e}"))
+            continue
+
+        props = ctx["props"]
+        session = ctx["session"]
+        csrf_token = ctx["csrf_token"]
+        base_url = ctx["base_url"]
+
+        save_url = props.get("urls", {}).get("save_grade")
+        if not save_url:
+            failed.append((sid, "save_grade URL not found in grading context"))
+            continue
+
+        rubric_items = props.get("rubric_items", [])
+        current_evals = props.get("rubric_item_evaluations", [])
+        current_eval = props.get("evaluation", {})
+
+        if g["rubric_item_ids"] is not None:
+            apply_ids = set(g["rubric_item_ids"])
+        else:
+            apply_ids = {
+                str(e["rubric_item_id"])
+                for e in current_evals
+                if e.get("present")
+            }
+
+        rubric_items_payload = {}
+        for ri in rubric_items:
+            rid = str(ri["id"])
+            rubric_items_payload[rid] = {
+                "score": "true" if rid in apply_ids else "false"
+            }
+
+        resolved_points = (
+            g["point_adjustment"]
+            if g["point_adjustment"] is not None
+            else current_eval.get("points")
+        )
+        resolved_comments = (
+            g["comment"]
+            if g["comment"] is not None
+            else current_eval.get("comments")
+        )
+
+        json_payload = {
+            "rubric_items": rubric_items_payload,
+            "question_submission_evaluation": {
+                "points": resolved_points,
+                "comments": resolved_comments,
+            },
+        }
+
+        headers = {
+            "X-CSRF-Token": csrf_token,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        try:
+            resp = session.post(
+                f"{base_url}{save_url}",
+                json=json_payload,
+                headers=headers,
+            )
+        except Exception as e:
+            failed.append((sid, f"Error saving grade: {e}"))
+            continue
+
+        if resp.status_code != 200:
+            failed.append(
+                (sid, f"HTTP {resp.status_code}: {resp.text[:200]}")
+            )
+            continue
+
+        new_score_value, unknown_ids = _compute_new_score(
+            props, apply_ids, resolved_points
+        )
+        question_weight = props.get("question", {}).get("weight", "?")
+        succeeded.append(
+            (sid, _format_score(new_score_value), question_weight, unknown_ids)
+        )
+
+    lines = [
+        f"## Batch grade result for question `{question_id}`",
+        f"- **succeeded:** {len(succeeded)}",
+        f"- **failed:** {len(failed)}",
+        f"- **skipped (confidence < 0.6):** {len(skipped_confidence)}",
+    ]
+    if succeeded:
+        lines.append("")
+        lines.append("### Saved")
+        rows_with_warnings: list[tuple[str, set[str]]] = []
+        for sid, score, weight, unknown_ids in succeeded:
+            lines.append(f"- `{sid}`: {score}/{weight}")
+            if unknown_ids:
+                rows_with_warnings.append((sid, unknown_ids))
+        if rows_with_warnings:
+            lines.append("")
+            lines.append(
+                "### ⚠️ Unknown rubric IDs (ignored locally; "
+                "Gradescope may have rejected them)"
+            )
+            for sid, unknown_ids in rows_with_warnings:
+                lines.append(f"- `{sid}`: {sorted(unknown_ids)}")
+    if failed:
+        lines.append("")
+        lines.append("### Failed")
+        for sid, err in failed:
+            lines.append(f"- `{sid}`: {err}")
+    if skipped_confidence:
+        lines.append("")
+        lines.append("### Skipped (low confidence)")
+        for sid, cf in skipped_confidence:
+            lines.append(f"- `{sid}`: confidence={cf:.2f}")
+    return "\n".join(lines)
 
 
 def create_rubric_item(

@@ -159,6 +159,32 @@ Use the artifact to gather:
 - crop regions and relevant page URLs
 - whether the question uses positive or negative scoring
 
+### Rubric completeness check
+
+Before grading, verify the rubric can actually express your contract. Many
+Gradescope assignments are created with a single placeholder rubric item
+(typically `Correct` with weight `0.0` under negative scoring) — that item
+applies "no deduction" and gives full credit, but cannot express anything
+else.
+
+Treat the rubric as **incomplete** when any of these are true:
+
+- `scoring_type=negative` and every rubric item has weight `0.0`
+  → there is no way to express any deduction, including "blank" or "wrong".
+- `scoring_type=positive` and every rubric item has weight `0.0`
+  → there is no way to award any partial or full credit.
+- The contract requires partial credit (e.g., "method right + arithmetic
+  error → 0.5") but no rubric item exists at the partial-credit weight.
+- The contract requires a "blank → 0" path under negative scoring but no
+  full-deduction item exists.
+
+When you detect an incomplete rubric, stop and propose the rubric items the
+contract actually needs. Quote the contract clause that requires each new
+item, list the proposed `description` and `weight` for each, and ask the
+user to approve before any rubric write. Do not patch the gap with
+`point_adjustment` per submission — that hides the policy across many
+grades and makes audits painful.
+
 ### Reference priority
 
 Use this priority order:
@@ -295,6 +321,22 @@ For each submission:
 1. crop region only
 2. full page if the crop is truncated or unclear
 3. adjacent pages if the reasoning spills across pages
+
+### Page-tagging is unreliable on scanned PDFs
+
+Students tag which pages belong to which question when they upload, and they
+get this wrong all the time — Q7 work routinely lives on a different page
+than the one tagged as Q7. Symptoms include `relevant_pages` pointing at
+pages that contain a different question entirely, or "missing" answers that
+are actually on a later page the student forgot to tag.
+
+For any new assignment whose tagging quality you have not personally
+verified, default to `tool_cache_relevant_pages(..., include_all_pages=True)`
+when sweeping for completeness or for short-answer correctness checks. The
+extra page downloads are cheap; missing a real answer because of a bad tag
+is not. Once you have spot-checked a few submissions and confirmed tags are
+reliable for that assignment, you can drop back to the default crop-only
+mode.
 
 ### Visual cross-check for scanned work
 
