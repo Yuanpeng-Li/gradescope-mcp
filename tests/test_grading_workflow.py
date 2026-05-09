@@ -64,6 +64,44 @@ def test_cache_relevant_pages_uses_authenticated_session(monkeypatch) -> None:
     )
 
 
+def test_cache_relevant_pages_include_all_pages_bypasses_filter(monkeypatch) -> None:
+    """include_all_pages=True downloads every page regardless of crop tagging."""
+    session = _FakeSession()
+    monkeypatch.setattr(
+        grading_workflow,
+        "_resolve_assignment_questions",
+        lambda *_args, **_kwargs: ("a", {"q": {"index": 1}}, None),
+    )
+    monkeypatch.setattr(grading_workflow, "_get_grading_context", lambda *_args, **_kwargs: {
+        "props": {
+            "question": {
+                "parameters": {
+                    "crop_rect_list": [{"page_number": 2, "x1": 0, "x2": 100, "y1": 0, "y2": 100}]
+                }
+            },
+            "pages": [
+                {"number": n, "url": f"https://example.com/{n}.jpg"}
+                for n in (1, 2, 3, 4, 5, 6, 7)
+            ],
+        }
+    })
+    monkeypatch.setattr(grading_workflow, "get_connection", lambda: _FakeConn(session))
+
+    # Default filter: only pages 1, 2, 3 (crop on page 2 ± 1).
+    result_default = grading_workflow.cache_relevant_pages("1", "a", "q", "s")
+    assert "Cached 3 relevant page(s)" in result_default
+    assert len(session.urls) == 3
+
+    # Reset and fetch all pages.
+    session.urls.clear()
+    result_all = grading_workflow.cache_relevant_pages(
+        "1", "a", "q", "s", include_all_pages=True
+    )
+    assert "Cached 7 relevant page(s)" in result_all
+    assert len(session.urls) == 7
+    assert session.urls[-1] == "https://example.com/7.jpg"
+
+
 def test_prepare_grading_artifact_auto_resolves_assignment(monkeypatch) -> None:
     class _Assignment:
         def __init__(self, assignment_id: str):

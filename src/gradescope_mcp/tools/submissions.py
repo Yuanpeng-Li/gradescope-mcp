@@ -1,6 +1,8 @@
 """Submission-related MCP tools."""
 
+import contextlib
 import pathlib
+import re
 
 from gradescopeapi.classes.upload import upload_assignment
 
@@ -60,21 +62,23 @@ def upload_submission(
 
     try:
         conn = get_connection()
-        file_handles = []
-        try:
-            for path in validated_paths:
-                file_handles.append(open(path, "rb"))
-
+        # ExitStack guarantees every successfully-opened handle is closed even
+        # if a later open() raises (EISDIR, EACCES, race-deleted file). The
+        # earlier try/finally only protected handles after the loop completed.
+        # The arguments are also passed positionally — `upload_assignment`'s
+        # signature is (session, course_id, assignment_id, *files, ...) so
+        # mixing kw-args with *file_handles raised TypeError.
+        with contextlib.ExitStack() as stack:
+            file_handles = [
+                stack.enter_context(open(path, "rb")) for path in validated_paths
+            ]
             result_url = upload_assignment(
-                session=conn.session,
-                course_id=course_id,
-                assignment_id=assignment_id,
+                conn.session,
+                course_id,
+                assignment_id,
                 *file_handles,
                 leaderboard_name=leaderboard_name,
             )
-        finally:
-            for fh in file_handles:
-                fh.close()
 
     except AuthError as e:
         return f"Authentication error: {e}"
@@ -166,14 +170,23 @@ def _format_submissions_json(data: dict, assignment_id: str, course_id: str) -> 
     return "\n".join(lines)
 
 
+_REVIEW_GRADES_PLACEHOLDERS = frozenset({"", "-", "--", "—", "–", "n/a"})
+_REVIEW_GRADES_AFFIRMATIVE = frozenset({"yes", "y", "true", "graded", "done", "✓", "✅"})
+_REVIEW_GRADES_SCORE_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?|Graded|✓|✅)\s*$"
+)
+
+
 def _get_submissions_from_review_grades(
     conn, course_id: str, assignment_id: str
 ) -> str:
     """Fallback: scrape submission list from the review_grades HTML table.
 
-    Used for online assignments where submissions.json returns 404.
+    Used for online assignments where submissions.json returns 404. Uses
+    header-aware column resolution so that adding/removing the Sections column
+    (or any other layout shift) doesn't pull score/graded data from the wrong
+    cells, which used to silently corrupt the output.
     """
-    import re
     from bs4 import BeautifulSoup
 
     url = (
@@ -193,37 +206,76 @@ def _get_submissions_from_review_grades(
             "has no table. This assignment type may not be supported yet."
         )
 
-    rows = table.find_all("tr")[1:]  # skip header
-    if not rows:
+    headers = []
+    thead = table.find("thead")
+    if thead is not None:
+        header_row = thead.find("tr")
+        if header_row is not None:
+            headers = [th.get_text(strip=True) for th in header_row.find_all(["th", "td"])]
+    if not headers:
+        first_row = table.find("tr")
+        if first_row is not None:
+            ths = first_row.find_all("th")
+            if ths:
+                headers = [th.get_text(strip=True) for th in ths]
+
+    def _col(*names: str) -> int | None:
+        wanted = {n.lower() for n in names}
+        for idx, h in enumerate(headers):
+            if (h or "").strip().lower() in wanted:
+                return idx
+        return None
+
+    score_idx = _col("score", "total score", "points")
+    graded_idx = _col("graded?", "graded", "status")
+
+    body = table.find("tbody") or table
+    data_rows = [tr for tr in body.find_all("tr") if tr.find("td")]
+    if not data_rows:
         return f"No submissions found for assignment `{assignment_id}` in course `{course_id}`."
 
-    # Extract submission IDs from links
-    submissions = []
     sub_id_pattern = re.compile(r"/submissions/(\d+)")
-    for row in rows:
+    submissions = []
+    for row in data_rows:
         cells = row.find_all("td")
-        if not cells:
+        cell_text = [c.get_text(strip=True) for c in cells]
+        if not cell_text:
             continue
 
-        # Find submission ID from any link in the row
         sub_id = None
         for link in row.find_all("a", href=True):
             match = sub_id_pattern.search(link["href"])
             if match:
                 sub_id = match.group(1)
                 break
-
         if not sub_id:
             continue
 
-        # Extract score and graded status from cells
-        score_text = cells[4].get_text(strip=True) if len(cells) > 4 else ""
-        graded_text = cells[5].get_text(strip=True) if len(cells) > 5 else ""
+        # Score: prefer the resolved column; fall back to the historical
+        # cells[4] only when the header lookup fails.
+        score_text = ""
+        if score_idx is not None and score_idx < len(cell_text):
+            score_text = cell_text[score_idx]
+        elif len(cell_text) > 4:
+            score_text = cell_text[4]
+
+        # Graded: derived from the explicit column if present, otherwise from
+        # the score column's content. ``--`` and other placeholders never
+        # count, no matter which column they appear in.
+        graded = False
+        if graded_idx is not None and graded_idx < len(cell_text):
+            flag = cell_text[graded_idx].strip().lower()
+            if flag in _REVIEW_GRADES_AFFIRMATIVE:
+                graded = True
+        if not graded and score_text:
+            cleaned = score_text.strip()
+            if cleaned.lower() not in _REVIEW_GRADES_PLACEHOLDERS and _REVIEW_GRADES_SCORE_RE.match(cleaned):
+                graded = True
 
         submissions.append({
             "id": sub_id,
             "score": score_text,
-            "graded": bool(graded_text and graded_text != "--"),
+            "graded": graded,
         })
 
     total = len(submissions)

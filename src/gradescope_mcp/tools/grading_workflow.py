@@ -244,7 +244,17 @@ def _select_relevant_pages(
     pages: list[dict[str, Any]],
     crop_rects: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Keep only crop pages and their immediate neighbors."""
+    """Keep only crop pages and their immediate neighbors.
+
+    When no crop info is available — common for online assignments and for
+    scanned exams whose outline lacks crop rects — returning the first three
+    pages silently hides any answer beyond page 3 of a multi-page submission.
+    Return everything in that case so the caller can decide.
+
+    Same fallback when crop pages don't intersect the actual submission pages
+    at all (e.g., student tagged the wrong region): return everything rather
+    than guess.
+    """
     if not pages:
         return []
 
@@ -254,7 +264,7 @@ def _select_relevant_pages(
         if rect.get("page_number") is not None
     }
     if not crop_page_numbers:
-        return pages[:3]
+        return list(pages)
 
     wanted = set()
     for page_number in crop_page_numbers:
@@ -264,7 +274,7 @@ def _select_relevant_pages(
         page for page in pages
         if page.get("number") in wanted
     ]
-    return filtered or pages[:3]
+    return filtered or list(pages)
 
 
 def _compute_readiness(
@@ -604,8 +614,15 @@ def cache_relevant_pages(
     assignment_id: str | None,
     question_id: str,
     submission_id: str,
+    include_all_pages: bool = False,
 ) -> str:
-    """Download the crop page and its neighbors to /tmp/gradescope-mcp for local inspection."""
+    """Download the crop page and its neighbors to /tmp/gradescope-mcp for local inspection.
+
+    Set ``include_all_pages=True`` to download every page of the submission,
+    bypassing the crop-centric filter. Use this when the student tagged the
+    wrong page for the current question and the work is on a page that the
+    normal (tag-aware) filter would miss.
+    """
     if not course_id or not question_id or not submission_id:
         return (
             "Error: course_id, question_id, and submission_id "
@@ -633,7 +650,10 @@ def cache_relevant_pages(
         page for page in props.get("pages", [])
         if isinstance(page, dict) and page.get("url")
     ]
-    relevant_pages = _select_relevant_pages(pages, crop_rects)
+    if include_all_pages:
+        relevant_pages = pages
+    else:
+        relevant_pages = _select_relevant_pages(pages, crop_rects)
     if not relevant_pages:
         return "No relevant pages were found for this submission."
 

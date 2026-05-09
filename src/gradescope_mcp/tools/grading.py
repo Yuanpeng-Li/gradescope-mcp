@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import re
+import statistics
 
 from bs4 import BeautifulSoup
 
@@ -54,7 +55,11 @@ def _get_outline_data(course_id: str, assignment_id: str) -> dict:
         outline_list = props.get("outline", [])
         questions = {}
 
-        def _flatten(items):
+        def _flatten(items, parent_id=None):
+            # AssignmentOutline encodes parenthood via the children list, not
+            # via a per-item parent_id field. Without threading the parent_id
+            # through the recursion, every question would land at the top
+            # level and _build_question_tree would lose the grouping.
             for item in items:
                 qid = str(item["id"])
                 questions[qid] = {
@@ -63,12 +68,12 @@ def _get_outline_data(course_id: str, assignment_id: str) -> dict:
                     "title": item.get("title", ""),
                     "weight": item.get("weight"),
                     "index": item.get("index", 0),
-                    "parent_id": item.get("parent_id"),
+                    "parent_id": item.get("parent_id", parent_id),
                     "content": item.get("content", []),
                 }
                 children = item.get("children", [])
                 if children:
-                    _flatten(children)
+                    _flatten(children, parent_id=item["id"])
 
         _flatten(outline_list)
         props["questions"] = questions
@@ -231,9 +236,11 @@ def export_assignment_scores(course_id: str, assignment_id: str) -> str:
     if "csv" not in content_type and "text" not in content_type:
         return f"Error: Unexpected content type: {content_type}"
 
-    # Parse the CSV
+    # Parse the CSV. Capture fieldnames eagerly: a 200 with empty body would
+    # leave reader.fieldnames as None and crash the question-column list-comp.
     reader = csv.DictReader(io.StringIO(resp.text))
     rows = list(reader)
+    fieldnames = list(reader.fieldnames or [])
 
     if not rows:
         return f"No scores found for assignment `{assignment_id}`."
@@ -242,7 +249,15 @@ def export_assignment_scores(course_id: str, assignment_id: str) -> str:
     total_students = len(rows)
     graded = [r for r in rows if r.get("Status") == "Graded"]
     missing = [r for r in rows if r.get("Status") == "Missing"]
-    submitted = [r for r in rows if r.get("Status") not in ("Missing", "")]
+    # Submitted = not missing AND has a non-empty submission marker. Many
+    # assignments leave Status blank for "submitted but not yet graded", so
+    # rely on Submission ID / Submission Time as positive evidence rather than
+    # treating blank Status as ungraded.
+    submitted = [
+        r for r in rows
+        if r.get("Status") != "Missing"
+        and (r.get("Submission ID") or r.get("Submission Time"))
+    ]
 
     scores = []
     for r in graded:
@@ -251,24 +266,29 @@ def export_assignment_scores(course_id: str, assignment_id: str) -> str:
         except (ValueError, TypeError):
             pass
 
-    max_points = rows[0].get("Max Points", "N/A") if rows else "N/A"
+    # Per-row Max Points so bonus credit / per-student overrides render
+    # correctly. Falls back to "N/A" only when the column is missing entirely.
+    def _row_max(r: dict) -> str:
+        return r.get("Max Points", "N/A") or "N/A"
+
+    distinct_max = {_row_max(r) for r in rows}
+    summary_max = next(iter(distinct_max)) if len(distinct_max) == 1 else "varies"
 
     lines = [f"## Scores for Assignment {assignment_id}\n"]
     lines.append(f"**Total students:** {total_students}")
     lines.append(f"**Graded:** {len(graded)}")
-    lines.append(f"**Submitted (not yet graded):** {len(submitted) - len(graded)}")
+    lines.append(f"**Submitted (not yet graded):** {max(0, len(submitted) - len(graded))}")
     lines.append(f"**Missing:** {len(missing)}")
-    lines.append(f"**Max points:** {max_points}")
+    lines.append(f"**Max points:** {summary_max}")
 
     if scores:
-        avg = sum(scores) / len(scores)
-        lines.append(f"**Average score:** {avg:.2f}")
+        lines.append(f"**Average score:** {statistics.mean(scores):.2f}")
         lines.append(f"**Min:** {min(scores):.1f} | **Max:** {max(scores):.1f}")
-        lines.append(f"**Median:** {sorted(scores)[len(scores) // 2]:.1f}")
+        lines.append(f"**Median:** {statistics.median(scores):.1f}")
 
     # Show per-question column names to reveal the question structure
     question_cols = [
-        col for col in reader.fieldnames
+        col for col in fieldnames
         if col not in (
             "First Name", "Last Name", "SID", "Email", "Sections",
             "Total Score", "Max Points", "Status", "Submission ID",
@@ -289,7 +309,7 @@ def export_assignment_scores(course_id: str, assignment_id: str) -> str:
         total = r.get("Total Score", "N/A")
         status = r.get("Status", "N/A")
         lateness = r.get("Lateness (H:M:S)", "")
-        lines.append(f"| {name} | {email} | {total}/{max_points} | {status} | {lateness} |")
+        lines.append(f"| {name} | {email} | {total}/{_row_max(r)} | {status} | {lateness} |")
 
     if len(rows) > 20:
         lines.append(f"\n_... and {len(rows) - 20} more students_")

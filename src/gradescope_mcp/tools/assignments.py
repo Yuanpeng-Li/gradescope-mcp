@@ -43,13 +43,17 @@ def get_assignments(course_id: str) -> str:
     lines.append("|---|------|-----|-------------|----------|----------|--------|-------|")
 
     for i, a in enumerate(assignments, 1):
+        # Use ``is None`` rather than ``or`` so a real score of 0 / 0.0 is not
+        # collapsed to "N/A" — students who scored zero deserve to see zero.
+        grade = "N/A" if a.grade is None else a.grade
+        max_grade = "N/A" if a.max_grade is None else a.max_grade
         lines.append(
             f"| {i} | {a.name} | `{a.assignment_id}` | "
             f"{_format_datetime(a.release_date)} | "
             f"{_format_datetime(a.due_date)} | "
             f"{_format_datetime(a.late_due_date)} | "
             f"{a.submissions_status or 'N/A'} | "
-            f"{a.grade or 'N/A'}/{a.max_grade or 'N/A'} |"
+            f"{grade}/{max_grade} |"
         )
 
     lines.append(f"\n**Total assignments:** {len(assignments)}")
@@ -84,6 +88,8 @@ def get_assignment_details(course_id: str, assignment_id: str) -> str:
     if target is None:
         return f"Assignment `{assignment_id}` not found in course `{course_id}`."
 
+    grade = "N/A" if target.grade is None else target.grade
+    max_grade = "N/A" if target.max_grade is None else target.max_grade
     lines = [
         f"## Assignment Details\n",
         f"- **Name:** {target.name}",
@@ -92,7 +98,7 @@ def get_assignment_details(course_id: str, assignment_id: str) -> str:
         f"- **Due Date:** {_format_datetime(target.due_date)}",
         f"- **Late Due Date:** {_format_datetime(target.late_due_date)}",
         f"- **Submission Status:** {target.submissions_status or 'N/A'}",
-        f"- **Grade:** {target.grade or 'N/A'} / {target.max_grade or 'N/A'}",
+        f"- **Grade:** {grade} / {max_grade}",
     ]
 
     return "\n".join(lines)
