@@ -27,6 +27,7 @@ from gradescope_mcp.tools.grading import (
     get_assignment_outline,
     export_assignment_scores,
     get_grading_progress,
+    get_student_assignment_link,
 )
 from gradescope_mcp.tools.regrades import (
     get_regrade_requests,
@@ -43,6 +44,7 @@ from gradescope_mcp.tools.grading_ops import (
     get_next_ungraded,
     get_question_rubric,
     list_question_submissions,
+    get_student_submission_map,
 )
 from gradescope_mcp.tools.answer_groups import (
     get_answer_groups,
@@ -302,17 +304,45 @@ def tool_get_assignment_outline(course_id: str, assignment_id: str) -> str:
 
 
 @mcp.tool()
-def tool_export_assignment_scores(course_id: str, assignment_id: str) -> str:
+def tool_export_assignment_scores(
+    course_id: str,
+    assignment_id: str,
+    output_format: str = "markdown",
+) -> str:
     """Export per-question scores for an assignment.
 
-    Returns a summary table with student names, total scores, statistics,
-    and per-question breakdowns. Requires instructor/TA access.
+    Markdown form truncates to the first 20 students (use for spot-check);
+    JSON form returns the full roster plus per-student per-question scores.
+    Requires instructor/TA access.
 
     Args:
         course_id: The Gradescope course ID.
         assignment_id: The assignment ID.
+        output_format: ``"markdown"`` (default) or ``"json"``. Use
+            ``"json"`` whenever you need every row or per-question scores.
     """
-    return export_assignment_scores(course_id, assignment_id)
+    return export_assignment_scores(course_id, assignment_id, output_format)
+
+
+@mcp.tool()
+def tool_get_student_assignment_link(
+    course_id: str,
+    assignment_id: str,
+    student_name: str,
+) -> str:
+    """Return the per-student `/assignments/.../submissions/Z` URL.
+
+    Opens the entire assignment submission (cover-sheet view) for one
+    student. Use this for skim-review across all questions — different
+    from the per-question `/questions/.../grade` URL.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID.
+        student_name: Exact-match "First Last" (case-sensitive, matches
+            the Gradescope scores CSV columns).
+    """
+    return get_student_assignment_link(course_id, assignment_id, student_name)
 
 
 @mcp.tool()
@@ -417,9 +447,13 @@ def tool_apply_grade(
         question_id: The question ID.
         submission_id: The question submission ID.
         rubric_item_ids: List of rubric item IDs to apply (checked). Items NOT
-            in this list will be unchecked. Pass None to keep unchanged.
+            in this list will be unchecked. ``None`` keeps current rubric
+            state; ``[]`` clears all applied items.
         point_adjustment: Submission-specific point adjustment. Pass None to keep.
-        comment: Grader comment. Pass None to keep unchanged.
+        comment: Per-submission comment (Gradescope's "Provide comments
+            specific to this submission" field). ``None`` keeps current,
+            ``""`` clears, any other string overwrites. Stored separately
+            from rubric items.
         confidence: Agent's self-assessed grading confidence (0.0-1.0).
             Below 0.6 = rejected. 0.6-0.8 = warning. Above 0.8 = OK.
             Pass None to skip confidence gating (manual mode).
@@ -538,6 +572,31 @@ def tool_list_question_submissions(
         filter: "all" (default), "ungraded", or "graded".
     """
     return list_question_submissions(course_id, question_id, filter)
+
+
+@mcp.tool()
+def tool_get_student_submission_map(
+    course_id: str,
+    assignment_id: str,
+    student_name: str = "",
+) -> str:
+    """Build a per-student → {question_id: submission_id} map.
+
+    Replaces "fetch each question's submissions list, then join by student"
+    boilerplate. Especially useful when reviewing several questions for one
+    student (e.g. spot-checking a low-prediction-accuracy outlier across
+    Q1-Q5).
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID.
+        student_name: Optional exact-match filter (case-sensitive,
+            "First Last" as shown on Gradescope's submissions page).
+
+    Returns JSON with ``questions`` and ``students`` lists. Submission IDs
+    are Question Submission IDs ready for grading tools.
+    """
+    return get_student_submission_map(course_id, assignment_id, student_name)
 
 
 @mcp.tool()
@@ -731,7 +790,7 @@ def tool_cache_relevant_pages(
     assignment_id: str | None = None,
     question_id: str = "",
     submission_id: str = "",
-    include_all_pages: bool = False,
+    include_all_pages: bool = True,
 ) -> str:
     """Download the crop page and neighboring pages to `/tmp/gradescope-mcp` for local review.
 
@@ -744,11 +803,13 @@ def tool_cache_relevant_pages(
             will try to resolve the owning assignment from question_id.
         question_id: The question ID.
         submission_id: The question submission ID.
-        include_all_pages: Default ``False`` caches only the crop page and its
-            immediate neighbors (driven by the student's tagging). Set
-            ``True`` to download every page of the submission — use when the
-            student tagged the wrong page for this question and the work is
-            on a page the normal filter would miss.
+        include_all_pages: Default ``True`` caches every page of the
+            submission. This is the safe default for scanned exams because
+            students routinely tag the wrong page for a question, and the
+            extra pages are cheap. Set ``False`` to cache only the crop
+            page and its immediate neighbors (driven by the student's
+            tagging) when you've already verified tagging is reliable
+            for this assignment.
     """
     return cache_relevant_pages(
         course_id, assignment_id, question_id, submission_id, include_all_pages

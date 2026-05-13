@@ -207,46 +207,138 @@ def get_assignment_outline(course_id: str, assignment_id: str) -> str:
     return "\n".join(lines)
 
 
-def export_assignment_scores(course_id: str, assignment_id: str) -> str:
-    """Export per-question scores for an assignment as a formatted table.
+def _fetch_assignment_scores_csv(
+    course_id: str, assignment_id: str,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Fetch and parse the /scores CSV for an assignment.
 
-    Returns a summary table with student names, total scores, and per-question
-    breakdowns. Requires instructor/TA access.
+    Returns ``(rows, fieldnames)``. Raises ``AuthError`` for auth failures
+    and ``ValueError`` for HTTP / content-type problems so callers can
+    return well-formatted error strings.
+    """
+    conn = get_connection()
+    url = (
+        f"{conn.gradescope_base_url}"
+        f"/courses/{course_id}/assignments/{assignment_id}/scores"
+    )
+    resp = conn.session.get(url)
+    if resp.status_code != 200:
+        raise ValueError(
+            f"Cannot access scores (status {resp.status_code}). "
+            "Check permissions."
+        )
+    content_type = resp.headers.get("content-type", "")
+    if "csv" not in content_type and "text" not in content_type:
+        raise ValueError(f"Unexpected content type: {content_type}")
+
+    reader = csv.DictReader(io.StringIO(resp.text))
+    rows = list(reader)
+    fieldnames = list(reader.fieldnames or [])
+    return rows, fieldnames
+
+
+def get_student_assignment_link(
+    course_id: str,
+    assignment_id: str,
+    student_name: str,
+) -> str:
+    """Return the per-student `/assignments/.../submissions/Z` URL.
+
+    Looks up the student's row in the scores CSV by exact-match name and
+    returns the Gradescope link that opens the **entire** assignment
+    submission (cover sheet view), not a single-question grade page.
+
+    Useful for skim-review of one student across all questions, e.g. when
+    flagged by an outlier-detection pass.
 
     Args:
         course_id: The Gradescope course ID.
         assignment_id: The assignment ID.
+        student_name: Exact match against ``"First Last"`` as Gradescope
+            stores it (concatenation of First Name + Last Name columns).
+            Case-sensitive.
+
+    Returns:
+        The plain submission URL as a single-line string on success, or
+        a clear ``Error: ...`` message if the student isn't found, has no
+        submission, or matches multiple rows.
     """
-    if not course_id or not assignment_id:
-        return "Error: both course_id and assignment_id are required."
+    if not course_id or not assignment_id or not student_name:
+        return "Error: course_id, assignment_id, and student_name are required."
 
     try:
-        conn = get_connection()
-        url = f"{conn.gradescope_base_url}/courses/{course_id}/assignments/{assignment_id}/scores"
-        resp = conn.session.get(url)
+        rows, _fields = _fetch_assignment_scores_csv(course_id, assignment_id)
     except AuthError as e:
         return f"Authentication error: {e}"
+    except ValueError as e:
+        return f"Error: {e}"
     except Exception as e:
         return f"Error fetching scores: {e}"
 
-    if resp.status_code != 200:
-        return f"Error: Cannot access scores (status {resp.status_code}). Check permissions."
+    conn = get_connection()
 
-    content_type = resp.headers.get("content-type", "")
-    if "csv" not in content_type and "text" not in content_type:
-        return f"Error: Unexpected content type: {content_type}"
+    needle = student_name.strip()
+    matches = []
+    for r in rows:
+        full = f"{r.get('First Name', '')} {r.get('Last Name', '')}".strip()
+        if full == needle:
+            matches.append(r)
 
-    # Parse the CSV. Capture fieldnames eagerly: a 200 with empty body would
-    # leave reader.fieldnames as None and crash the question-column list-comp.
-    reader = csv.DictReader(io.StringIO(resp.text))
-    rows = list(reader)
-    fieldnames = list(reader.fieldnames or [])
+    if not matches:
+        return (
+            f"Error: no student named `{needle}` found in assignment "
+            f"`{assignment_id}` roster. Check spelling — match is "
+            f"case-sensitive against 'First Last' as it appears in the "
+            f"scores CSV."
+        )
+    if len(matches) > 1:
+        # Two students with literally identical names — surface them.
+        emails = [r.get("Email", "") for r in matches]
+        return (
+            f"Error: multiple students named `{needle}` found "
+            f"({len(matches)} rows). Disambiguate by email: {emails}."
+        )
 
-    if not rows:
-        return f"No scores found for assignment `{assignment_id}`."
+    r = matches[0]
+    sub_id = (r.get("Submission ID") or "").strip()
+    if not sub_id:
+        return (
+            f"Student `{needle}` has no submission for assignment "
+            f"`{assignment_id}` (missing / not submitted)."
+        )
 
-    # Build summary statistics
-    total_students = len(rows)
+    url = (
+        f"{conn.gradescope_base_url}/courses/{course_id}"
+        f"/assignments/{assignment_id}/submissions/{sub_id}"
+    )
+    return f"{url}"
+
+
+# Columns that aren't per-question score columns.
+_NON_QUESTION_CSV_COLUMNS = frozenset({
+    "First Name", "Last Name", "SID", "Email", "Sections",
+    "Total Score", "Max Points", "Status", "Submission ID",
+    "Submission Time", "Lateness (H:M:S)", "View Count",
+    "Submission Count",
+})
+
+
+def _row_max_points(r: dict) -> str:
+    return r.get("Max Points", "N/A") or "N/A"
+
+
+def _parse_score(value) -> float | None:
+    """Best-effort float-parse a CSV cell. Returns None for blanks/junk."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _summarize_scores_csv(rows: list[dict], fieldnames: list[str]) -> dict:
+    """Compute summary statistics + per-question column list from CSV rows."""
     graded = [r for r in rows if r.get("Status") == "Graded"]
     missing = [r for r in rows if r.get("Status") == "Missing"]
     # Submitted = not missing AND has a non-empty submission marker. Many
@@ -259,48 +351,132 @@ def export_assignment_scores(course_id: str, assignment_id: str) -> str:
         and (r.get("Submission ID") or r.get("Submission Time"))
     ]
 
-    scores = []
+    scores: list[float] = []
     for r in graded:
-        try:
-            scores.append(float(r.get("Total Score", 0)))
-        except (ValueError, TypeError):
-            pass
+        parsed = _parse_score(r.get("Total Score"))
+        if parsed is not None:
+            scores.append(parsed)
 
-    # Per-row Max Points so bonus credit / per-student overrides render
-    # correctly. Falls back to "N/A" only when the column is missing entirely.
-    def _row_max(r: dict) -> str:
-        return r.get("Max Points", "N/A") or "N/A"
-
-    distinct_max = {_row_max(r) for r in rows}
+    distinct_max = {_row_max_points(r) for r in rows}
     summary_max = next(iter(distinct_max)) if len(distinct_max) == 1 else "varies"
 
-    lines = [f"## Scores for Assignment {assignment_id}\n"]
-    lines.append(f"**Total students:** {total_students}")
-    lines.append(f"**Graded:** {len(graded)}")
-    lines.append(f"**Submitted (not yet graded):** {max(0, len(submitted) - len(graded))}")
-    lines.append(f"**Missing:** {len(missing)}")
-    lines.append(f"**Max points:** {summary_max}")
+    question_cols = [c for c in fieldnames if c not in _NON_QUESTION_CSV_COLUMNS]
 
+    summary = {
+        "total_students": len(rows),
+        "graded": len(graded),
+        "submitted_not_yet_graded": max(0, len(submitted) - len(graded)),
+        "missing": len(missing),
+        "max_points": summary_max,
+        "question_columns": question_cols,
+    }
     if scores:
-        lines.append(f"**Average score:** {statistics.mean(scores):.2f}")
-        lines.append(f"**Min:** {min(scores):.1f} | **Max:** {max(scores):.1f}")
-        lines.append(f"**Median:** {statistics.median(scores):.1f}")
+        summary["average_score"] = round(statistics.mean(scores), 2)
+        summary["min_score"] = min(scores)
+        summary["max_score"] = max(scores)
+        summary["median_score"] = statistics.median(scores)
+    return summary
 
-    # Show per-question column names to reveal the question structure
-    question_cols = [
-        col for col in fieldnames
-        if col not in (
-            "First Name", "Last Name", "SID", "Email", "Sections",
-            "Total Score", "Max Points", "Status", "Submission ID",
-            "Submission Time", "Lateness (H:M:S)", "View Count",
-            "Submission Count",
+
+def export_assignment_scores(
+    course_id: str,
+    assignment_id: str,
+    output_format: str = "markdown",
+) -> str:
+    """Export per-question scores for an assignment.
+
+    Returns either a markdown table (truncated to the first 20 students)
+    for quick eyeballing, or a complete JSON payload with every student
+    and every per-question score. Requires instructor/TA access.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID.
+        output_format: ``"markdown"`` (default) for a compact summary
+            table, or ``"json"`` for the full, untruncated payload
+            including per-question scores per student. Use ``"json"``
+            when you need every row or need to feed scores into other
+            analysis.
+
+    Returns:
+        Markdown string when ``output_format="markdown"`` (default),
+        or a JSON string when ``output_format="json"``. The JSON shape
+        is ``{"assignment_id", "summary", "students": [{"name", "email",
+        "sid", "submission_id", "status", "total_score", "max_points",
+        "lateness", "question_scores": {col: float|None, ...}}, ...]}``.
+    """
+    if not course_id or not assignment_id:
+        return "Error: both course_id and assignment_id are required."
+
+    if output_format not in ("markdown", "json"):
+        return 'Error: output_format must be "markdown" or "json".'
+
+    try:
+        rows, fieldnames = _fetch_assignment_scores_csv(course_id, assignment_id)
+    except AuthError as e:
+        return f"Authentication error: {e}"
+    except ValueError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error fetching scores: {e}"
+
+    if not rows:
+        if output_format == "json":
+            return json.dumps({
+                "assignment_id": assignment_id,
+                "summary": {"total_students": 0},
+                "students": [],
+            })
+        return f"No scores found for assignment `{assignment_id}`."
+
+    summary = _summarize_scores_csv(rows, fieldnames)
+    question_cols = summary["question_columns"]
+
+    if output_format == "json":
+        students = []
+        for r in rows:
+            name = f"{r.get('First Name', '')} {r.get('Last Name', '')}".strip()
+            students.append({
+                "name": name,
+                "email": r.get("Email", ""),
+                "sid": r.get("SID", ""),
+                "submission_id": r.get("Submission ID", ""),
+                "status": r.get("Status", ""),
+                "total_score": _parse_score(r.get("Total Score")),
+                "max_points": _row_max_points(r),
+                "lateness": r.get("Lateness (H:M:S)", ""),
+                "question_scores": {
+                    col: _parse_score(r.get(col)) for col in question_cols
+                },
+            })
+        return json.dumps({
+            "assignment_id": assignment_id,
+            "summary": summary,
+            "students": students,
+        }, indent=2)
+
+    # Markdown summary (existing behavior, lightly refactored)
+    lines = [f"## Scores for Assignment {assignment_id}\n"]
+    lines.append(f"**Total students:** {summary['total_students']}")
+    lines.append(f"**Graded:** {summary['graded']}")
+    lines.append(f"**Submitted (not yet graded):** {summary['submitted_not_yet_graded']}")
+    lines.append(f"**Missing:** {summary['missing']}")
+    lines.append(f"**Max points:** {summary['max_points']}")
+
+    if "average_score" in summary:
+        lines.append(f"**Average score:** {summary['average_score']:.2f}")
+        lines.append(
+            f"**Min:** {summary['min_score']:.1f} | "
+            f"**Max:** {summary['max_score']:.1f}"
         )
-    ]
+        lines.append(f"**Median:** {summary['median_score']:.1f}")
+
     if question_cols:
         lines.append(f"\n**Question breakdown:** {', '.join(question_cols)}")
 
-    # Show first 20 students as a table
-    lines.append(f"\n### Student Scores (showing {min(20, len(rows))} of {len(rows)})\n")
+    lines.append(
+        f"\n### Student Scores (showing {min(20, len(rows))} of {len(rows)})\n"
+    )
     lines.append("| Name | Email | Total | Status | Lateness |")
     lines.append("|------|-------|-------|--------|----------|")
     for r in rows[:20]:
@@ -309,10 +485,15 @@ def export_assignment_scores(course_id: str, assignment_id: str) -> str:
         total = r.get("Total Score", "N/A")
         status = r.get("Status", "N/A")
         lateness = r.get("Lateness (H:M:S)", "")
-        lines.append(f"| {name} | {email} | {total}/{_row_max(r)} | {status} | {lateness} |")
+        lines.append(
+            f"| {name} | {email} | {total}/{_row_max_points(r)} | {status} | {lateness} |"
+        )
 
     if len(rows) > 20:
-        lines.append(f"\n_... and {len(rows) - 20} more students_")
+        lines.append(
+            f"\n_... and {len(rows) - 20} more students. "
+            f"Re-run with `output_format=\"json\"` to get all rows._"
+        )
 
     return "\n".join(lines)
 

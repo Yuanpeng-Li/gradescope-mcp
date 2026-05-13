@@ -331,15 +331,19 @@ def _compute_readiness(
         score += 0.1
         reasons.append("Few relevant pages reduce ambiguity.")
     elif len(pages) >= 5:
-        reasons.append("Many pages increase the chance of cross-page spillover.")
+        reasons.append(
+            "Several relevant pages — review the crop first and only "
+            "fall back to full pages if the crop is truncated."
+        )
 
     # Penalties for complex submissions
     if any((rect.get("y2", 0) - rect.get("y1", 0)) > 30 for rect in crop_rects):
         reasons.append("Large crop height suggests the answer may span more than one logical block.")
         score -= 0.05
-    if len(pages) >= 8:
-        reasons.append("This submission has many scanned pages, so cross-page spillover is more likely.")
-        score -= 0.05
+    # Note: we used to penalize ≥8-page submissions, but multi-page
+    # scanned exams are the norm rather than a risk signal. The
+    # crop-first reading order already handles spillover; double-counting
+    # page count was making routine submissions look not_ready.
 
     bounded = max(0.0, min(score, 0.95))
     if bounded >= 0.8:

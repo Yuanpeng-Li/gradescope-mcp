@@ -15,6 +15,7 @@ from typing import Iterable
 from bs4 import BeautifulSoup
 
 from gradescope_mcp.auth import get_connection, AuthError
+from gradescope_mcp.tools.grading import _build_question_tree, _get_outline_data
 from gradescope_mcp.tools.safety import write_confirmation_required
 
 logger = logging.getLogger(__name__)
@@ -708,6 +709,11 @@ def apply_grade(
 
     **WARNING**: This modifies student grades. Use with caution.
 
+    The ``comment`` parameter maps to Gradescope's "Provide comments
+    specific to this submission" field — it is **separate** from
+    rubric items in the wire payload, so applying a comment does not
+    silently clear rubric state and vice versa.
+
     Args:
         course_id: The Gradescope course ID.
         question_id: The question ID.
@@ -716,7 +722,12 @@ def apply_grade(
             this list will be unchecked. Pass None to keep current rubric unchanged.
         point_adjustment: Submission-specific point adjustment (can be negative).
             Pass None to keep current adjustment unchanged.
-        comment: Grader comment for this submission. Pass None to keep unchanged.
+        comment: Per-submission grader comment.
+            - ``None`` (default): keep the existing comment unchanged.
+            - ``""`` (empty string): **clear** any existing comment.
+            - Any other string: overwrite the comment with this text.
+            Stored in Gradescope's ``question_submission_evaluation.comments``
+            field, independent of ``rubric_item_ids``.
         confidence: Agent's self-assessed grading confidence (0.0-1.0).
             - < 0.6: Grade will be REJECTED — skip or flag for human review.
             - 0.6-0.8: Grade will proceed with a warning to review.
@@ -870,10 +881,15 @@ def apply_grade_batch(
 
     Each ``grades`` entry is a dict:
         - ``submission_id``: str (required)
-        - ``rubric_item_ids``: list[str] | None — same semantics as apply_grade
-        - ``point_adjustment``: float | None
-        - ``comment``: str | None
-        - ``confidence``: float | None — per-row gate (<0.6 is rejected)
+        - ``rubric_item_ids``: list[str] | None — same semantics as
+          ``apply_grade``: ``None`` keeps current rubric state, ``[]`` clears
+          all items, a list overwrites with that exact set.
+        - ``point_adjustment``: float | None — ``None`` keeps current.
+        - ``comment``: str | None — per-submission comment (Gradescope's
+          "Provide comments specific to this submission" field, separate
+          from rubric items). ``None`` keeps the existing comment, ``""``
+          clears it, any other string overwrites.
+        - ``confidence``: float | None — per-row gate (<0.6 is rejected).
 
     All entries are applied to the same ``question_id``. Confidence gating is
     per-row. On ``confirm_write=False`` returns a compact preview table.
@@ -1268,6 +1284,125 @@ def list_question_submissions(
     )
 
     return json.dumps({"summary": summary, "submissions": entries}, indent=2)
+
+
+def get_student_submission_map(
+    course_id: str,
+    assignment_id: str,
+    student_name: str = "",
+) -> str:
+    """Build a per-student → {question_id: submission_id} map for an assignment.
+
+    For each leaf question in the assignment outline (i.e. each gradable
+    question, not the parent QuestionGroup), fetch the submission entries
+    and group by student. Use this when reviewing several questions for one
+    student — it replaces N calls to ``list_question_submissions`` plus a
+    client-side join.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID.
+        student_name: Optional exact-match filter. When provided, the
+            result only contains submissions for that student. Matching is
+            case-sensitive against ``"First Last"`` exactly as Gradescope
+            renders it on the submissions page.
+
+    Returns:
+        JSON with keys ``questions`` (the leaf questions in outline order),
+        ``students`` (sorted alphabetically; each entry has ``name`` and a
+        ``submissions`` mapping of ``question_id`` → ``submission_id``),
+        and optionally ``errors`` (per-question fetch errors) or
+        ``warning`` (when a ``student_name`` filter yields zero rows).
+
+    The submission IDs returned are **Question Submission IDs**, ready to
+    feed into ``get_submission_grading_context`` / ``apply_grade``.
+
+    Limitation: students are keyed only by display name. If two students
+    in the roster share a literal "First Last" string, their submissions
+    will merge under one entry (last write wins per question). For
+    disambiguation by email, use ``tool_get_student_assignment_link``
+    which reads the scores CSV.
+    """
+    if not course_id or not assignment_id:
+        return "Error: course_id and assignment_id are required."
+
+    try:
+        props = _get_outline_data(course_id, assignment_id)
+    except AuthError as e:
+        return f"Authentication error: {e}"
+    except ValueError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error fetching outline: {e}"
+
+    questions = props.get("questions", {})
+    if not questions:
+        return f"No questions found for assignment `{assignment_id}`."
+
+    tree = _build_question_tree(questions)
+
+    # Collect leaf questions in outline order. A "leaf" is any node that
+    # holds submissions: children of a QuestionGroup, or a standalone
+    # top-level question with no children.
+    leaf_questions: list[dict] = []
+    for group in tree:
+        if group["children"]:
+            for child in group["children"]:
+                leaf_questions.append({
+                    "qid": str(child["id"]),
+                    "title": child.get("title") or "",
+                    "weight": child.get("weight"),
+                })
+        elif group["id"] is not None:
+            leaf_questions.append({
+                "qid": str(group["id"]),
+                "title": group.get("title") or "",
+                "weight": group.get("weight"),
+            })
+
+    if not leaf_questions:
+        return f"No leaf questions found for assignment `{assignment_id}`."
+
+    by_student: dict[str, dict[str, str]] = {}
+    errors: list[str] = []
+
+    for q in leaf_questions:
+        qid = q["qid"]
+        try:
+            entries = _fetch_question_submission_entries(course_id, qid)
+        except AuthError as e:
+            return f"Authentication error: {e}"
+        except Exception as e:
+            errors.append(f"question {qid}: {e}")
+            continue
+
+        for entry in entries:
+            name = (entry.get("student_name") or "").strip()
+            if not name:
+                continue
+            if student_name and name != student_name:
+                continue
+            by_student.setdefault(name, {})[qid] = entry["submission_id"]
+
+    students_out = [
+        {"name": name, "submissions": by_student[name]}
+        for name in sorted(by_student.keys())
+    ]
+
+    result: dict = {
+        "questions": leaf_questions,
+        "students": students_out,
+    }
+    if errors:
+        result["errors"] = errors
+    if student_name and not students_out:
+        result["warning"] = (
+            f"No submissions found for student `{student_name}`. "
+            f"Check spelling — match is case-sensitive against "
+            f"'First Last' as Gradescope renders it."
+        )
+
+    return json.dumps(result, indent=2)
 
 
 def get_next_ungraded(

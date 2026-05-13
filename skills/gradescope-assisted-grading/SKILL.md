@@ -150,6 +150,25 @@ Interpret it carefully:
 - Do not hallucinate a true answer key from placeholder text.
 - If needed, draft a fallback grading basis from the prompt, rubric, and domain knowledge, but treat it as internal guidance only.
 
+### Reference file structure for review workflows
+
+The user-reference markdown is the agent's working file — structure it
+for the workflows you'll need:
+
+- **Per-question section (default):** prompt + correct answer + rubric
+  items with IDs and weights + list of `(submission_id, student_name)`
+  for that question. Use this for question-by-question batch grading
+  (most common workflow).
+- **Per-student index (add when reviewing outliers):** when you need to
+  re-check several questions for one student (e.g. flagged prediction-
+  vs-actual outlier), append a `## Students` section with one entry per
+  student listing their `(question_label, qid, sid)` rows. The
+  fast way to populate this is `tool_get_student_submission_map`.
+
+Without the per-student index, reviewing 12 students × 19 questions
+requires 12 × 19 lookups across the per-question lists. With the
+index it's 12 lookups.
+
 For each question, call `tool_prepare_grading_artifact(course_id, assignment_id, question_id)` and read `/tmp/gradescope-mcp/gradescope-grading-{assignment_id}-{question_id}.md`.
 
 Use the artifact to gather:
@@ -185,6 +204,36 @@ user to approve before any rubric write. Do not patch the gap with
 `point_adjustment` per submission — that hides the policy across many
 grades and makes audits painful.
 
+For partial-credit questions, always include a **"Blank or completely
+off-topic"** item at the full question weight as the baseline. It is the
+only clean way to express "student wrote nothing relevant" without
+fighting the rubric, and graders consistently need it. Treat it as a
+default, not an optional add.
+
+### Marking a submission "graded" under negative scoring
+
+Under `scoring_type=negative`, submitting an empty `rubric_item_ids=[]`
+(or never touching the rubric) gives full credit numerically — but the
+Gradescope grading dashboard still flags the submission as *ungraded*
+because **no rubric item was clicked**. The progress counter only
+increments for submissions where at least one item is checked.
+
+If you want full-credit submissions to show as completed in
+`tool_get_grading_progress` and the per-question UI:
+
+- Apply the placeholder `Correct` (0 pt) item explicitly:
+  `rubric_item_ids=["<correct_item_id>"]`.
+- This adds 0 deduction (score stays at full weight) but flips the
+  "graded" flag.
+- If the rubric was created without a `Correct` placeholder, create one
+  with weight `0.0` before starting full-credit batches.
+
+The recurring symptom: you batch-write 39 grades, every score is correct,
+but `tool_get_grading_progress` reports 11/39 graded. Cause: the 28
+full-credit submissions had empty rubric. Fix: re-batch with
+`rubric_item_ids=["<correct_item_id>"]` on those 28; scores stay the
+same and the dashboard catches up.
+
 ### Reference priority
 
 Use this priority order:
@@ -207,6 +256,65 @@ Never begin grading a question without confirming its scoring mode. Using the wr
 If the scoring mode seen in tool output conflicts with the user's expectation, stop and ask which interpretation is correct before any write.
 
 If the user's lateness or resubmission policy conflicts with Gradescope's default score state, stop and ask before using rubric changes or `point_adjustment` to compensate.
+
+### Switching scoring_type mid-grading
+
+If the user toggles a question between `negative` and `positive` after
+some submissions are already graded (manually in the Gradescope rubric
+editor, or via a future MCP tool):
+
+1. **The question weight may reset to 0.** Gradescope's positive-scoring
+   model uses rubric item weights as the score; the question's `weight`
+   becomes display-only. After the switch, re-check with
+   `tool_get_question_rubric` and if the user expects a positive
+   `max` (e.g. a 3 pt bonus question), have them set it back in the
+   outline editor.
+2. **Already-applied rubric items keep their IDs but flip semantic
+   meaning.** A `-1` deduction item becomes a `+1` award item; the
+   description ("Distribution predicted *incorrectly* — 1pt deduction")
+   now reads backwards. You usually want to rename the existing items so
+   the description matches the new direction.
+3. **All current scores invert relative to intent.** A student previously
+   at 3/3 (no items applied = no deductions) is now at 0/3 (no items
+   applied = no awards). You must re-batch grades with the correct items
+   per student — renaming alone is **not** enough.
+4. The safest rollback path when the switch was a mistake is: flip
+   `scoring_type` back to its original value. Existing items + applied
+   item state then reproduce the original scores with no batch needed.
+
+Always preview the rubric and a sample submission before re-batching.
+
+### Bonus question pattern
+
+Bonus questions (predict-your-score, pick-a-number, etc.) usually have a
+score range different from a normal question. Two clean implementations:
+
+**(A) Positive scoring with weighted items (preferred when the bonus
+table has small fixed levels):**
+
+- Set question `weight = max bonus` in the outline (e.g. 8).
+- Set `scoring_type = positive`.
+- Create one rubric item per bonus level, with positive weight:
+  `[+1 (level 1), +2 (level 2), …, +8 (top tier)]`.
+- Plus the standard `Correct (0 pt)` item for "graded with 0 bonus".
+- Apply one item per student; `point_adjustment = 0`.
+- The rubric is self-documenting; the user can adjust any one student's
+  level by clicking a different item.
+
+**(B) Negative scoring + `point_adjustment` (preferred when the bonus
+formula is per-student and doesn't fit a small set of levels):**
+
+- Set question `weight = max bonus`.
+- Keep `scoring_type = negative` and the `Correct (0 pt)` placeholder.
+- Per student: apply `[Correct]` and set
+  `point_adjustment = bonus - weight` so final = max − (max − bonus) = bonus.
+- This works but the rubric carries no information; rationale must live
+  outside (in a `comment` or in the user's spreadsheet).
+
+Use (A) whenever the bonus follows a fixed table; switch to (B) when the
+bonus is a continuous function of per-student data (e.g. "bonus equals
+total points predicted minus actual"). Mixing the two patterns within
+one assignment is fine — keep them per-question.
 
 ## Rubric Review Loop
 
