@@ -854,3 +854,183 @@ def test_get_next_ungraded_uses_props_sid_after_auto_discovery(monkeypatch) -> N
     # so it should navigate to 300
     assert result == "CTX 1 2 300 json"
 
+
+
+def test_compute_new_score_with_raw_returns_preclamp_value() -> None:
+    # 0-point, ceiling-capped bonus question: +10 item clamps to 0, raw is 10.
+    props = {
+        "question": {
+            "weight": 0,
+            "scoring_type": "positive",
+            "floor": True,
+            "ceiling": True,
+        },
+        "rubric_items": [{"id": "300", "weight": 10}],
+    }
+    assert grading_ops._compute_new_score(props, ["300"], None, with_raw=True) == (
+        0.0,
+        set(),
+        10.0,
+    )
+    # Default (no with_raw) still returns the 2-tuple.
+    assert grading_ops._compute_new_score(props, ["300"], None) == (0.0, set())
+
+
+def _single_ctx(props: dict):
+    class _Session:
+        def post(self, url, **kwargs):
+            return SimpleNamespace(status_code=200, json=lambda: {}, text="")
+
+    return lambda *_a, **_k: {
+        "props": props,
+        "csrf_token": "t",
+        "session": _Session(),
+        "base_url": "https://example.com",
+    }
+
+
+def test_apply_grade_warns_when_save_leaves_submission_ungraded(monkeypatch) -> None:
+    """Empty rubric set + no adjustment does not mark the submission graded."""
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _single_ctx(
+            {
+                "question": {"title": "Q1", "weight": 5, "scoring_type": "negative"},
+                "submission": {"score": None, "graded": False},
+                "evaluation": {"points": None, "comments": None},
+                "rubric_items": [
+                    {"id": 100, "description": "Correct", "weight": 0},
+                    {"id": 200, "description": "Deduction", "weight": 2},
+                ],
+                "rubric_item_evaluations": [],
+                "urls": {"save_grade": "/save"},
+            }
+        ),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        rubric_item_ids=[],
+        confirm_write=True,
+    )
+
+    assert "Grade saved" in result
+    assert "will NOT mark this submission as graded" in result
+
+
+def test_apply_grade_warns_when_score_is_clamped(monkeypatch) -> None:
+    """Adding points beyond a 0-point, ceiling-capped question is clamped to 0."""
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _single_ctx(
+            {
+                "question": {
+                    "title": "Bonus",
+                    "weight": 0,
+                    "scoring_type": "positive",
+                    "floor": True,
+                    "ceiling": True,
+                },
+                "submission": {"score": None, "graded": False},
+                "evaluation": {"points": None, "comments": None},
+                "rubric_items": [{"id": 300, "description": "Bonus", "weight": 10}],
+                "rubric_item_evaluations": [],
+                "urls": {"save_grade": "/save"},
+            }
+        ),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        rubric_item_ids=["300"],
+        confirm_write=True,
+    )
+
+    assert "Grade saved" in result
+    assert "Score clamped from 10 to 0" in result
+
+
+def test_apply_grade_batch_flags_ungraded_rows(monkeypatch) -> None:
+    posts: list = []
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _make_fake_batch_ctx_builder(posts),
+    )
+
+    result = grading_ops.apply_grade_batch(
+        course_id="1",
+        question_id="2",
+        grades=[{"submission_id": "501", "rubric_item_ids": []}],
+        confirm_write=True,
+    )
+
+    assert "Check these writes" in result
+    assert "will NOT mark this submission as graded" in result
+
+
+def test_apply_grade_uses_resolved_points_for_reported_score(monkeypatch) -> None:
+    # A pre-existing point adjustment (evaluation.points) must be reflected in the
+    # reported score even when point_adjustment is None on this call.
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _single_ctx(
+            {
+                "question": {"title": "Q", "weight": 5, "scoring_type": "negative"},
+                "submission": {"score": None, "graded": False},
+                "evaluation": {"points": 1, "comments": None},
+                "rubric_items": [{"id": 100, "description": "Deduct", "weight": 2}],
+                "rubric_item_evaluations": [],
+                "urls": {"save_grade": "/save"},
+            }
+        ),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        rubric_item_ids=["100"],
+        point_adjustment=None,
+        confirm_write=True,
+    )
+
+    # 5 - 2 (deduction) + 1 (pre-existing adjustment carried via resolved_points) = 4.
+    assert "**New score:** 4/5" in result
+
+
+def test_apply_grade_ungraded_warning_is_scoring_aware(monkeypatch) -> None:
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _single_ctx(
+            {
+                "question": {"title": "Bonus", "weight": 5, "scoring_type": "positive"},
+                "submission": {"score": None, "graded": False},
+                "evaluation": {"points": None, "comments": None},
+                "rubric_items": [{"id": 100, "description": "x", "weight": 2}],
+                "rubric_item_evaluations": [],
+                "urls": {"save_grade": "/save"},
+            }
+        ),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        rubric_item_ids=[],
+        confirm_write=True,
+    )
+
+    assert "will NOT mark this submission as graded" in result
+    # Positive scoring must not get the negative-scoring "0-point Correct" advice.
+    assert "negative scoring" not in result
+    assert "0-point" not in result
