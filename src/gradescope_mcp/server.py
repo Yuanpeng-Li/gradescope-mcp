@@ -410,20 +410,29 @@ def tool_get_assignment_statistics(course_id: str, assignment_id: str) -> str:
 
 @mcp.tool()
 def tool_get_submission_grading_context(
-    course_id: str, question_id: str, submission_id: str
+    course_id: str,
+    question_id: str,
+    submission_id: str,
+    include_page_urls: bool = False,
 ) -> str:
     """Get full grading context for a question submission.
 
     Returns current rubric items (with IDs), applied evaluations, score,
     comments, point adjustment, navigation URLs (next/prev/ungraded),
-    and submission page images. Use this before applying grades.
+    and submission page numbers. Use this before applying grades.
 
     Args:
         course_id: The Gradescope course ID.
         question_id: The question ID.
         submission_id: The question submission ID.
+        include_page_urls: When True, include the signed page-image URLs.
+            They are long and expire quickly, so they are omitted by default;
+            page numbers are always shown. Use cache_relevant_pages /
+            smart_read_submission to fetch page images.
     """
-    return get_submission_grading_context(course_id, question_id, submission_id)
+    return get_submission_grading_context(
+        course_id, question_id, submission_id, include_page_urls=include_page_urls
+    )
 
 
 @mcp.tool()

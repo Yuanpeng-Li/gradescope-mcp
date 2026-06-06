@@ -6,6 +6,26 @@
 
 ---
 
+## 2026-06-05: Make submission page-image URLs opt-in
+
+### What was done
+
+- `get_submission_grading_context` (and the `tool_` wrapper) gained an
+  `include_page_urls: bool = False` parameter. Markdown output now lists page
+  numbers and the relevant-pages hint by default and omits the signed
+  page-image URLs, which are multi-KB and expire quickly. Pass
+  `include_page_urls=True` to restore them. JSON output is unchanged.
+- Motivation: each grading-context call previously emitted several long signed
+  S3 URLs, a large token cost for data an agent typically fetches via
+  `cache_relevant_pages` / `smart_read_submission` instead.
+
+### Tests
+
+- Updated the markdown pages test for the new default and added a test for
+  `include_page_urls=True`. Suite: **68 passed**.
+
+---
+
 ## Session 9 — 2026-03-18: Full Project Audit And Documentation Refresh
 
 ### What was done

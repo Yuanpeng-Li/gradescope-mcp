@@ -163,6 +163,7 @@ def get_submission_grading_context(
     question_id: str,
     submission_id: str,
     output_format: str = "markdown",
+    include_page_urls: bool = False,
 ) -> str:
     """Get the full grading context for a specific question submission.
 
@@ -174,6 +175,12 @@ def get_submission_grading_context(
         question_id: The question ID.
         submission_id: The question submission ID (NOT the assignment submission ID).
         output_format: "markdown" (default) or "json" for structured output.
+        include_page_urls: When True, the markdown output includes the signed
+            page-image URLs. These are long (multi-KB query strings) and expire
+            quickly, so they are omitted by default to keep the context compact;
+            page numbers and the relevant-pages hint are always shown. Use
+            ``cache_relevant_pages`` / ``smart_read_submission`` to actually
+            fetch page images. (No effect on JSON output.)
     """
     if not course_id or not question_id or not submission_id:
         return "Error: course_id, question_id, and submission_id are required."
@@ -346,17 +353,24 @@ def get_submission_grading_context(
 
     # Scanned PDF pages for this question
     if pages:
+        real_pages = [p for p in pages if isinstance(p, dict) and not _is_placeholder_page(p)]
         lines.append(f"\n### Submission Pages ({len(pages)})")
         if crop:
             crop_pages = sorted(set(c.get("page_number") for c in crop if "page_number" in c))
             lines.append(f"**Relevant pages:** {crop_pages}")
-        for p in pages[:3]:
-            if isinstance(p, dict) and p.get("url") and not _is_placeholder_page(p):
-                page_num = p.get('number') or '?'
+        for p in real_pages[:3]:
+            page_num = p.get("number") or "?"
+            if include_page_urls and p.get("url"):
                 lines.append(f"- Page {page_num}: [View]({_normalize_url(p['url'])})")
-        real_pages = [p for p in pages if isinstance(p, dict) and not _is_placeholder_page(p)]
+            else:
+                lines.append(f"- Page {page_num}")
         if len(real_pages) > 3:
             lines.append(f"- _...and {len(real_pages) - 3} more pages_")
+        if not include_page_urls and any(p.get("url") for p in real_pages):
+            lines.append(
+                "_Page image URLs omitted to save space; pass "
+                "`include_page_urls=True` to include them._"
+            )
 
     return "\n".join(lines)
 
