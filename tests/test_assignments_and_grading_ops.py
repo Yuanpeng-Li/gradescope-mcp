@@ -984,3 +984,44 @@ def test_apply_grade_batch_preview_shows_full_credit(monkeypatch) -> None:
 
     assert "full credit (0-pt item)" in result
     assert posts == []
+
+
+def test_full_credit_ignores_missing_or_invalid_weights(monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _fc_ctx(
+            [
+                {"id": 100, "description": "Correct", "weight": 0},
+                {"id": 200, "description": "Missing weight"},
+                {"id": 300, "description": "Invalid weight", "weight": "n/a"},
+            ],
+            captured,
+        ),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        full_credit=True,
+        confirm_write=True,
+    )
+
+    # Only the explicit 0-point item is the benchmark; missing/invalid weights
+    # must not be auto-selected.
+    assert "Grade saved" in result
+    assert captured["json"]["rubric_items"]["100"] == {"score": "true"}
+    assert captured["json"]["rubric_items"]["200"] == {"score": "false"}
+    assert captured["json"]["rubric_items"]["300"] == {"score": "false"}
+
+
+def test_parses_to_zero_only_for_explicit_zero() -> None:
+    assert grading_ops._parses_to_zero(0) is True
+    assert grading_ops._parses_to_zero("0") is True
+    assert grading_ops._parses_to_zero(0.0) is True
+    assert grading_ops._parses_to_zero(None) is False
+    assert grading_ops._parses_to_zero("") is False
+    assert grading_ops._parses_to_zero("n/a") is False
+    assert grading_ops._parses_to_zero(2) is False

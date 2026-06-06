@@ -108,11 +108,19 @@ def _format_score(score: float | None) -> str:
     return f"{score:g}"
 
 
-def _safe_weight(weight: object) -> float:
+def _parses_to_zero(weight: object) -> bool:
+    """True only when ``weight`` is an explicitly parseable value equal to 0.
+
+    Missing (``None``) or unparseable weights return ``False`` so they are
+    treated as unknown/non-zero rather than being misclassified as the 0-point
+    full-credit benchmark.
+    """
+    if weight is None:
+        return False
     try:
-        return float(weight or 0)
+        return float(weight) == 0.0
     except (TypeError, ValueError):
-        return 0.0
+        return False
 
 
 def _resolve_full_credit_items(props: dict) -> tuple[list[str] | None, str | None]:
@@ -137,7 +145,7 @@ def _resolve_full_credit_items(props: dict) -> tuple[list[str] | None, str | Non
     zero_items = [
         str(ri["id"])
         for ri in (props.get("rubric_items", []) or [])
-        if "id" in ri and _safe_weight(ri.get("weight")) == 0.0
+        if "id" in ri and _parses_to_zero(ri.get("weight"))
     ]
     if len(zero_items) == 1:
         return zero_items, None
