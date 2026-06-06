@@ -973,3 +973,64 @@ def test_apply_grade_batch_flags_ungraded_rows(monkeypatch) -> None:
 
     assert "Check these writes" in result
     assert "will NOT mark this submission as graded" in result
+
+
+def test_apply_grade_uses_resolved_points_for_reported_score(monkeypatch) -> None:
+    # A pre-existing point adjustment (evaluation.points) must be reflected in the
+    # reported score even when point_adjustment is None on this call.
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _single_ctx(
+            {
+                "question": {"title": "Q", "weight": 5, "scoring_type": "negative"},
+                "submission": {"score": None, "graded": False},
+                "evaluation": {"points": 1, "comments": None},
+                "rubric_items": [{"id": 100, "description": "Deduct", "weight": 2}],
+                "rubric_item_evaluations": [],
+                "urls": {"save_grade": "/save"},
+            }
+        ),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        rubric_item_ids=["100"],
+        point_adjustment=None,
+        confirm_write=True,
+    )
+
+    # 5 - 2 (deduction) + 1 (pre-existing adjustment carried via resolved_points) = 4.
+    assert "**New score:** 4/5" in result
+
+
+def test_apply_grade_ungraded_warning_is_scoring_aware(monkeypatch) -> None:
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _single_ctx(
+            {
+                "question": {"title": "Bonus", "weight": 5, "scoring_type": "positive"},
+                "submission": {"score": None, "graded": False},
+                "evaluation": {"points": None, "comments": None},
+                "rubric_items": [{"id": 100, "description": "x", "weight": 2}],
+                "rubric_item_evaluations": [],
+                "urls": {"save_grade": "/save"},
+            }
+        ),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        rubric_item_ids=[],
+        confirm_write=True,
+    )
+
+    assert "will NOT mark this submission as graded" in result
+    # Positive scoring must not get the negative-scoring "0-point Correct" advice.
+    assert "negative scoring" not in result
+    assert "0-point" not in result

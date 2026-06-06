@@ -153,12 +153,21 @@ def _grade_write_warnings(
             f"ceiling in Gradescope, then re-apply."
         )
     if not apply_ids and resolved_points is None:
-        warnings.append(
+        base = (
             "No rubric items are checked and no point adjustment is set, so "
-            "Gradescope will NOT mark this submission as graded. For full "
-            "credit in negative scoring, check the question's 0-point "
-            '"Correct" benchmark item (pass its ID in rubric_item_ids).'
+            "Gradescope will NOT mark this submission as graded."
         )
+        if question.get("scoring_type", "negative") == "negative":
+            base += (
+                " For full credit in negative scoring, check the question's "
+                '0-point "Correct" benchmark item (pass its ID in rubric_item_ids).'
+            )
+        else:
+            base += (
+                " Check the appropriate rubric items, or set a point adjustment, "
+                "to record a grade."
+            )
+        warnings.append(base)
     return warnings
 
 
@@ -906,7 +915,7 @@ def apply_grade(
 
     if resp.status_code == 200:
         new_score, unknown_ids, raw_score = _compute_new_score(
-            props, apply_ids, point_adjustment, with_raw=True
+            props, apply_ids, resolved_points, with_raw=True
         )
         warning = ""
         if unknown_ids:
