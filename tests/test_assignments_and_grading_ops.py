@@ -854,3 +854,133 @@ def test_get_next_ungraded_uses_props_sid_after_auto_discovery(monkeypatch) -> N
     # so it should navigate to 300
     assert result == "CTX 1 2 300 json"
 
+
+
+def _fc_ctx(rubric_items: list[dict], captured: dict | None = None):
+    class _Session:
+        def post(self, url, **kwargs):
+            if captured is not None:
+                captured["json"] = kwargs.get("json")
+            return SimpleNamespace(status_code=200, json=lambda: {}, text="")
+
+    return lambda *_a, **_k: {
+        "props": {
+            "question": {"title": "Q", "weight": 5, "scoring_type": "negative"},
+            "submission": {"score": None, "graded": False},
+            "evaluation": {"points": None, "comments": None},
+            "rubric_items": rubric_items,
+            "rubric_item_evaluations": [],
+            "urls": {"save_grade": "/save"},
+        },
+        "csrf_token": "t",
+        "session": _Session(),
+        "base_url": "https://example.com",
+    }
+
+
+def test_apply_grade_full_credit_checks_benchmark_item(monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _fc_ctx(
+            [
+                {"id": 100, "description": "Correct", "weight": 0},
+                {"id": 200, "description": "Deduction", "weight": 2},
+            ],
+            captured,
+        ),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        full_credit=True,
+        confirm_write=True,
+    )
+
+    assert "Grade saved" in result
+    assert "**New score:** 5/5" in result
+    assert captured["json"]["rubric_items"]["100"] == {"score": "true"}
+    assert captured["json"]["rubric_items"]["200"] == {"score": "false"}
+
+
+def test_apply_grade_full_credit_errors_on_ambiguous_benchmark(monkeypatch) -> None:
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _fc_ctx(
+            [
+                {"id": 100, "description": "Correct", "weight": 0},
+                {"id": 300, "description": "Also zero", "weight": 0},
+            ]
+        ),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        full_credit=True,
+        confirm_write=True,
+    )
+
+    assert "multiple 0-point items" in result
+
+
+def test_apply_grade_full_credit_rejects_with_rubric_item_ids(monkeypatch) -> None:
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _fc_ctx([{"id": 100, "description": "Correct", "weight": 0}]),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        rubric_item_ids=["100"],
+        full_credit=True,
+        confirm_write=True,
+    )
+
+    assert "not both" in result
+
+
+def test_apply_grade_batch_full_credit_row(monkeypatch) -> None:
+    posts: list = []
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _make_fake_batch_ctx_builder(posts),
+    )
+
+    result = grading_ops.apply_grade_batch(
+        course_id="1",
+        question_id="2",
+        grades=[{"submission_id": "501", "full_credit": True}],
+        confirm_write=True,
+    )
+
+    assert "**succeeded:** 1" in result
+    # The builder's 0-weight benchmark item (id 100) must be checked.
+    assert posts and posts[0]["json"]["rubric_items"]["100"] == {"score": "true"}
+
+
+def test_apply_grade_batch_preview_shows_full_credit(monkeypatch) -> None:
+    posts: list = []
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _make_fake_batch_ctx_builder(posts),
+    )
+
+    result = grading_ops.apply_grade_batch(
+        course_id="1",
+        question_id="2",
+        grades=[{"submission_id": "501", "full_credit": True}],
+    )
+
+    assert "full credit (0-pt item)" in result
+    assert posts == []
