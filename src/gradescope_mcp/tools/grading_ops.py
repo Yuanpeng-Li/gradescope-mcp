@@ -40,7 +40,9 @@ def _compute_new_score(
     props: dict,
     apply_ids: Iterable[str] | None,
     point_adjustment: float | int | None,
-) -> tuple[float | None, set[str]]:
+    *,
+    with_raw: bool = False,
+) -> tuple[float | None, set[str]] | tuple[float | None, set[str], float | None]:
     """Compute the resulting score from rubric items + adjustment.
 
     Mirrors Gradescope's scoring semantics so callers can report the real
@@ -53,15 +55,21 @@ def _compute_new_score(
     ``apply_ids`` that don't exist in the question's current rubric — those
     contribute 0 to the local sum but Gradescope may reject them server-side,
     so callers should surface them to the user.
+
+    When ``with_raw=True``, returns a ``(score, unknown_ids, raw_score)``
+    triple where ``raw_score`` is the score *before* floor/ceiling clamping.
+    Callers can compare ``score`` and ``raw_score`` to detect (and warn about)
+    a clamped result — e.g. trying to add bonus points on a 0-point,
+    ceiling-capped question.
     """
     question = props.get("question", {}) or {}
     weight = question.get("weight")
     if weight is None:
-        return None, set()
+        return (None, set(), None) if with_raw else (None, set())
     try:
         weight_f = float(weight)
     except (TypeError, ValueError):
-        return None, set()
+        return (None, set(), None) if with_raw else (None, set())
 
     scoring_type = question.get("scoring_type", "negative")
     floor = question.get("floor")
@@ -92,10 +100,13 @@ def _compute_new_score(
     else:
         score = weight_f - applied_sum + pa
 
+    raw_score = score
     if floor and score < 0:
         score = 0.0
     if ceiling and score > weight_f:
         score = weight_f
+    if with_raw:
+        return score, unknown_ids, raw_score
     return score, unknown_ids
 
 
@@ -106,6 +117,49 @@ def _format_score(score: float | None) -> str:
     if float(score).is_integer():
         return str(int(score))
     return f"{score:g}"
+
+
+def _grade_write_warnings(
+    apply_ids: set[str],
+    resolved_points: float | int | None,
+    raw_score: float | None,
+    final_score: float | None,
+    question: dict,
+) -> list[str]:
+    """Flag grade writes whose persisted result may surprise the caller.
+
+    Two failure modes show up in real grading runs, both of which the locally
+    computed "new score" alone hides:
+
+    - **Ungraded save:** with no rubric items checked and no point adjustment,
+      Gradescope does not mark the submission graded — even though a full score
+      is computed locally. (This is the trap behind passing ``[]`` for full
+      credit.)
+    - **Clamped score:** the floor/ceiling caps the result, e.g. adding bonus
+      points on a 0-point, ceiling-capped question silently yields 0.
+    """
+    warnings: list[str] = []
+    weight = question.get("weight")
+    if (
+        raw_score is not None
+        and final_score is not None
+        and abs(float(raw_score) - float(final_score)) > 1e-9
+    ):
+        warnings.append(
+            f"Score clamped from {_format_score(raw_score)} to "
+            f"{_format_score(final_score)} by the question's floor/ceiling "
+            f"(question is worth {weight}). To award points beyond the cap "
+            f"(e.g. bonus), raise the question's point value or disable its "
+            f"ceiling in Gradescope, then re-apply."
+        )
+    if not apply_ids and resolved_points is None:
+        warnings.append(
+            "No rubric items are checked and no point adjustment is set, so "
+            "Gradescope will NOT mark this submission as graded. For full "
+            "credit in negative scoring, check the question's 0-point "
+            '"Correct" benchmark item (pass its ID in rubric_item_ids).'
+        )
+    return warnings
 
 
 def _get_grading_context(course_id: str, question_id: str, submission_id: str) -> dict:
@@ -851,13 +905,20 @@ def apply_grade(
         return f"Error saving grade: {e}"
 
     if resp.status_code == 200:
-        new_score, unknown_ids = _compute_new_score(props, apply_ids, point_adjustment)
+        new_score, unknown_ids, raw_score = _compute_new_score(
+            props, apply_ids, point_adjustment, with_raw=True
+        )
         warning = ""
         if unknown_ids:
-            warning = (
+            warning += (
                 f"\n⚠️ **Unknown rubric IDs (ignored locally, may be rejected by "
                 f"Gradescope):** {sorted(unknown_ids)}"
             )
+        for w in _grade_write_warnings(
+            apply_ids, resolved_points, raw_score, new_score,
+            props.get("question", {}) or {},
+        ):
+            warning += f"\n⚠️ {w}"
         return (
             f"✅ Grade saved successfully!\n"
             f"**New score:** {_format_score(new_score)}/"
@@ -978,7 +1039,7 @@ def apply_grade_batch(
             + "\n".join(preview_lines)
         )
 
-    succeeded: list[tuple[str, object, object, set[str]]] = []
+    succeeded: list[tuple[str, object, object, set[str], list[str]]] = []
     failed: list[tuple[str, str]] = []
     skipped_confidence: list[tuple[str, float]] = []
 
@@ -1073,12 +1134,22 @@ def apply_grade_batch(
             )
             continue
 
-        new_score_value, unknown_ids = _compute_new_score(
-            props, apply_ids, resolved_points
+        new_score_value, unknown_ids, raw_score = _compute_new_score(
+            props, apply_ids, resolved_points, with_raw=True
         )
         question_weight = props.get("question", {}).get("weight", "?")
+        row_warnings = _grade_write_warnings(
+            apply_ids, resolved_points, raw_score, new_score_value,
+            props.get("question", {}) or {},
+        )
         succeeded.append(
-            (sid, _format_score(new_score_value), question_weight, unknown_ids)
+            (
+                sid,
+                _format_score(new_score_value),
+                question_weight,
+                unknown_ids,
+                row_warnings,
+            )
         )
 
     lines = [
@@ -1091,10 +1162,13 @@ def apply_grade_batch(
         lines.append("")
         lines.append("### Saved")
         rows_with_warnings: list[tuple[str, set[str]]] = []
-        for sid, score, weight, unknown_ids in succeeded:
+        rows_with_notes: list[tuple[str, list[str]]] = []
+        for sid, score, weight, unknown_ids, row_warnings in succeeded:
             lines.append(f"- `{sid}`: {score}/{weight}")
             if unknown_ids:
                 rows_with_warnings.append((sid, unknown_ids))
+            if row_warnings:
+                rows_with_notes.append((sid, row_warnings))
         if rows_with_warnings:
             lines.append("")
             lines.append(
@@ -1103,6 +1177,12 @@ def apply_grade_batch(
             )
             for sid, unknown_ids in rows_with_warnings:
                 lines.append(f"- `{sid}`: {sorted(unknown_ids)}")
+        if rows_with_notes:
+            lines.append("")
+            lines.append("### ⚠️ Check these writes")
+            for sid, row_warnings in rows_with_notes:
+                for w in row_warnings:
+                    lines.append(f"- `{sid}`: {w}")
     if failed:
         lines.append("")
         lines.append("### Failed")

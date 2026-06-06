@@ -6,6 +6,30 @@
 
 ---
 
+## Session 10 — 2026-06-05: Warn On Ungraded And Clamped Grade Writes
+
+### What was done
+
+- `apply_grade` and `apply_grade_batch` now surface two grade-write failure
+  modes that the locally computed score alone hid:
+  - **Ungraded save:** a save with no rubric items checked and no point
+    adjustment does not mark the submission graded in Gradescope (the trap
+    behind passing `[]` for full credit). The result now warns and points to
+    the 0-point "Correct" benchmark item.
+  - **Clamped score:** the floor/ceiling capped the result (e.g. adding bonus
+    points on a 0-point, ceiling-capped question). The result now reports the
+    pre-clamp value and how to fix it.
+- `_compute_new_score` gained an opt-in `with_raw=True` that also returns the
+  pre-clamp score; the default 2-tuple return is unchanged.
+- No behavior change to what is written; reporting only.
+
+### Tests
+
+- Added 4 tests (ungraded warning, clamp warning, `with_raw`, batch ungraded
+  flag). Suite: **71 passed**.
+
+---
+
 ## Session 9 — 2026-03-18: Full Project Audit And Documentation Refresh
 
 ### What was done
