@@ -108,6 +108,79 @@ def _format_score(score: float | None) -> str:
     return f"{score:g}"
 
 
+def _coerce_bool_flag(value: object) -> tuple[bool | None, str | None]:
+    """Coerce a batch-entry boolean flag, rejecting ambiguous values.
+
+    ``None`` (absent) becomes ``False``. Real booleans pass through. The
+    strings ``"true"``/``"false"`` (case-insensitive) are accepted. Anything
+    else returns an error so a stray value like the string ``"false"`` cannot
+    be silently truthy and trigger an unintended write.
+    """
+    if value is None:
+        return False, None
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v == "true":
+            return True, None
+        if v == "false":
+            return False, None
+    return None, f"invalid full_credit value {value!r} (use a boolean true/false)"
+
+
+def _parses_to_zero(weight: object) -> bool:
+    """True only when ``weight`` is an explicitly parseable value equal to 0.
+
+    Missing (``None``) or unparseable weights return ``False`` so they are
+    treated as unknown/non-zero rather than being misclassified as the 0-point
+    full-credit benchmark.
+    """
+    if weight is None:
+        return False
+    try:
+        return float(weight) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _resolve_full_credit_items(props: dict) -> tuple[list[str] | None, str | None]:
+    """Resolve the rubric item(s) representing full credit for a question.
+
+    In negative scoring, "full credit" means checking the 0-point benchmark
+    item (the one usually labelled "Correct"). Checking *nothing* leaves the
+    submission **ungraded** even though the displayed score is full, so callers
+    that want full credit must apply that item.
+
+    Returns ``(item_ids, None)`` when exactly one zero-weight item exists,
+    otherwise ``(None, error_message)`` so the caller can ask for an explicit
+    ``rubric_item_ids`` instead of guessing.
+    """
+    question = props.get("question", {}) or {}
+    scoring_type = question.get("scoring_type", "negative")
+    if scoring_type != "negative":
+        return None, (
+            "full_credit is only supported for negative-scoring questions "
+            f"(this question is '{scoring_type}'); pass rubric_item_ids explicitly."
+        )
+    zero_items = [
+        str(ri["id"])
+        for ri in (props.get("rubric_items", []) or [])
+        if "id" in ri and _parses_to_zero(ri.get("weight"))
+    ]
+    if len(zero_items) == 1:
+        return zero_items, None
+    if not zero_items:
+        return None, (
+            "full_credit could not find a 0-point benchmark item to mark this "
+            "submission graded; pass the benchmark item's ID in rubric_item_ids."
+        )
+    return None, (
+        f"full_credit found multiple 0-point items ({zero_items}); cannot pick "
+        "one automatically. Pass the intended item's ID in rubric_item_ids."
+    )
+
+
 def _get_grading_context(course_id: str, question_id: str, submission_id: str) -> dict:
     """Fetch the SubmissionGrader page and extract all context needed for grading.
 
@@ -699,6 +772,7 @@ def apply_grade(
     comment: str | None = None,
     confidence: float | None = None,
     confirm_write: bool = False,
+    full_credit: bool = False,
 ) -> str:
     """Apply a grade to a student's question submission.
 
@@ -706,6 +780,7 @@ def apply_grade(
     1. Apply/remove rubric items (toggle which are checked)
     2. Set a submission-specific point adjustment
     3. Add a grader comment
+    4. Mark full credit (``full_credit=True``)
 
     **WARNING**: This modifies student grades. Use with caution.
 
@@ -734,6 +809,11 @@ def apply_grade(
             - > 0.8: Grade proceeds normally.
             - None: No confidence gating (manual grading mode).
         confirm_write: Must be True to save the grade.
+        full_credit: When True, marks the submission full credit by checking the
+            question's 0-point benchmark ("Correct") item. Use this instead of
+            an empty ``rubric_item_ids`` list: clearing all items does NOT mark
+            the submission graded in Gradescope. Negative-scoring questions
+            only; cannot be combined with ``rubric_item_ids``.
     """
     if not course_id or not question_id or not submission_id:
         return "Error: course_id, question_id, and submission_id are required."
@@ -743,8 +823,16 @@ def apply_grade(
     if isinstance(rubric_item_ids, str):
         rubric_item_ids = [rubric_item_ids]
 
-    if rubric_item_ids is None and point_adjustment is None and comment is None:
-        return "Error: at least one of rubric_item_ids, point_adjustment, or comment must be provided."
+    if (
+        rubric_item_ids is None
+        and point_adjustment is None
+        and comment is None
+        and not full_credit
+    ):
+        return (
+            "Error: at least one of rubric_item_ids, point_adjustment, comment, "
+            "or full_credit must be provided."
+        )
 
     # Confidence gate: reject low-confidence grades
     if confidence is not None:
@@ -773,6 +861,16 @@ def apply_grade(
     csrf_token = ctx["csrf_token"]
     base_url = ctx["base_url"]
 
+    # Resolve full_credit into an explicit rubric selection so the preview and
+    # the save payload both reflect it.
+    if full_credit:
+        if rubric_item_ids is not None:
+            return "Error: pass either full_credit=True or rubric_item_ids, not both."
+        fc_ids, fc_err = _resolve_full_credit_items(props)
+        if fc_err:
+            return f"Error: {fc_err}"
+        rubric_item_ids = fc_ids
+
     if not confirm_write:
         details = [
             f"course_id=`{course_id}`",
@@ -780,7 +878,11 @@ def apply_grade(
             f"submission_id=`{submission_id}`",
             f"current_score={props.get('submission', {}).get('score', 'Ungraded')}",
         ]
-        if rubric_item_ids is not None:
+        if full_credit:
+            details.append(
+                f"full_credit=True (0-pt benchmark item {sorted(rubric_item_ids)})"
+            )
+        elif rubric_item_ids is not None:
             details.append(f"rubric_item_ids={sorted(rubric_item_ids)}")
         if point_adjustment is not None:
             details.append(f"point_adjustment={point_adjustment}")
@@ -890,6 +992,10 @@ def apply_grade_batch(
           from rubric items). ``None`` keeps the existing comment, ``""``
           clears it, any other string overwrites.
         - ``confidence``: float | None — per-row gate (<0.6 is rejected).
+        - ``full_credit``: bool — when true, marks the row full credit via the
+          question's 0-point benchmark item (negative scoring only). Use this
+          instead of ``rubric_item_ids: []``, which clears items but leaves the
+          submission ungraded. Cannot be combined with ``rubric_item_ids``.
 
     All entries are applied to the same ``question_id``. Confidence gating is
     per-row. On ``confirm_write=False`` returns a compact preview table.
@@ -922,13 +1028,22 @@ def apply_grade_batch(
         pa = g.get("point_adjustment")
         cm = g.get("comment")
         cf = g.get("confidence")
+        fc, fc_err = _coerce_bool_flag(g.get("full_credit"))
+        if fc_err:
+            errors.append(f"row {i} ({sid}): {fc_err}")
+            continue
         if cf is not None and not (0.0 <= cf <= 1.0):
             errors.append(f"row {i} ({sid}): confidence must be between 0.0 and 1.0")
             continue
-        if rids is None and pa is None and cm is None:
+        if rids is None and pa is None and cm is None and not fc:
             errors.append(
                 f"row {i} ({sid}): at least one of rubric_item_ids, "
-                "point_adjustment, or comment is required"
+                "point_adjustment, comment, or full_credit is required"
+            )
+            continue
+        if fc and rids is not None:
+            errors.append(
+                f"row {i} ({sid}): pass either full_credit or rubric_item_ids, not both"
             )
             continue
         normalized.append(
@@ -938,6 +1053,7 @@ def apply_grade_batch(
                 "point_adjustment": pa,
                 "comment": cm,
                 "confidence": cf,
+                "full_credit": fc,
             }
         )
     if errors:
@@ -949,11 +1065,12 @@ def apply_grade_batch(
             "|---|---------------|-----------------|-----------|---------|------------|",
         ]
         for i, g in enumerate(normalized, 1):
-            rids_disp = (
-                str(sorted(g["rubric_item_ids"]))
-                if g["rubric_item_ids"] is not None
-                else "(keep current)"
-            )
+            if g.get("full_credit"):
+                rids_disp = "full credit (0-pt item)"
+            elif g["rubric_item_ids"] is not None:
+                rids_disp = str(sorted(g["rubric_item_ids"]))
+            else:
+                rids_disp = "(keep current)"
             pa_disp = (
                 str(g["point_adjustment"])
                 if g["point_adjustment"] is not None
@@ -1010,6 +1127,13 @@ def apply_grade_batch(
         if not save_url:
             failed.append((sid, "save_grade URL not found in grading context"))
             continue
+
+        if g.get("full_credit"):
+            fc_ids, fc_err = _resolve_full_credit_items(props)
+            if fc_err:
+                failed.append((sid, fc_err))
+                continue
+            g["rubric_item_ids"] = fc_ids
 
         rubric_items = props.get("rubric_items", [])
         current_evals = props.get("rubric_item_evaluations", [])
