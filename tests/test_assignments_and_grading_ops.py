@@ -181,6 +181,8 @@ def test_get_submission_grading_context_markdown_shows_real_pages_only(monkeypat
     assert "**Scoring:** negative (floor=0, ceiling=10)" in result
     assert "Rubric items **deduct** points" in result
     assert "- **next_submission**: qid=`2`, sid=`100`" in result
+    # Count reflects the real (non-placeholder) pages, not the raw total of 5.
+    assert "### Submission Pages (4)" in result
     assert "**Relevant pages:** [3]" in result
     # Page numbers are shown; the long signed URLs are omitted by default.
     assert "- Page 2" in result

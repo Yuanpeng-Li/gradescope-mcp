@@ -354,19 +354,22 @@ def get_submission_grading_context(
     # Scanned PDF pages for this question
     if pages:
         real_pages = [p for p in pages if isinstance(p, dict) and not _is_placeholder_page(p)]
-        lines.append(f"\n### Submission Pages ({len(pages)})")
+        # Count reflects the real (non-placeholder) pages that are actually listed.
+        lines.append(f"\n### Submission Pages ({len(real_pages)})")
         if crop:
             crop_pages = sorted(set(c.get("page_number") for c in crop if "page_number" in c))
             lines.append(f"**Relevant pages:** {crop_pages}")
+        # real_pages excludes placeholders (which have a missing/empty url), so
+        # every entry here has a usable url; only the flag gates whether we show it.
         for p in real_pages[:3]:
             page_num = p.get("number") or "?"
-            if include_page_urls and p.get("url"):
+            if include_page_urls:
                 lines.append(f"- Page {page_num}: [View]({_normalize_url(p['url'])})")
             else:
                 lines.append(f"- Page {page_num}")
         if len(real_pages) > 3:
             lines.append(f"- _...and {len(real_pages) - 3} more pages_")
-        if not include_page_urls and any(p.get("url") for p in real_pages):
+        if not include_page_urls and real_pages:
             lines.append(
                 "_Page image URLs omitted to save space; pass "
                 "`include_page_urls=True` to include them._"
