@@ -1063,3 +1063,23 @@ def test_apply_grade_batch_rejects_string_full_credit(monkeypatch) -> None:
         confirm_write=True,
     )
     assert posts == []
+
+
+def test_apply_grade_full_credit_preview_signals_intent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _fc_ctx([{"id": 100, "description": "Correct", "weight": 0}]),
+    )
+
+    result = grading_ops.apply_grade(
+        course_id="1",
+        question_id="2",
+        submission_id="99",
+        full_credit=True,
+        confirm_write=False,
+    )
+
+    # Preview must show the full_credit intent, not just the resolved IDs.
+    assert "Write confirmation required" in result
+    assert "full_credit=True" in result

@@ -878,7 +878,11 @@ def apply_grade(
             f"submission_id=`{submission_id}`",
             f"current_score={props.get('submission', {}).get('score', 'Ungraded')}",
         ]
-        if rubric_item_ids is not None:
+        if full_credit:
+            details.append(
+                f"full_credit=True (0-pt benchmark item {sorted(rubric_item_ids)})"
+            )
+        elif rubric_item_ids is not None:
             details.append(f"rubric_item_ids={sorted(rubric_item_ids)}")
         if point_adjustment is not None:
             details.append(f"point_adjustment={point_adjustment}")
