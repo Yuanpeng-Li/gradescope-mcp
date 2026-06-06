@@ -181,10 +181,51 @@ def test_get_submission_grading_context_markdown_shows_real_pages_only(monkeypat
     assert "**Scoring:** negative (floor=0, ceiling=10)" in result
     assert "Rubric items **deduct** points" in result
     assert "- **next_submission**: qid=`2`, sid=`100`" in result
+    # Count reflects the real (non-placeholder) pages, not the raw total of 5.
+    assert "### Submission Pages (4)" in result
     assert "**Relevant pages:** [3]" in result
-    assert "- Page 2: [View](https://example.com/page2.jpg)" in result
+    # Page numbers are shown; the long signed URLs are omitted by default.
+    assert "- Page 2" in result
+    assert "https://example.com/page2.jpg" not in result
+    assert "include_page_urls=True" in result
     assert "- _...and 1 more pages_" in result
     assert "missing_pdf" not in result
+
+
+def test_get_submission_grading_context_includes_page_urls_when_requested(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        lambda *_args, **_kwargs: {
+            "props": {
+                "question": {"title": "Integral", "weight": 10},
+                "submission": {
+                    "owner_names": "Student B",
+                    "score": None,
+                    "graded": False,
+                },
+                "evaluation": {},
+                "rubric_items": [],
+                "rubric_item_evaluations": [],
+                "navigation_urls": {},
+                "num_graded_submissions": 1,
+                "num_submissions": 5,
+                "pages": [
+                    {"number": 2, "url": "https://example.com/page2.jpg"},
+                    {"number": 3, "url": "https://example.com/page3.jpg"},
+                ],
+            }
+        },
+    )
+
+    result = grading_ops.get_submission_grading_context(
+        "1", "2", "99", include_page_urls=True
+    )
+
+    assert "- Page 2: [View](https://example.com/page2.jpg)" in result
+    assert "include_page_urls=True" not in result
 
 
 def test_get_question_rubric_uses_question_rubric_fallback(monkeypatch) -> None:
