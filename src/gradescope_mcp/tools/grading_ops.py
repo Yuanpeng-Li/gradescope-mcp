@@ -108,6 +108,27 @@ def _format_score(score: float | None) -> str:
     return f"{score:g}"
 
 
+def _coerce_bool_flag(value: object) -> tuple[bool | None, str | None]:
+    """Coerce a batch-entry boolean flag, rejecting ambiguous values.
+
+    ``None`` (absent) becomes ``False``. Real booleans pass through. The
+    strings ``"true"``/``"false"`` (case-insensitive) are accepted. Anything
+    else returns an error so a stray value like the string ``"false"`` cannot
+    be silently truthy and trigger an unintended write.
+    """
+    if value is None:
+        return False, None
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v == "true":
+            return True, None
+        if v == "false":
+            return False, None
+    return None, f"invalid full_credit value {value!r} (use a boolean true/false)"
+
+
 def _parses_to_zero(weight: object) -> bool:
     """True only when ``weight`` is an explicitly parseable value equal to 0.
 
@@ -1003,7 +1024,10 @@ def apply_grade_batch(
         pa = g.get("point_adjustment")
         cm = g.get("comment")
         cf = g.get("confidence")
-        fc = bool(g.get("full_credit"))
+        fc, fc_err = _coerce_bool_flag(g.get("full_credit"))
+        if fc_err:
+            errors.append(f"row {i} ({sid}): {fc_err}")
+            continue
         if cf is not None and not (0.0 <= cf <= 1.0):
             errors.append(f"row {i} ({sid}): confidence must be between 0.0 and 1.0")
             continue

@@ -1025,3 +1025,41 @@ def test_parses_to_zero_only_for_explicit_zero() -> None:
     assert grading_ops._parses_to_zero("") is False
     assert grading_ops._parses_to_zero("n/a") is False
     assert grading_ops._parses_to_zero(2) is False
+
+
+def test_coerce_bool_flag_rejects_ambiguous_strings() -> None:
+    assert grading_ops._coerce_bool_flag(None) == (False, None)
+    assert grading_ops._coerce_bool_flag(True) == (True, None)
+    assert grading_ops._coerce_bool_flag(False) == (False, None)
+    assert grading_ops._coerce_bool_flag("true") == (True, None)
+    assert grading_ops._coerce_bool_flag("False") == (False, None)
+    val, err = grading_ops._coerce_bool_flag("nope")
+    assert val is None and "invalid full_credit" in err
+
+
+def test_apply_grade_batch_rejects_string_full_credit(monkeypatch) -> None:
+    posts: list = []
+    monkeypatch.setattr(
+        grading_ops,
+        "_get_grading_context",
+        _make_fake_batch_ctx_builder(posts),
+    )
+
+    # An unrecognized string is rejected outright (not silently truthy).
+    bad = grading_ops.apply_grade_batch(
+        course_id="1",
+        question_id="2",
+        grades=[{"submission_id": "501", "full_credit": "nope"}],
+        confirm_write=True,
+    )
+    assert "invalid full_credit" in bad
+    assert posts == []
+
+    # The string "false" parses to False, so it does NOT trigger a write.
+    grading_ops.apply_grade_batch(
+        course_id="1",
+        question_id="2",
+        grades=[{"submission_id": "501", "full_credit": "false"}],
+        confirm_write=True,
+    )
+    assert posts == []
