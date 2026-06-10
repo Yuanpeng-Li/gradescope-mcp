@@ -6,6 +6,40 @@
 
 ---
 
+## Session 10 — 2026-06-10: Staff Targeted Submission Uploads
+
+### What was done
+
+1. Added `tool_inspect_submission_upload_form`, a read-only helper that fetches
+   Manage Submissions or a specific submission page and summarizes available
+   file-upload forms.
+2. Added `tool_upload_submission_for_student`, a preview-first write tool for
+   instructor/TA workflows that upload or replace files on behalf of a student.
+3. Kept the existing `tool_upload_submission` behavior backward-compatible for
+   ordinary assignment uploads.
+4. Added unit coverage for:
+   - confirmation gating
+   - upload-form inspection
+   - form-driven multipart POSTs with a student user ID
+5. Updated `README.md` and `AGENT.md` for the new tool inventory and test
+   count.
+
+### Why this matters
+
+The prior upload tool only posted files as the authenticated user and had no
+way to target a roster user or an existing assignment-level submission. Staff
+upload workflows in Gradescope live behind Manage Submissions and can vary by
+assignment type, so the new implementation discovers the live upload form
+instead of hardcoding one endpoint.
+
+### Current state
+
+- **39 tools** + **3 resources** + **7 prompts**
+- **70 automated tests**
+- New targeted upload writes still require `confirm_write=True`
+
+---
+
 ## Session 9 — 2026-03-18: Full Project Audit And Documentation Refresh
 
 ### What was done
