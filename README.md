@@ -18,7 +18,7 @@ workflows.
 - 39 MCP tools
 - 3 MCP resources
 - 7 MCP prompts
-- 70 automated tests
+- 76 automated tests
 - Python 3.10+
 - Package manager: `uv`
 
@@ -219,6 +219,9 @@ you complete normal school login:
 ```bash
 python3 scripts/export_sso_cookie.py --url https://www.gradescope.com/
 ```
+
+The helper waits for you to confirm that school SSO is complete before saving
+cookies. For non-SSO flows, `--auto-detect` can restore automatic saving.
 
 or:
 

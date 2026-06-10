@@ -15,7 +15,7 @@ simple CRUD wrappers.
 - 39 tools
 - 3 resources
 - 7 prompts
-- 70 automated tests
+- 76 automated tests
 - Python 3.10+
 - `uv` + `hatchling`
 - `mcp` FastMCP server
@@ -28,7 +28,7 @@ simple CRUD wrappers.
   Loads `.env`, configures logging, and starts the server.
 - `scripts/export_sso_cookie.py`
   Optional local helper that opens Chrome for school SSO and writes a
-  Gradescope cookie header to `.env`.
+  Gradescope cookie header to `.env` after manual confirmation.
 
 ### Server registration
 - `src/gradescope_mcp/server.py`

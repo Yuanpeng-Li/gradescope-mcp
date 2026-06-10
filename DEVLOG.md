@@ -21,6 +21,8 @@
 5. Updated `.env.example`, `README.md`, and `AGENT.md`.
 6. Added `scripts/export_sso_cookie.py`, an optional Chrome/Playwright helper
    that writes `GRADESCOPE_COOKIE_HEADER` to `.env` after browser SSO login.
+7. Changed the helper to wait for manual confirmation by default so Chrome
+   does not close early when Gradescope creates a pre-login session cookie.
 
 ### Why this matters
 
@@ -60,7 +62,7 @@ instead of hardcoding one endpoint.
 ### Current state
 
 - **39 tools** + **3 resources** + **7 prompts**
-- **70 automated tests**
+- **76 automated tests**
 - New targeted upload writes still require `confirm_write=True`
 
 ---
