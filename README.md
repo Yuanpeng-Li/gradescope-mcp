@@ -15,7 +15,7 @@ workflows.
 
 ## Current Status
 
-- 39 MCP tools (24 read-only, 11 that write to Gradescope, 4 that only write
+- 41 MCP tools (25 read-only, 12 that write to Gradescope, 4 that only write
   to the private local cache)
 - 3 MCP resources (1 static resource, 2 URI templates)
 - 7 MCP prompts
@@ -77,6 +77,8 @@ the private local cache).
 | `tool_get_assignment_submissions` | read-only | Global Submission IDs with graded status, progress and late flag |
 | `tool_get_student_submission` | read-only | One student's typed answers (untrusted blocks), file and page links, per-question and total scores |
 | `tool_get_assignment_graders` | read-only | Staff who last graded a question's submissions, with counts (not the assigned graders) |
+| `tool_inspect_submission_upload_form` | read-only | The staff upload forms on Manage Submissions or one submission page: action, file and student fields |
+| `tool_upload_submission_for_student` | write | Upload or replace files on behalf of one student through the staff upload form |
 
 ### Grading Read
 | Tool | Kind | Description |

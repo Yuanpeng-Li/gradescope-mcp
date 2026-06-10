@@ -659,7 +659,7 @@ def test_recovery_wrappers_keep_registered_metadata_identical() -> None:
     expected = anyio.run(listing, baseline)
 
     assert json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
-    assert len(actual[0]) == 39
+    assert len(actual[0]) == 41
     by_name = {t["name"]: t for t in actual[0]}
     assert by_name["tool_apply_grade"]["inputSchema"]["required"] == [
         "course_id", "question_id", "submission_id",

@@ -54,6 +54,8 @@ from gradescope_mcp.tools.assignments import (
 )
 from gradescope_mcp.tools.submissions import (
     upload_submission,
+    upload_submission_for_student,
+    inspect_submission_upload_form,
     get_assignment_submissions,
     get_student_submission,
     get_assignment_graders,
@@ -504,6 +506,65 @@ def tool_upload_submission(
     return upload_submission(
         course_id, assignment_id, file_paths, leaderboard_name, confirm_write,
         expected_sha256=expected_sha256,
+    )
+
+
+@gs_tool(read_only("Inspect staff upload forms"))
+def tool_inspect_submission_upload_form(
+    course_id: GradescopeID,
+    assignment_id: GradescopeID,
+    submission_id: OptionalGradescopeID = None,
+) -> str:
+    """Inspect staff upload forms for one assignment or existing submission.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID.
+        submission_id: Optional existing assignment-level submission ID. If
+            supplied, inspects that submission page for replace/resubmit forms;
+            otherwise inspects the Manage Submissions page.
+    """
+    return inspect_submission_upload_form(course_id, assignment_id, submission_id)
+
+
+@gs_tool(gradescope_write("Upload submission for a student", idempotent=False))
+def tool_upload_submission_for_student(
+    course_id: GradescopeID,
+    assignment_id: GradescopeID,
+    user_id: GradescopeID,
+    file_paths: list[str],
+    submission_id: OptionalGradescopeID = None,
+    student_field_name: str | None = None,
+    confirm_write: bool = False,
+) -> str:
+    """Upload files on behalf of a student through the staff upload UI.
+
+    The tool discovers the live Gradescope upload form before posting, because
+    staff upload fields can differ by assignment type. Use
+    `tool_inspect_submission_upload_form` first if automatic form detection
+    cannot identify the student field. Files are vetted like
+    tool_upload_submission's.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID.
+        user_id: The student's Gradescope user ID (found via get_course_roster).
+        file_paths: List of absolute file paths to upload.
+        submission_id: Optional existing assignment-level submission ID for
+            replace/resubmit workflows.
+        student_field_name: Optional exact form field name for user_id.
+        confirm_write: Must be True to perform the upload. The default
+            returns a preview and changes nothing. Setting it is not user
+            approval: show the preview to the user first.
+    """
+    return upload_submission_for_student(
+        course_id,
+        assignment_id,
+        user_id,
+        file_paths,
+        submission_id,
+        student_field_name,
+        confirm_write,
     )
 
 

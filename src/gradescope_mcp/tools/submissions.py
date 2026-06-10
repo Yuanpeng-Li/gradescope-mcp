@@ -3,6 +3,7 @@
 import hashlib
 import io
 import json
+import mimetypes
 import os
 import pathlib
 import re
@@ -12,7 +13,7 @@ from bs4 import BeautifulSoup
 from gradescopeapi.classes.upload import upload_assignment
 
 from gradescope_mcp.auth import get_connection, AuthError
-from gradescope_mcp.tools.common import element_classes, is_hidden_element
+from gradescope_mcp.tools.common import element_classes, is_hidden_element, sanitize_inline
 from gradescope_mcp.tools.grading import get_student_submission_content
 from gradescope_mcp.tools.safety import write_confirmation_required
 
@@ -609,6 +610,338 @@ def _upload_outcome(
         "Gradescope before uploading again."
     )
     return "\n".join(lines)
+
+
+def inspect_submission_upload_form(
+    course_id: str,
+    assignment_id: str,
+    submission_id: str | None = None,
+) -> str:
+    """Inspect available Gradescope file-upload forms for staff workflows.
+
+    This read-only helper fetches either Manage Submissions or one existing
+    submission page and summarizes file-upload forms, including candidate
+    student-owner fields. It is useful because Gradescope's staff upload UI can
+    vary by assignment type and frontend rollout.
+    """
+    if not course_id or not assignment_id:
+        return "Error: both course_id and assignment_id are required."
+
+    try:
+        conn = get_connection()
+        page_url = _submission_page_url(conn, course_id, assignment_id, submission_id)
+        resp = conn.session.get(page_url)
+    except AuthError as e:
+        return f"Authentication error: {e}"
+    except Exception as e:
+        return f"Error fetching upload form: {e}"
+
+    if resp.status_code != 200:
+        return (
+            f"Error: cannot access upload form page (status {resp.status_code}) "
+            f"at {page_url}."
+        )
+
+    forms = _file_upload_forms(BeautifulSoup(resp.text, "html.parser"))
+    if not forms:
+        return (
+            f"No file-upload forms found at {page_url}. "
+            "This assignment may render upload controls client-side, may not "
+            "allow staff uploads, or may have anonymous grading enabled."
+        )
+
+    lines = [
+        "## Submission Upload Forms",
+        f"**URL:** {page_url}",
+        f"**File-upload forms found:** {len(forms)}",
+    ]
+    for index, form in enumerate(forms, 1):
+        action = _form_action(page_url, form)
+        method = (form.get("method") or "get").upper()
+        file_names = _file_input_names(form)
+        student_fields = _student_field_candidates(form)
+        hidden_count = len(_extract_non_file_fields(form))
+        lines.extend([
+            "",
+            f"### Form {index}",
+            f"- method: `{method}`",
+            f"- action: `{action}`",
+            f"- file inputs: {', '.join(f'`{n}`' for n in file_names) or 'none'}",
+            f"- candidate student fields: {', '.join(f'`{n}`' for n in student_fields) or 'none'}",
+            f"- hidden/non-file fields: {hidden_count}",
+            f"- text: {sanitize_inline(_clip(_form_text(form), 220)) or 'N/A'}",
+        ])
+
+    return "\n".join(lines)
+
+
+def upload_submission_for_student(
+    course_id: str,
+    assignment_id: str,
+    user_id: str,
+    file_paths: list[str],
+    submission_id: str | None = None,
+    student_field_name: str | None = None,
+    confirm_write: bool = False,
+) -> str:
+    """Upload files on behalf of one student through the staff UI.
+
+    The files are vetted like ``upload_submission``'s (absolute paths to
+    regular files of at most 100 MB; no hidden, credential-like or system
+    files; ``GRADESCOPE_MCP_UPLOAD_ROOT`` honored) and each is read once.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID.
+        user_id: The student's Gradescope user ID from the roster.
+        file_paths: List of absolute file paths to upload.
+        submission_id: Optional existing assignment-level submission ID. When
+            supplied, the tool looks for a replacement/resubmission file form on
+            that submission page. When omitted, it looks for a new-upload form
+            on Manage Submissions and fills the student owner field.
+        student_field_name: Optional exact form field name to use for user_id if
+            automatic student-field detection fails.
+        confirm_write: Must be True to perform the upload.
+    """
+    if not course_id or not assignment_id:
+        return "Error: both course_id and assignment_id are required."
+    if not user_id:
+        return "Error: user_id is required."
+    if not file_paths:
+        return "Error: at least one file path is required."
+
+    try:
+        roots = _upload_roots()
+        validated_paths = [_validate_upload_path(fp, roots) for fp in file_paths]
+    except ValueError as e:
+        return f"Error: {e}"
+
+    if not confirm_write:
+        details = [
+            f"course_id=`{course_id}`",
+            f"assignment_id=`{assignment_id}`",
+            f"user_id=`{user_id}`",
+            f"files={', '.join(str(path) for path in validated_paths)}",
+        ]
+        if submission_id:
+            details.append(f"submission_id=`{submission_id}`")
+        if student_field_name:
+            details.append(f"student_field_name=`{student_field_name}`")
+        return write_confirmation_required("upload_submission_for_student", details)
+
+    contents = []
+    for path in validated_paths:
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read(_MAX_UPLOAD_BYTES + 1)
+        except OSError as e:
+            return f"Error: cannot read {path}: {e}. Nothing was uploaded."
+        if len(data) > _MAX_UPLOAD_BYTES:
+            return (
+                f"Error: {path} grew past the upload limit of "
+                f"{_MAX_UPLOAD_BYTES:,} bytes. Nothing was uploaded."
+            )
+        contents.append(data)
+
+    try:
+        conn = get_connection()
+        page_url = _submission_page_url(conn, course_id, assignment_id, submission_id)
+        page_resp = conn.session.get(page_url)
+        if page_resp.status_code != 200:
+            return (
+                f"Error: cannot access upload form page (status "
+                f"{page_resp.status_code}) at {page_url}."
+            )
+
+        soup = BeautifulSoup(page_resp.text, "html.parser")
+        form = _find_staff_upload_form(
+            soup,
+            user_id=user_id,
+            submission_id=submission_id,
+            student_field_name=student_field_name,
+        )
+        if form is None:
+            return (
+                "Error: could not find a suitable staff upload form. "
+                "Run `tool_inspect_submission_upload_form` for this assignment "
+                "to see the available forms and field names."
+            )
+
+        post_url = _form_action(page_url, form)
+        method = (form.get("method") or "get").lower()
+        if method != "post":
+            return f"Error: upload form uses unsupported method `{method}`."
+
+        fields = _extract_non_file_fields(form)
+        if submission_id is None:
+            student_field = student_field_name or _choose_student_field(form, user_id)
+            if not student_field:
+                return (
+                    "Error: could not identify a student field in the upload "
+                    "form. Re-run with student_field_name from "
+                    "`tool_inspect_submission_upload_form`."
+                )
+            fields = [(name, value) for name, value in fields if name != student_field]
+            fields.append((student_field, user_id))
+
+        file_input_names = _file_input_names(form)
+        file_field = file_input_names[0] if file_input_names else "submission[files][]"
+        post_resp = conn.session.post(
+            post_url,
+            data=fields,
+            files=[
+                (file_field, (path.name, data, _mime_type(path)))
+                for path, data in zip(validated_paths, contents)
+            ],
+            headers={"Referer": page_url},
+        )
+    except AuthError as e:
+        return f"Authentication error: {e}"
+    except Exception as e:
+        return f"Error uploading submission for student `{user_id}`: {e}"
+
+    if post_resp.status_code >= 400:
+        return (
+            f"Error: Gradescope upload request failed with status "
+            f"{post_resp.status_code} at {post_url}."
+        )
+
+    filenames = [p.name for p in validated_paths]
+    return (
+        "✅ Staff upload request completed.\n"
+        f"- **Student user ID:** {user_id}\n"
+        f"- **Files:** {', '.join(filenames)}\n"
+        f"- **Request URL:** {post_url}\n"
+        f"- **Final URL:** {post_resp.url}"
+    )
+
+
+def _mime_type(path: pathlib.Path) -> str:
+    return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+
+def _submission_page_url(
+    conn,
+    course_id: str,
+    assignment_id: str,
+    submission_id: str | None = None,
+) -> str:
+    base = f"{conn.gradescope_base_url}/courses/{course_id}/assignments/{assignment_id}"
+    if submission_id:
+        return f"{base}/submissions/{submission_id}"
+    return f"{base}/submissions"
+
+
+def _file_upload_forms(soup: BeautifulSoup) -> list:
+    return [
+        form
+        for form in soup.find_all("form")
+        if form.find("input", attrs={"type": lambda v: (v or "").lower() == "file"})
+    ]
+
+
+def _file_input_names(form) -> list[str]:
+    names = []
+    for input_el in form.find_all("input"):
+        if (input_el.get("type") or "").lower() == "file":
+            names.append(input_el.get("name") or "submission[files][]")
+    return names
+
+
+def _extract_non_file_fields(form) -> list[tuple[str, str]]:
+    fields: list[tuple[str, str]] = []
+    for input_el in form.find_all("input"):
+        name = input_el.get("name")
+        if not name:
+            continue
+        type_ = (input_el.get("type") or "").lower()
+        if type_ in {"file", "submit", "button", "image", "reset"}:
+            continue
+        fields.append((name, input_el.get("value", "")))
+
+    for textarea in form.find_all("textarea"):
+        name = textarea.get("name")
+        if name:
+            fields.append((name, textarea.get_text()))
+
+    for select in form.find_all("select"):
+        name = select.get("name")
+        if not name:
+            continue
+        selected = select.find("option", selected=True) or select.find("option")
+        fields.append((name, selected.get("value", "") if selected else ""))
+
+    return fields
+
+
+def _form_action(page_url: str, form) -> str:
+    return urljoin(page_url, form.get("action") or page_url)
+
+
+def _form_text(form) -> str:
+    return " ".join(form.get_text(" ", strip=True).split())
+
+
+def _clip(value: str, limit: int) -> str:
+    return value if len(value) <= limit else value[: limit - 3] + "..."
+
+
+def _student_field_candidates(form) -> list[str]:
+    candidates = []
+    pattern = re.compile(r"(user|owner|student|member|submitter)", re.I)
+    for el in form.find_all(["input", "select"]):
+        name = el.get("name")
+        if name and pattern.search(name) and name not in candidates:
+            candidates.append(name)
+    return candidates
+
+
+def _choose_student_field(form, user_id: str) -> str | None:
+    for select in form.find_all("select"):
+        name = select.get("name")
+        if not name:
+            continue
+        for option in select.find_all("option"):
+            if (option.get("value") or "").strip() == str(user_id):
+                return name
+
+    candidates = _student_field_candidates(form)
+    return candidates[0] if candidates else None
+
+
+def _find_staff_upload_form(
+    soup: BeautifulSoup,
+    user_id: str,
+    submission_id: str | None,
+    student_field_name: str | None,
+):
+    forms = _file_upload_forms(soup)
+    if not forms:
+        return None
+
+    if submission_id:
+        terms = ("replace", "resubmit", "re-upload", "upload", "submission")
+        ranked = sorted(
+            forms,
+            key=lambda form: (
+                not any(
+                    term in (_form_text(form) + " " + (form.get("action") or "")).lower()
+                    for term in terms
+                ),
+                len(_form_text(form)),
+            ),
+        )
+        return ranked[0]
+
+    for form in forms:
+        if student_field_name:
+            field_names = {name for name, _value in _extract_non_file_fields(form)}
+            if student_field_name in field_names:
+                return form
+        elif _choose_student_field(form, user_id):
+            return form
+
+    return None
 
 
 def _json_body(resp):
