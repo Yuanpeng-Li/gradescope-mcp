@@ -134,6 +134,113 @@ def test_outline_flatten_threads_parent_id_through_children(monkeypatch) -> None
     assert len(tree[0]["children"]) == 2
 
 
+def test_grading_progress_preserves_top_level_question_numbers(monkeypatch) -> None:
+    """Progress labels must not shift standalone questions after grouped ones."""
+    grade_json = {
+        "assignments": {
+            "99": {
+                "questions": {
+                    "101": {
+                        "id": 101,
+                        "index": 1,
+                        "title": "Question 1",
+                        "type": "FreeResponseQuestion",
+                        "question_group": False,
+                        "parent_id": None,
+                        "total_graded_count": 10,
+                        "total_count": 10,
+                        "graders": [{"name": "TA"}],
+                    },
+                    "200": {
+                        "id": 200,
+                        "index": 2,
+                        "title": "Question 2",
+                        "type": "QuestionGroup",
+                        "question_group": True,
+                        "parent_id": None,
+                    },
+                    "201": {
+                        "id": 201,
+                        "index": 1,
+                        "title": "part a)",
+                        "type": "FreeResponseQuestion",
+                        "question_group": False,
+                        "parent_id": 200,
+                        "total_graded_count": 9,
+                        "total_count": 10,
+                        "graders": [],
+                    },
+                    "202": {
+                        "id": 202,
+                        "index": 2,
+                        "title": "part b)",
+                        "type": "FreeResponseQuestion",
+                        "question_group": False,
+                        "parent_id": 200,
+                        "total_graded_count": 8,
+                        "total_count": 10,
+                        "graders": [],
+                    },
+                    "301": {
+                        "id": 301,
+                        "index": 3,
+                        "title": "Question 3",
+                        "type": "FreeResponseQuestion",
+                        "question_group": False,
+                        "parent_id": None,
+                        "total_graded_count": 0,
+                        "total_count": 10,
+                        "graders": [],
+                    },
+                    "400": {
+                        "id": 400,
+                        "index": 4,
+                        "title": "Question 4",
+                        "type": "QuestionGroup",
+                        "question_group": True,
+                        "parent_id": None,
+                    },
+                    "401": {
+                        "id": 401,
+                        "index": 1,
+                        "title": "part a)",
+                        "type": "FreeResponseQuestion",
+                        "question_group": False,
+                        "parent_id": 400,
+                        "total_graded_count": 0,
+                        "total_count": 10,
+                        "graders": [],
+                    },
+                }
+            }
+        },
+        "action_button": {},
+    }
+
+    monkeypatch.setattr(
+        grading,
+        "get_connection",
+        lambda: SimpleNamespace(
+            gradescope_base_url="https://x",
+            session=SimpleNamespace(get=lambda *a, **kw: SimpleNamespace(
+                status_code=200,
+                json=lambda: grade_json,
+            )),
+        ),
+    )
+
+    result = grading.get_grading_progress("1", "99")
+
+    assert "Q1 Question 1 (`101`)" in result
+    assert "Q2.1 part a) (`201`)" in result
+    assert "Q2.2 part b) (`202`)" in result
+    assert "Q3 Question 3 (`301`)" in result
+    assert "Q4.1 part a) (`401`)" in result
+    assert "Q3 Question 1 (`101`)" not in result
+    assert "Q4 Question 3 (`301`)" not in result
+    assert "**Overall progress:** 27/50 (54%)" in result
+
+
 # ---------------------------------------------------------------------------
 # 🔴4 — get_assignments collapses 0 score to "N/A"
 # ---------------------------------------------------------------------------
