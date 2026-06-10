@@ -55,7 +55,7 @@ def test_inspect_submission_upload_form_lists_candidate_fields(monkeypatch) -> N
     """
 
     session = SimpleNamespace(
-        get=lambda _url: SimpleNamespace(status_code=200, text=html)
+        get=lambda _url, **_kwargs: SimpleNamespace(status_code=200, text=html)
     )
     monkeypatch.setattr(
         submissions,
@@ -95,7 +95,7 @@ def test_upload_submission_for_student_posts_discovered_form(
     captured: dict = {}
 
     class FakeSession:
-        def get(self, url):
+        def get(self, url, **_kwargs):
             captured["get_url"] = url
             return SimpleNamespace(status_code=200, text=html)
 

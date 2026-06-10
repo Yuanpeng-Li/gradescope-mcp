@@ -108,7 +108,7 @@ def inspect_submission_upload_form(
         page_url = _submission_page_url(
             conn, course_id, assignment_id, submission_id
         )
-        resp = conn.session.get(page_url)
+        resp = conn.session.get(page_url, headers=_html_headers())
     except AuthError as e:
         return f"Authentication error: {e}"
     except Exception as e:
@@ -206,7 +206,7 @@ def upload_submission_for_student(
         page_url = _submission_page_url(
             conn, course_id, assignment_id, submission_id
         )
-        page_resp = conn.session.get(page_url)
+        page_resp = conn.session.get(page_url, headers=_html_headers())
         if page_resp.status_code != 200:
             return (
                 f"Error: cannot access upload form page (status "
@@ -312,6 +312,15 @@ def _submission_page_url(
     if submission_id:
         return f"{base}/submissions/{submission_id}"
     return f"{base}/submissions"
+
+
+def _html_headers() -> dict[str, str]:
+    return {
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "*/*;q=0.8"
+        ),
+    }
 
 
 def _file_upload_forms(soup: BeautifulSoup) -> list:
