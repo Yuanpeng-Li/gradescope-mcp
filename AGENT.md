@@ -12,10 +12,10 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 34 tools
+- 39 tools
 - 3 resources
 - 7 prompts
-- 30 automated tests
+- 70 automated tests
 - Python 3.10+
 - `uv` + `hatchling`
 - `mcp` FastMCP server
@@ -42,7 +42,8 @@ simple CRUD wrappers.
 - `src/gradescope_mcp/tools/assignments.py`
   Assignment listing, detail reads, date edits, rename.
 - `src/gradescope_mcp/tools/submissions.py`
-  Uploads, submission listing, per-student submission reads, grader discovery.
+  Uploads, staff upload-form inspection, student-targeted uploads,
+  submission listing, per-student submission reads, grader discovery.
 - `src/gradescope_mcp/tools/extensions.py`
   Extension reads and writes.
 - `src/gradescope_mcp/tools/grading.py`
@@ -69,38 +70,43 @@ simple CRUD wrappers.
 2. `tool_get_assignments`
 3. `tool_get_assignment_details`
 4. `tool_get_course_roster`
-5. `tool_get_extensions`
-6. `tool_get_assignment_submissions`
-7. `tool_get_student_submission`
-8. `tool_get_assignment_graders`
-9. `tool_get_assignment_outline`
-10. `tool_export_assignment_scores`
-11. `tool_get_grading_progress`
-12. `tool_get_regrade_requests`
-13. `tool_get_regrade_detail`
-14. `tool_get_assignment_statistics`
-15. `tool_get_submission_grading_context`
-16. `tool_get_question_rubric`
-17. `tool_list_question_submissions`
-18. `tool_get_next_ungraded`
-19. `tool_get_answer_groups`
-20. `tool_get_answer_group_detail`
-21. `tool_prepare_grading_artifact`
-22. `tool_assess_submission_readiness`
-23. `tool_cache_relevant_pages`
-24. `tool_prepare_answer_key`
-25. `tool_smart_read_submission`
+5. `tool_inspect_submission_upload_form`
+6. `tool_get_extensions`
+7. `tool_get_assignment_submissions`
+8. `tool_get_student_submission`
+9. `tool_get_assignment_graders`
+10. `tool_get_assignment_outline`
+11. `tool_export_assignment_scores`
+12. `tool_get_student_assignment_link`
+13. `tool_get_grading_progress`
+14. `tool_get_regrade_requests`
+15. `tool_get_regrade_detail`
+16. `tool_get_assignment_statistics`
+17. `tool_get_submission_grading_context`
+18. `tool_get_question_rubric`
+19. `tool_list_question_submissions`
+20. `tool_get_student_submission_map`
+21. `tool_get_next_ungraded`
+22. `tool_get_answer_groups`
+23. `tool_get_answer_group_detail`
+24. `tool_prepare_grading_artifact`
+25. `tool_assess_submission_readiness`
+26. `tool_cache_relevant_pages`
+27. `tool_prepare_answer_key`
+28. `tool_smart_read_submission`
 
 ### Write / mutation
-26. `tool_upload_submission`
-27. `tool_set_extension`
-28. `tool_modify_assignment_dates`
-29. `tool_rename_assignment`
-30. `tool_apply_grade`
-31. `tool_create_rubric_item`
-32. `tool_update_rubric_item`
-33. `tool_delete_rubric_item`
-34. `tool_grade_answer_group`
+29. `tool_upload_submission`
+30. `tool_upload_submission_for_student`
+31. `tool_set_extension`
+32. `tool_modify_assignment_dates`
+33. `tool_rename_assignment`
+34. `tool_apply_grade`
+35. `tool_apply_grade_batch`
+36. `tool_create_rubric_item`
+37. `tool_update_rubric_item`
+38. `tool_delete_rubric_item`
+39. `tool_grade_answer_group`
 
 ## Operating Assumptions
 

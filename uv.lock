@@ -370,6 +370,7 @@ dependencies = [
     { name = "gradescopeapi" },
     { name = "mcp" },
     { name = "python-dotenv" },
+    { name = "requests-toolbelt" },
 ]
 
 [package.dev-dependencies]
@@ -383,6 +384,7 @@ requires-dist = [
     { name = "gradescopeapi", specifier = ">=1.8.0" },
     { name = "mcp", specifier = ">=1.26.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "requests-toolbelt", specifier = ">=1.0.0" },
 ]
 
 [package.metadata.requires-dev]
