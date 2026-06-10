@@ -32,10 +32,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--chrome-path", default="")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--manual-confirm",
+        dest="manual_confirm",
         action="store_true",
-        help="Wait for the user to confirm login is complete before saving cookies.",
+        default=True,
+        help=(
+            "Wait for the user to confirm login is complete before saving "
+            "cookies. This is the default."
+        ),
+    )
+    mode.add_argument(
+        "--auto-detect",
+        dest="manual_confirm",
+        action="store_false",
+        help=(
+            "Save automatically after the helper thinks Gradescope login "
+            "succeeded. Manual confirmation is safer for school SSO flows."
+        ),
     )
     return parser.parse_args()
 
@@ -159,7 +174,10 @@ def main() -> int:
 
     print("Opening Chrome for Gradescope SSO login...")
     print("Complete your normal school login in the browser window.")
-    print("This helper will save the Gradescope cookie after login succeeds.")
+    if args.manual_confirm:
+        print("Chrome will stay open until you confirm that login is complete.")
+    else:
+        print("Auto-detect mode will save cookies after login appears complete.")
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(

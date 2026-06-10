@@ -21,6 +21,8 @@
 5. Updated `.env.example`, `README.md`, and `AGENT.md`.
 6. Added `scripts/export_sso_cookie.py`, an optional Chrome/Playwright helper
    that writes `GRADESCOPE_COOKIE_HEADER` to `.env` after browser SSO login.
+7. Changed the helper to wait for manual confirmation by default so Chrome
+   does not close early when Gradescope creates a pre-login session cookie.
 
 ### Why this matters
 
@@ -28,6 +30,11 @@ Many institutional Gradescope accounts cannot log in with a direct Gradescope
 password. Cookie-based auth lets users complete SSO in their browser and give
 the MCP only a short-lived Gradescope session cookie, avoiding storage of school
 passwords.
+
+### Current state
+
+- **37 tools** + **3 resources** + **7 prompts**
+- **73 automated tests**
 
 ---
 ## Session 9 — 2026-03-18: Full Project Audit And Documentation Refresh
