@@ -15,10 +15,10 @@ workflows.
 
 ## Current Status
 
-- 34 MCP tools
+- 37 MCP tools
 - 3 MCP resources
 - 7 MCP prompts
-- 30 automated tests
+- 73 automated tests
 - Python 3.10+
 - Package manager: `uv`
 
@@ -142,7 +142,9 @@ before any mutation is executed.
 
 ### Authentication
 - `src/gradescope_mcp/auth.py`: maintains a singleton `GSConnection`
-- Credentials come from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`
+- Direct Gradescope login uses `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`
+- SSO / school-credential login uses `GRADESCOPE_COOKIE_HEADER` exported from
+  an authenticated browser session
 - `.env` is loaded automatically when starting with `python -m gradescope_mcp`
 
 ### Tool modules
@@ -200,7 +202,30 @@ cd gradescope-mcp
 cp .env.example .env
 ```
 
-Then edit `.env` with your Gradescope credentials.
+Then edit `.env` with either:
+
+```env
+# Preferred for SSO / school-credential users.
+GRADESCOPE_COOKIE_HEADER=_gradescope_session=...
+```
+
+For SSO users, the optional helper can open Chrome and write this value after
+you complete normal school login:
+
+```bash
+python3 scripts/export_sso_cookie.py --url https://www.gradescope.com/
+```
+
+The helper waits for you to confirm that school SSO is complete before saving
+cookies. For non-SSO flows, `--auto-detect` can restore automatic saving.
+
+or:
+
+```env
+# Direct Gradescope-account users only.
+GRADESCOPE_EMAIL=your_email@example.com
+GRADESCOPE_PASSWORD=your_password
+```
 
 ### 3. Run locally
 ```bash
@@ -225,8 +250,7 @@ Example client configuration:
         "gradescope_mcp"
       ],
       "env": {
-        "GRADESCOPE_EMAIL": "your_email@example.com",
-        "GRADESCOPE_PASSWORD": "your_password"
+        "GRADESCOPE_COOKIE_HEADER": "_gradescope_session=..."
       }
     }
   }

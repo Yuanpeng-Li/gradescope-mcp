@@ -12,10 +12,10 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 34 tools
+- 37 tools
 - 3 resources
 - 7 prompts
-- 30 automated tests
+- 73 automated tests
 - Python 3.10+
 - `uv` + `hatchling`
 - `mcp` FastMCP server
@@ -26,6 +26,9 @@ simple CRUD wrappers.
 ### Runtime entry
 - `src/gradescope_mcp/__main__.py`
   Loads `.env`, configures logging, and starts the server.
+- `scripts/export_sso_cookie.py`
+  Optional local helper that opens Chrome for school SSO and writes a
+  Gradescope cookie header to `.env` after manual confirmation.
 
 ### Server registration
 - `src/gradescope_mcp/server.py`
@@ -105,7 +108,10 @@ simple CRUD wrappers.
 ## Operating Assumptions
 
 ### Authentication
-- Credentials must come from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`
+- Direct-login credentials can come from `GRADESCOPE_EMAIL` and
+  `GRADESCOPE_PASSWORD`
+- SSO / school-credential sessions can come from `GRADESCOPE_COOKIE_HEADER` or
+  `GRADESCOPE_SESSION_COOKIE`
 - Never hardcode credentials
 - `python -m gradescope_mcp` automatically loads `.env`
 
