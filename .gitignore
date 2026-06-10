@@ -11,6 +11,7 @@ build/
 
 # Environment variables
 .env
+.gradescope_sso_chrome_profile/
 
 # Per-project Claude Code MCP server registration (may embed credentials
 # inline as `env` entries — see `claude mcp add ... --env`).

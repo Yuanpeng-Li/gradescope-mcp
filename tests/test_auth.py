@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 import requests
+from requests import Session
 
 from gradescope_mcp import auth
 
@@ -109,3 +110,75 @@ def test_reset_connection_swallows_logout_failures() -> None:
     auth._connection = Conn()
     auth.reset_connection()
     assert auth._connection is None
+
+
+def test_get_connection_accepts_sso_cookie_header(monkeypatch) -> None:
+    """SSO-only users can authenticate with browser-exported cookies."""
+    auth._connection = None
+
+    class Conn:
+        def __init__(self):
+            self.session = Session()
+            self.gradescope_base_url = "https://www.gradescope.com"
+            self.logged_in = False
+            self.account = None
+
+    monkeypatch.setattr(auth, "GSConnection", Conn)
+    monkeypatch.setattr(
+        auth,
+        "Account",
+        lambda session, base_url: SimpleNamespace(session=session, base_url=base_url),
+    )
+    monkeypatch.setenv(
+        "GRADESCOPE_COOKIE_HEADER",
+        "_gradescope_session=session-value; other_cookie=abc",
+    )
+    monkeypatch.delenv("GRADESCOPE_SESSION_COOKIE", raising=False)
+    monkeypatch.delenv("GRADESCOPE_EMAIL", raising=False)
+    monkeypatch.delenv("GRADESCOPE_PASSWORD", raising=False)
+
+    conn = auth.get_connection()
+
+    assert conn.logged_in is True
+    assert conn.account.base_url == "https://www.gradescope.com"
+    assert conn.session.cookies.get("_gradescope_session") == "session-value"
+    assert conn.session.cookies.get("other_cookie") == "abc"
+
+
+def test_get_connection_accepts_single_session_cookie(monkeypatch) -> None:
+    """A single _gradescope_session value can be used as a fallback."""
+    auth._connection = None
+
+    class Conn:
+        def __init__(self):
+            self.session = Session()
+            self.gradescope_base_url = "https://www.gradescope.com"
+            self.logged_in = False
+            self.account = None
+
+    monkeypatch.setattr(auth, "GSConnection", Conn)
+    monkeypatch.setattr(
+        auth,
+        "Account",
+        lambda session, base_url: SimpleNamespace(session=session, base_url=base_url),
+    )
+    monkeypatch.delenv("GRADESCOPE_COOKIE_HEADER", raising=False)
+    monkeypatch.setenv("GRADESCOPE_SESSION_COOKIE", "session-value")
+    monkeypatch.delenv("GRADESCOPE_EMAIL", raising=False)
+    monkeypatch.delenv("GRADESCOPE_PASSWORD", raising=False)
+
+    conn = auth.get_connection()
+
+    assert conn.logged_in is True
+    assert conn.session.cookies.get("_gradescope_session") == "session-value"
+
+
+def test_get_connection_missing_credentials_mentions_sso_cookie(monkeypatch) -> None:
+    auth._connection = None
+    monkeypatch.delenv("GRADESCOPE_COOKIE_HEADER", raising=False)
+    monkeypatch.delenv("GRADESCOPE_SESSION_COOKIE", raising=False)
+    monkeypatch.delenv("GRADESCOPE_EMAIL", raising=False)
+    monkeypatch.delenv("GRADESCOPE_PASSWORD", raising=False)
+
+    with pytest.raises(auth.AuthError, match="GRADESCOPE_COOKIE_HEADER"):
+        auth.get_connection()

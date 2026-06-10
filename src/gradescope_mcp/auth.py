@@ -13,10 +13,11 @@ explicitly so callers can opt in.
 
 import logging
 import os
+from http.cookies import SimpleCookie
 from typing import Callable, TypeVar
 
 import requests
-from gradescopeapi.classes.connection import GSConnection
+from gradescopeapi.classes.connection import GSConnection, Account
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +46,21 @@ def get_connection() -> GSConnection:
     if _connection is not None and _connection.logged_in:
         return _connection
 
+    cookie_header = os.environ.get("GRADESCOPE_COOKIE_HEADER")
+    session_cookie = os.environ.get("GRADESCOPE_SESSION_COOKIE")
+    if cookie_header or session_cookie:
+        _connection = _connection_from_cookies(cookie_header, session_cookie)
+        logger.info("Loaded Gradescope session from cookie environment.")
+        return _connection
+
     email = os.environ.get("GRADESCOPE_EMAIL")
     password = os.environ.get("GRADESCOPE_PASSWORD")
 
     if not email or not password:
         raise AuthError(
             "Missing Gradescope credentials. "
-            "Set GRADESCOPE_EMAIL and GRADESCOPE_PASSWORD environment variables."
+            "Set GRADESCOPE_COOKIE_HEADER for SSO sessions, or set "
+            "GRADESCOPE_EMAIL and GRADESCOPE_PASSWORD for direct login."
         )
 
     try:
@@ -66,6 +75,48 @@ def get_connection() -> GSConnection:
         # repr() preserves the exception type when str(e) is empty
         # (some requests exceptions stringify to "").
         raise AuthError(f"Unexpected error during login: {e!r}") from e
+
+
+def _connection_from_cookies(
+    cookie_header: str | None,
+    session_cookie: str | None,
+) -> GSConnection:
+    """Build a Gradescope connection from browser-exported session cookies.
+
+    This supports SSO-only accounts where the MCP cannot log in with
+    ``GRADESCOPE_EMAIL`` / ``GRADESCOPE_PASSWORD``. ``GRADESCOPE_COOKIE_HEADER``
+    should be a standard HTTP cookie header copied from an authenticated
+    Gradescope browser session. ``GRADESCOPE_SESSION_COOKIE`` is a narrower
+    fallback for only the Rails ``_gradescope_session`` cookie value.
+    """
+    conn = GSConnection()
+
+    if cookie_header:
+        parsed = SimpleCookie()
+        try:
+            parsed.load(cookie_header)
+        except Exception as e:
+            raise AuthError(f"Invalid GRADESCOPE_COOKIE_HEADER: {e}") from e
+        if not parsed:
+            raise AuthError("GRADESCOPE_COOKIE_HEADER did not contain cookies.")
+        for morsel in parsed.values():
+            conn.session.cookies.set(
+                morsel.key,
+                morsel.value,
+                domain=".gradescope.com",
+                path="/",
+            )
+    elif session_cookie:
+        conn.session.cookies.set(
+            "_gradescope_session",
+            session_cookie,
+            domain=".gradescope.com",
+            path="/",
+        )
+
+    conn.logged_in = True
+    conn.account = Account(conn.session, conn.gradescope_base_url)
+    return conn
 
 
 def reset_connection() -> None:
