@@ -648,7 +648,17 @@ cp .env.example .env
 ```
 
 Then edit `.env` with your Gradescope credentials (and any optional
-settings).
+settings). For an SSO account, run the helper instead; it opens Chrome, waits
+until you confirm that the school login is complete, and writes
+`GRADESCOPE_COOKIE_HEADER` to `.env` (see [SSO accounts](#sso-accounts)):
+
+```bash
+python3 scripts/export_sso_cookie.py
+```
+
+It needs Playwright (`python3 -m pip install --user playwright`).
+`--auto-detect` saves as soon as the page looks logged in instead of waiting
+for confirmation.
 
 ### 3. Run locally
 ```bash
@@ -752,6 +762,8 @@ gradescope-mcp/
 ├── README.md
 ├── pyproject.toml
 ├── uv.lock
+├── scripts/
+│   └── export_sso_cookie.py
 ├── skills/
 │   └── gradescope-assisted-grading/
 │       └── SKILL.md
@@ -786,6 +798,7 @@ gradescope-mcp/
     ├── test_common.py
     ├── test_dates_extensions_submissions.py
     ├── test_docs_consistency.py
+    ├── test_export_sso_cookie.py
     ├── test_extensions_and_answer_key.py
     ├── test_grading_ops_fixes.py
     ├── test_grading_workflow.py

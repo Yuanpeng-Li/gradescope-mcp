@@ -410,6 +410,7 @@ Current test files:
 - `tests/test_common.py`
 - `tests/test_dates_extensions_submissions.py`
 - `tests/test_docs_consistency.py`
+- `tests/test_export_sso_cookie.py`
 - `tests/test_extensions_and_answer_key.py`
 - `tests/test_grading_ops_fixes.py`
 - `tests/test_grading_workflow.py`
