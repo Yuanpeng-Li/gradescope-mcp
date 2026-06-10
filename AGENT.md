@@ -43,6 +43,11 @@ simple CRUD wrappers.
   re-reads `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` from the same files,
   touching only the credential variables that came from `.env`.
 
+- `scripts/export_sso_cookie.py`
+  Optional local helper (not part of the server) that opens Chrome for a
+  school SSO login and writes `GRADESCOPE_COOKIE_HEADER` to `.env` after
+  manual confirmation.
+
 ### Server registration
 - `src/gradescope_mcp/server.py`
   The authoritative tool/resource/prompt inventory. If counts in docs
@@ -303,7 +308,10 @@ All tools are `openWorldHint=true`.
 ## Operating Assumptions
 
 ### Authentication
-- Credentials must come from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`
+- Credentials must come from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`,
+  or for SSO accounts from `GRADESCOPE_COOKIE_HEADER` /
+  `GRADESCOPE_SESSION_COOKIE` (a browser-session cookie; when set, no
+  password login happens and `/account` is fetched to verify it)
 - Never hardcode credentials
 - `python -m gradescope_mcp` loads `.env` from the working directory, then
   from the source checkout (never from parent directories); variables

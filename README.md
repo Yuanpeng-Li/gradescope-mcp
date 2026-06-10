@@ -486,8 +486,10 @@ creates a new submission.
 
 | Variable | Required | Meaning |
 |----------|----------|---------|
-| `GRADESCOPE_EMAIL` | yes | Gradescope account email |
-| `GRADESCOPE_PASSWORD` | yes | Gradescope account password |
+| `GRADESCOPE_EMAIL` | yes, unless a cookie is set | Gradescope account email |
+| `GRADESCOPE_PASSWORD` | yes, unless a cookie is set | Gradescope account password |
+| `GRADESCOPE_COOKIE_HEADER` | no | For SSO accounts: the `Cookie` header of a logged-in Gradescope browser tab (see [SSO accounts](#sso-accounts)). When set, the email and password are not used |
+| `GRADESCOPE_SESSION_COOKIE` | no | For SSO accounts: only the `_gradescope_session` cookie value; used when `GRADESCOPE_COOKIE_HEADER` is not set |
 | `GRADESCOPE_MCP_CACHE_DIR` | no | Private cache root (see [Local cache](#local-cache)); must be owned by you with mode 0700 |
 | `GRADESCOPE_MCP_HTTP_TIMEOUT` | no | Read timeout in seconds for Gradescope requests (default 60); the connect timeout is `min(10, value)`. Invalid values are ignored with a warning |
 | `GRADESCOPE_MCP_UPLOAD_ROOT` | no | Absolute paths of existing directories, separated by `os.pathsep` (`:` on Linux/macOS, `;` on Windows), that upload files must resolve inside |
@@ -511,8 +513,9 @@ the `.env`, or pass the variables through the client configuration.
 
 ## Authentication
 
-- Credentials come only from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`.
-  The server logs in itself and POSTs them as a form body to `/login`
+- Credentials come from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`, or for
+  an SSO account from a browser-session cookie (see
+  [SSO accounts](#sso-accounts)). The server logs in itself and POSTs them as a form body to `/login`
   (gradescopeapi would put them in the URL query string). Error messages and
   logs never contain them.
 - A login that Gradescope answers without logging in starts a cooldown.
@@ -560,7 +563,24 @@ the `.env`, or pass the variables through the client configuration.
     (`isError: true`), followed by the output of the first attempt (or of
     the re-run, if the first attempt raised), labelled as possibly
     incomplete. If neither run returned output, the error stands alone.
-- Only email/password login is supported.
+
+### SSO accounts
+
+An account that signs in through a school's SSO has no Gradescope password.
+Give the server a browser-session cookie instead:
+
+- `GRADESCOPE_COOKIE_HEADER`: the `Cookie` header of a logged-in Gradescope
+  tab (a leading `Cookie:` is ignored), or
+- `GRADESCOPE_SESSION_COOKIE`: just the value of the `_gradescope_session`
+  cookie.
+
+`python3 scripts/export_sso_cookie.py` opens a browser for the SSO login
+and writes `GRADESCOPE_COOKIE_HEADER` to `.env` for you. With a cookie set,
+no password login happens: the server fetches `/account` with the cookie to
+check that Gradescope accepts it and to read the CSRF token. A rejected
+cookie gives `Authentication error: Gradescope login failed: Gradescope did
+not accept the session cookie ...`; export a fresh one. Cookie values never
+appear in errors or logs. Never put your school password in `.env`.
 
 ## Architecture
 
