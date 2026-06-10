@@ -15,10 +15,10 @@ workflows.
 
 ## Current Status
 
-- 34 MCP tools
+- 39 MCP tools
 - 3 MCP resources
 - 7 MCP prompts
-- 30 automated tests
+- 70 automated tests
 - Python 3.10+
 - Package manager: `uv`
 
@@ -29,12 +29,14 @@ workflows.
 - Assignment outline parsing for online and scanned-PDF assignments
 - Roster inspection with a custom HTML parser
 - Submission listing for multiple assignment types
+- Staff upload-form inspection for student-targeted uploads
 - Grading progress, rubric context, answer groups, regrades, and statistics
 - Workflow helpers that cache grading artifacts and answer-key snapshots to
   `/tmp/gradescope-mcp`
 
 ### Write-oriented workflows
 - Uploading submissions
+- Uploading or replacing submissions on behalf of a student
 - Setting student extensions
 - Modifying assignment dates
 - Renaming assignments
@@ -54,6 +56,8 @@ before any mutation is executed.
 | `tool_get_assignments` | List assignments for a course | All |
 | `tool_get_assignment_details` | Get one assignment's details | All |
 | `tool_upload_submission` | Upload files to an assignment | All |
+| `tool_inspect_submission_upload_form` | Inspect staff upload forms before targeted uploads | Instructor/TA |
+| `tool_upload_submission_for_student` | Upload or replace files on behalf of one student | Instructor/TA |
 
 ### Instructor / TA Management
 | Tool | Description |
