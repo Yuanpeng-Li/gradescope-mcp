@@ -6,6 +6,30 @@
 
 ---
 
+## Session 10 — 2026-06-10: SSO Cookie Authentication
+
+### What was done
+
+1. Added cookie-based authentication for school-credential / SSO users:
+   - `GRADESCOPE_COOKIE_HEADER`
+   - `GRADESCOPE_SESSION_COOKIE`
+2. Kept direct Gradescope email/password authentication as a fallback.
+3. Updated the missing-credentials error so users know both supported auth
+   paths.
+4. Added unit coverage for cookie-header auth, single session-cookie auth, and
+   missing-credential messaging.
+5. Updated `.env.example`, `README.md`, and `AGENT.md`.
+6. Added `scripts/export_sso_cookie.py`, an optional Chrome/Playwright helper
+   that writes `GRADESCOPE_COOKIE_HEADER` to `.env` after browser SSO login.
+
+### Why this matters
+
+Many institutional Gradescope accounts cannot log in with a direct Gradescope
+password. Cookie-based auth lets users complete SSO in their browser and give
+the MCP only a short-lived Gradescope session cookie, avoiding storage of school
+passwords.
+
+---
 ## Session 9 — 2026-03-18: Full Project Audit And Documentation Refresh
 
 ### What was done
