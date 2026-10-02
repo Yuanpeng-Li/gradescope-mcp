@@ -101,9 +101,16 @@ simple CRUD wrappers.
     login. If one was, it does not re-run it (that could repeat the write,
     or find it done and report "nothing changed"): the first result is
     returned with a "session expired ... after Gradescope had accepted N
-    write request(s)" notice. A second expiry returns
-    `SESSION_RECOVERY_FAILED_MESSAGE` followed by the first attempt's
-    output (labelled as possibly incomplete) instead of replacing it.
+    write request(s)" notice. If the re-run expires too, a re-run that
+    had a write accepted is reported the same way
+    (`_report_writes_then_expiry`): its output plus the notice, which is
+    not an error result (`isError` false), or `SessionExpiredError` if it
+    raised. A re-run that wrote nothing returns
+    `SESSION_RECOVERY_FAILED_MESSAGE` followed by the output of the first
+    run that returned text (normally the first attempt, labelled as
+    possibly incomplete) instead of replacing it
+    (`_report_failed_recovery`); if neither returned text it raises
+    `SessionExpiredError`.
     `reset_connection()` without `expired` also does a best-effort logout.
   - The module-level `tool_*` / `resource_*` names in `server.py` are the
     wrapped functions (the original is at `__wrapped__`).

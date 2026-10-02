@@ -502,10 +502,19 @@ the `.env`, or pass the variables through the client configuration.
   request(s) ..." notice. Gradescope did receive those writes; anything the
   result reports as failed or not read back is unconfirmed, so check it
   with the read tools before retrying it.
-- If the session expires again during the re-run, the result is
-  `Authentication error: Gradescope session expired and re-login did not restore access.`
-  followed by the output of the first attempt, labelled as possibly
-  incomplete.
+- If the session expires again during the re-run, the result depends on
+  whether Gradescope accepted a write during the re-run:
+  - It did: the re-run's output is returned with the same "⚠️ ...
+    accepted N write request(s) ..." notice. This is not an error result
+    (`isError` is false unless the output itself starts with an error), so
+    look for the notice rather than relying on `isError`. If the re-run
+    raised instead of returning output, the result is
+    `Authentication error: Gradescope session expired during the call after Gradescope had accepted N write request(s); ...`.
+  - It did not: the result is
+    `Authentication error: Gradescope session expired and re-login did not restore access.`
+    (`isError: true`), followed by the output of the first attempt (or of
+    the re-run, if the first attempt raised), labelled as possibly
+    incomplete. If neither run returned output, the error stands alone.
 - Only email/password login is supported.
 
 ## Architecture

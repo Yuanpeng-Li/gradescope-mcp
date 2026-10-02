@@ -215,3 +215,119 @@ def test_undecodable_dotenv_is_skipped_without_partial_load(tmp_path, monkeypatc
 def test_module_docstring_promises_startup_never_fails_on_dotenv() -> None:
     doc = " ".join(entry.__doc__.split())
     assert "never stop the server from starting" in doc
+
+
+# ---------------------------------------------------------------------------
+# [5] The documented results of a second expiry match the code
+# ---------------------------------------------------------------------------
+
+
+_EXPIRED = object()  # stands in for the connection whose session expired
+
+
+def _scripted_tool(runs):
+    """A tool wrapped like ``gs_tool``; each run is ``(accepted writes,
+    returned text or raised exception)`` and ends in an expiry."""
+    script = iter(runs)
+
+    def tool() -> str:
+        writes, outcome = next(script)
+        auth._local.expired = _EXPIRED
+        auth._local.writes = writes
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    return server._signal_errors(auth.with_session_recovery(tool))
+
+
+def _text_and_error(result) -> tuple[str, bool]:
+    if isinstance(result, str):
+        return result, False
+    return "\n".join(c.text for c in result.content), bool(result.is_error)
+
+
+def test_second_expiry_after_a_write_in_the_rerun_returns_its_output_and_notice() -> None:
+    """Reviewer repro R2/double_expiry.py: the re-run saved row 5, then
+    expired again. The result is the re-run's output plus the writes notice,
+    and it is not an error result."""
+    tool = _scripted_tool([
+        (0, "## Batch grade result\n- **succeeded:** 0"),
+        (1, "## Batch grade result\n- **succeeded:** 1\n### Saved\n- `5`"),
+    ])
+
+    text, is_error = _text_and_error(tool())
+
+    assert not is_error
+    assert text.startswith("## Batch grade result\n- **succeeded:** 1")
+    assert text.endswith(auth._writes_then_expiry_notice(1))
+
+
+def test_second_expiry_after_a_write_in_a_rerun_that_raised_is_an_error() -> None:
+    tool = _scripted_tool([
+        (0, "first"),
+        (1, auth.SessionExpiredError("expired")),
+    ])
+
+    text, is_error = _text_and_error(tool())
+
+    assert is_error
+    assert text.startswith(
+        "Authentication error: Gradescope session expired during the call after "
+        "Gradescope had accepted 1 write request(s)"
+    )
+
+
+def test_second_expiry_without_writes_is_the_recovery_error_plus_an_output() -> None:
+    text, is_error = _text_and_error(_scripted_tool([(0, "first"), (0, "second")])())
+    assert is_error and text.startswith(auth.SESSION_RECOVERY_FAILED_MESSAGE)
+    assert "Output of the first attempt" in text and text.endswith("first")
+
+    # The first attempt raised: the re-run's output follows the error.
+    text, is_error = _text_and_error(
+        _scripted_tool([(0, auth.SessionExpiredError("x")), (0, "second")])()
+    )
+    assert is_error and text.startswith(auth.SESSION_RECOVERY_FAILED_MESSAGE)
+    assert "Output of the retry" in text and text.endswith("second")
+
+    # Neither returned text: the error stands alone.
+    text, is_error = _text_and_error(_scripted_tool(
+        [(0, auth.SessionExpiredError("x")), (0, auth.SessionExpiredError("y"))]
+    )())
+    assert is_error and text == auth.SESSION_RECOVERY_FAILED_MESSAGE
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _section(text: str, start: str, end: str) -> str:
+    return text[text.index(start):text.index(end, text.index(start))]
+
+
+def test_readme_states_both_second_expiry_results() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    section = _flat(_section(readme, "## Authentication", "## Architecture"))
+
+    assert "If the session expires again during the re-run" in section
+    # Case 1: a write accepted in the re-run.
+    assert (
+        "the re-run's output is returned with the same \"⚠️ ... accepted N write "
+        "request(s) ...\" notice. This is not an error result" in section
+    )
+    # Case 2: no write in the re-run.
+    assert (
+        f"`{auth.SESSION_RECOVERY_FAILED_MESSAGE}` (`isError: true`), followed by "
+        "the output of the first attempt (or of the re-run, if the first attempt "
+        "raised)" in section
+    )
+    assert "followed by the output of the first attempt, labelled" not in section
+
+
+def test_agent_md_states_both_second_expiry_results() -> None:
+    agent = _flat((ROOT / "AGENT.md").read_text(encoding="utf-8"))
+
+    assert "A second expiry returns `SESSION_RECOVERY_FAILED_MESSAGE` followed by the first" not in agent
+    assert "If the re-run expires too, a re-run that had a write accepted is reported the same way" in agent
+    assert "not an error result (`isError` false)" in agent
+    assert "A re-run that wrote nothing returns `SESSION_RECOVERY_FAILED_MESSAGE`" in agent

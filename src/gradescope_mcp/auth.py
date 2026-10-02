@@ -822,12 +822,15 @@ def with_session_recovery(fn: Callable[..., T]) -> Callable[..., T]:
       read tools. A call that raised gets ``SessionExpiredError`` saying so.
 
     If the session expires again during the re-run, a re-run that had a
-    write accepted is reported the same way. Otherwise a string-returning
-    call gets ``SESSION_RECOVERY_FAILED_MESSAGE`` (``"Authentication error:
-    Gradescope session expired and re-login did not restore access."``)
-    followed by the first attempt's output, labelled as possibly incomplete
+    write accepted is reported the same way: its output plus the notice
+    (not an error result), or ``SessionExpiredError`` if it raised.
+    Otherwise a string-returning call gets ``SESSION_RECOVERY_FAILED_MESSAGE``
+    (``"Authentication error: Gradescope session expired and re-login did
+    not restore access."``) followed by the first attempt's output, or the
+    re-run's if the first attempt raised, labelled as possibly incomplete
     (that output can be a misleading empty result, so it never stands on its
-    own); a call that raised gets ``SessionExpiredError`` with that text.
+    own); if neither run returned text, ``SessionExpiredError`` with that
+    text is raised.
     Other exceptions and login failures pass through unchanged.
 
     The hook does not mark the connection logged out, so a tool that keeps
