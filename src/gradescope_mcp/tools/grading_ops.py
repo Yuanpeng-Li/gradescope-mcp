@@ -1533,6 +1533,13 @@ def apply_grade(
                 "overwrite_graded=True only if the user approved overwriting "
                 "this grade"
             )
+        elif overwrite:
+            details.append(
+                "⚠️ overwrite_graded=True, but the submission is not graded "
+                "now: the flag could only overwrite a grade entered after this "
+                "preview, which the user has not seen. Drop it unless the user "
+                "approved that"
+            )
         if rubric_item_ids is not None:
             details.append(f"rubric_item_ids={rubric_item_ids}")
             details.append(f"will CHECK: {_describe_items(plan['checked'])}")
@@ -1606,6 +1613,7 @@ def apply_grade(
 
 _BATCH_ROW_KEYS = (
     "submission_id", "rubric_item_ids", "point_adjustment", "comment", "confidence",
+    "overwrite",
 )
 
 # Rows per apply_grade_batch call. Each row costs a page load, a POST and a
@@ -1619,7 +1627,8 @@ def _normalize_batch_rows(grades: list) -> tuple[list[dict], list[str]]:
 
     Returns ``(rows, errors)``. Every row is checked before anything is
     fetched or written: unknown keys, duplicate submission IDs, malformed
-    rubric IDs, and non-finite or non-numeric numbers are all errors.
+    rubric IDs, non-finite or non-numeric numbers and a non-boolean
+    ``overwrite`` are all errors.
     """
     rows: list[dict] = []
     errors: list[str] = []
@@ -1661,6 +1670,10 @@ def _normalize_batch_rows(grades: list) -> tuple[list[dict], list[str]]:
         if comment is not None and not isinstance(comment, str):
             errors.append(f"{label}: comment must be a string or null")
             continue
+        overwrite = g.get("overwrite")
+        if overwrite is not None and not isinstance(overwrite, bool):
+            errors.append(f"{label}: overwrite must be true, false or null")
+            continue
         try:
             rids = normalize_rubric_ids(raw_rids)
             pa = _coerce_finite_number(g.get("point_adjustment"), "point_adjustment")
@@ -1682,6 +1695,7 @@ def _normalize_batch_rows(grades: list) -> tuple[list[dict], list[str]]:
                 "point_adjustment": pa,
                 "comment": comment,
                 "confidence": cf,
+                "overwrite": overwrite is True,
             }
         )
     return rows, errors
@@ -1712,10 +1726,13 @@ def _is_low_confidence(row: dict) -> bool:
     return row["confidence"] is not None and row["confidence"] < CONFIDENCE_REJECT_BELOW
 
 
-def _batch_preview(
-    course_id: str, question_id: str, rows: list[dict], overwrite: bool,
-) -> str:
-    """Load every row's grading page and describe exactly what would be sent."""
+def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
+    """Load every row's grading page and describe exactly what would be sent.
+
+    ``overwrite: true`` is refused on a row that is not graded now: it could
+    only ever overwrite a grade entered after this preview, which the user
+    has not seen, so it must stay on the rows whose grade the preview shows.
+    """
     planned: list[tuple[dict, dict, dict]] = []
     problems: list[str] = []
     valid_ids: list[str] | None = None
@@ -1755,6 +1772,15 @@ def _batch_preview(
                 )
                 valid_ids = [str(ri["id"]) for ri in rubric]
                 continue
+        if row["overwrite"] and not _is_graded(props):
+            problems.append(
+                f"{label}: overwrite=true, but this submission is not graded "
+                "now. overwrite=true is only for a row whose grade this "
+                "preview shows and the user approved overwriting; on an "
+                "ungraded row it would let a grade entered after the preview "
+                "be overwritten. Remove it from this row"
+            )
+            continue
         plan = _plan_grade_write(
             props, row["rubric_item_ids"], row["point_adjustment"], row["comment"]
         )
@@ -1779,7 +1805,8 @@ def _batch_preview(
         "| # | submission_id | current | check | uncheck | point_adj | comment | projected | confidence |",
         "|---|---------------|---------|-------|---------|-----------|---------|-----------|------------|",
     ]
-    already_graded: list[str] = []
+    already_graded: list[str] = []  # graded, no overwrite: not written
+    overwritten: list[str] = []  # graded, overwrite=true on the row
     unchanged: list[str] = []
     review: list[str] = []
     skipped: list[str] = []
@@ -1800,10 +1827,11 @@ def _batch_preview(
         if _already_holds(props, plan):
             current += " (graded; already holds this grade, nothing to send)"
             unchanged.append(sid)
+        elif _is_graded(props) and row["overwrite"]:
+            current += " (graded; OVERWRITTEN: overwrite=true)"
+            overwritten.append(sid)
         elif _is_graded(props):
-            current += " (graded)" if overwrite else (
-                " (graded; SKIPPED unless overwrite_graded=True)"
-            )
+            current += " (graded; SKIPPED unless overwrite=true on this row)"
             already_graded.append(sid)
         if row["rubric_item_ids"] is None:
             check = "keep current: " + _describe_items(plan["checked"])
@@ -1844,36 +1872,44 @@ def _batch_preview(
             ]) + " |"
         )
 
-    skipped_graded = 0 if overwrite else len(already_graded)
     details = [
         f"course_id=`{course_id}`",
         f"question_id=`{question_id}`",
         f"rows={len(rows)} (will write "
-        f"{len(planned) - skipped_graded - len(unchanged)}, "
-        f"skip {len(skipped)} with confidence < {CONFIDENCE_REJECT_BELOW}"
-        + (f", skip {skipped_graded} already graded" if skipped_graded else "")
+        f"{len(planned) - len(already_graded) - len(unchanged)}"
+        + (f" ({len(overwritten)} overwriting a grade)" if overwritten else "")
+        + f", skip {len(skipped)} with confidence < {CONFIDENCE_REJECT_BELOW}"
+        + (f", skip {len(already_graded)} already graded" if already_graded else "")
         + (f", {len(unchanged)} already hold this grade" if unchanged else "")
         + ")",
     ]
-    graded_ids = ", ".join(f"`{s}`" for s in already_graded)
-    if already_graded and overwrite:
+    if overwritten:
+        details.append(
+            f"⚠️ {len(overwritten)} row(s) are already graded and will be "
+            "OVERWRITTEN (overwrite=true on the row): "
+            + ", ".join(f"`{s}`" for s in overwritten)
+            + ". Only rows with overwrite=true can overwrite a grade"
+        )
+    if already_graded:
         details.append(
             f"⚠️ {len(already_graded)} row(s) are already graded and will be "
-            f"OVERWRITTEN (overwrite_graded=True): {graded_ids}"
+            "SKIPPED (not written): "
+            + ", ".join(f"`{s}`" for s in already_graded)
+            + ". Leave them out of the confirm_write=True call: a row left in "
+            "is written if its grade is cleared before then. To overwrite one, "
+            'set "overwrite": true on that row only, if the user approved '
+            "overwriting that grade, and preview again"
         )
-    elif already_graded:
-        details.append(
-            f"⚠️ {len(already_graded)} row(s) are already graded and will be "
-            f"SKIPPED (not written): {graded_ids}. To overwrite them, re-run "
-            "with overwrite_graded=True, only if the user approved "
-            "overwriting these grades"
+    details.append(
+        "each row is re-read right before it is written; a row without "
+        "overwrite=true that is graded by then (e.g. by another grader after "
+        "this preview) is skipped, not overwritten"
+        + (
+            "; a row with overwrite=true overwrites the grade it holds at that "
+            "time (the result names it)"
+            if overwritten else ""
         )
-    if not overwrite:
-        details.append(
-            "each row is re-read right before it is written; a row graded by "
-            "then (e.g. by another grader after this preview) is skipped, "
-            "not overwritten"
-        )
+    )
     if planned:
         # scoring_type is per question, so the first row speaks for all.
         details.extend(_projection_notes(
@@ -1897,11 +1933,10 @@ def apply_grade_batch(
     question_id: str,
     grades: list[dict],
     confirm_write: bool = False,
-    overwrite_graded: bool = False,
 ) -> str:
     """Apply grades to many submissions for one question in a single call.
 
-    Each ``grades`` entry is a dict with exactly these keys (unknown keys
+    Each ``grades`` entry is a dict with only these keys (unknown keys
     are rejected):
         - ``submission_id``: str (required, unique within the batch)
         - ``rubric_item_ids``: list[str] | None — same semantics as
@@ -1915,6 +1950,9 @@ def apply_grade_batch(
           clears it, any other string overwrites.
         - ``confidence``: float | None — per-row gate: < 0.6 is skipped,
           0.6-0.8 is written and flagged NEEDS HUMAN REVIEW.
+        - ``overwrite``: bool | None — ``True`` lets this row overwrite the
+          grade it holds when the write runs. Set it only on a row the
+          preview showed as graded and the user approved overwriting.
 
     All entries are applied to the same ``question_id``. At most
     ``MAX_BATCH_ROWS`` (50) rows per call; split larger batches. Invalid rows
@@ -1926,13 +1964,18 @@ def apply_grade_batch(
     / skipped-by-confidence / skipped-already-graded / needs-review) with
     per-row scores read back from Gradescope.
 
-    Already graded rows are skipped unless ``overwrite_graded=True``. Each
-    row is re-read right before its write, so a row graded after the
-    preview (e.g. by another grader) is skipped too; with
-    ``overwrite_graded=True`` the result names every grade it overwrote. A
-    graded row that already holds exactly the requested grade is listed as
-    such and not re-sent. A row whose grading page belongs to another
-    submission is not written.
+    Overwrite approval is per row. Each row is re-read right before its
+    write; a row that is graded then is written only if it carries
+    ``overwrite: true``, so a row graded after the preview (e.g. by another
+    grader) is skipped and listed as not written, whatever the other rows
+    say. The result names every grade it overwrote. The preview refuses
+    ``overwrite: true`` on a row that is not graded, since there it could
+    only overwrite a grade the user has not seen. Rows the preview marks
+    SKIPPED should be left out of the confirmed call: the write cannot know
+    what the preview showed, so such a row is written if its grade was
+    cleared in between. A graded row that already holds exactly the
+    requested grade is listed as such and not re-sent. A row whose grading
+    page belongs to another submission is not written.
 
     This is meant for the main agent's post-approval execution phase:
     subagents (if any) should only propose rows, and the main agent previews
@@ -1956,9 +1999,8 @@ def apply_grade_batch(
     if errors:
         return "Error: invalid batch input:\n" + "\n".join(f"- {e}" for e in errors)
 
-    overwrite = overwrite_graded is True
     if not confirm_write:
-        return _batch_preview(course_id, question_id, rows, overwrite)
+        return _batch_preview(course_id, question_id, rows)
 
     to_write = [r for r in rows if not _is_low_confidence(r)]
     skipped_confidence = [
@@ -2029,9 +2071,10 @@ def apply_grade_batch(
                 if _needs_review(row["confidence"]):
                     review.append((sid, row["confidence"]))
                 continue
-            # A grade entered after the preview (e.g. by another grader) is
-            # never overwritten without the explicit opt-in.
-            if existing is not None and not overwrite:
+            # A graded row is overwritten only with its own opt-in, so a
+            # grade entered after the preview (e.g. by another grader) is
+            # never overwritten on the strength of another row's approval.
+            if existing is not None and not row["overwrite"]:
                 skipped_graded.append((sid, existing))
                 continue
             resp = _post_save_grade(ctx, plan["payload"])
@@ -2067,8 +2110,8 @@ def apply_grade_batch(
     ]
     if skipped_graded:
         lines.append(
-            "- **skipped (already graded at write time; overwrite_graded not "
-            f"set):** {len(skipped_graded)}"
+            "- **skipped (already graded at write time; no overwrite=true on "
+            f"the row):** {len(skipped_graded)}"
         )
     if unchanged:
         lines.append(
@@ -2104,12 +2147,13 @@ def apply_grade_batch(
         lines.append("")
         lines.append(
             "### ⚠️ Not written: already graded at write time "
-            "(overwrite_graded not set)"
+            "(no overwrite=true on the row)"
         )
         lines.append(
             "These rows were graded when the write ran, possibly by someone "
-            "else after the preview. Show the user their current grades and "
-            "re-run them with overwrite_graded=True only if they approve."
+            "else after the preview. Show the user their current grades; to "
+            'overwrite one, set "overwrite": true on that row only if they '
+            "approve, preview it again and confirm."
         )
         for sid, existing in skipped_graded:
             lines.append(f"- `{sid}`: {existing}")

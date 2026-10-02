@@ -196,6 +196,7 @@ class GradeRow(TypedDict, total=False):
     point_adjustment: Number | None
     comment: str | None
     confidence: Number | None
+    overwrite: bool | None
 
 
 # At most MAX_BATCH_ROWS rows. The schema advertises the cap (``maxItems``)
@@ -985,7 +986,6 @@ def tool_apply_grade_batch(
     question_id: GradescopeID,
     grades: GradeRows,
     confirm_write: bool = False,
-    overwrite_graded: bool = False,
 ) -> str:
     """Apply grades to many submissions for one question in a single call.
 
@@ -1010,6 +1010,9 @@ def tool_apply_grade_batch(
     - ``confidence``: number | null (per row: < 0.6 is skipped; 0.6-0.8
       inclusive is written and flagged NEEDS HUMAN REVIEW; true/false are
       rejected)
+    - ``overwrite``: boolean | null (``true`` lets this row overwrite the
+      grade it holds when the write runs; set it only on a row the preview
+      showed as graded and the user explicitly approved overwriting)
 
     Every rubric item ID must be in the question's rubric; otherwise the
     whole batch is refused and nothing is written.
@@ -1018,13 +1021,16 @@ def tool_apply_grade_batch(
     - ``confirm_write=False``: loads each row's grading page and returns a
       preview table (current score, items to check and uncheck, projected
       score, confidence) with warnings for already-graded rows (SKIPPED, or
-      OVERWRITTEN with ``overwrite_graded=True``) and rows flagged for
-      review; no writes.
+      OVERWRITTEN when the row has ``overwrite: true``) and rows flagged for
+      review; no writes. ``overwrite: true`` on a row that is not graded is
+      refused (it could only overwrite a grade entered after the preview).
     - ``confirm_write=True``: re-reads each row right before saving it and
       reads it back afterwards. A row that is graded at that point (even if
       it was ungraded in the preview, e.g. graded by another grader since)
-      is skipped and listed as not written, unless ``overwrite_graded=True``;
-      then the result names each grade it overwrote. A graded row that
+      is skipped and listed as not written unless that row has
+      ``overwrite: true``; the result names each grade it overwrote. Leave
+      rows the preview marked SKIPPED out of this call: a row left in is
+      written if its grade was cleared in the meantime. A graded row that
       already holds exactly the requested grade is listed as such and not
       re-sent. A row whose grading page belongs to another submission fails
       without a write. Returns
@@ -1038,13 +1044,8 @@ def tool_apply_grade_batch(
         confirm_write: Must be True to save. The default returns a preview
             and changes nothing. Setting it is not user approval: show the
             preview to the user first.
-        overwrite_graded: Must be True to save over rows that are already
-            graded when the write runs. Set it only with the user's explicit
-            approval to overwrite existing grades.
     """
-    return apply_grade_batch(
-        course_id, question_id, grades, confirm_write, overwrite_graded=overwrite_graded
-    )
+    return apply_grade_batch(course_id, question_id, grades, confirm_write)
 
 
 @gs_tool(read_only("Get question rubric"))
@@ -1863,17 +1864,22 @@ def auto_grade_question(
         f"preview; nothing is written. Show me a table: submission ID, student, "
         f"current score, items to check and uncheck, projected score, confidence, a "
         f"one-line justification, and every SKIPPED, OVERWRITTEN or NEEDS HUMAN "
-        f"REVIEW warning from the preview. Already graded rows are skipped unless "
-        f"overwrite_graded=True. Only if I explicitly approve overwriting those "
-        f"grades, preview the batch again with overwrite_graded=True (the preview "
-        f"then marks them OVERWRITTEN) and show me that preview.\n\n"
+        f"REVIEW warning from the preview. Already graded rows are SKIPPED unless "
+        f"the row has \"overwrite\": true. Overwrite approval is per row: only for "
+        f"a row whose current grade I explicitly approve overwriting, add "
+        f"\"overwrite\": true to that row (never to other rows), preview the batch "
+        f"again (the preview then marks that row OVERWRITTEN) and show me that "
+        f"preview.\n\n"
         f"**Step 5 — Approval**\n"
         f"Stop and wait for my explicit approval. Apply only the rows I approve; if "
         f"I change any row, preview the changed batch again and get my approval for "
         f"it. Passing confirm_write=True is not approval.\n\n"
         f"**Step 6 — Write the approved batch**\n"
         f"Only after I approve, call tool_apply_grade_batch with the approved rows "
-        f"and overwrite_graded value exactly as previewed and confirm_write=True.\n\n"
+        f"exactly as previewed (each row's overwrite key included) and "
+        f"confirm_write=True. Leave out the rows the preview marked SKIPPED (no new "
+        f"preview is needed for that): a row left in is written if its grade is "
+        f"cleared before the write.\n\n"
         f"**Step 7 — Verify**\n"
         f"Check the scores the batch result read back from Gradescope; for any "
         f"failure or read-back mismatch, stop and re-read the submission with "
@@ -1888,6 +1894,6 @@ def auto_grade_question(
         f"- Never call tool_apply_grade or tool_apply_grade_batch with "
         f"confirm_write=True before I approve the previewed batch.\n"
         f"- Never overwrite an already graded submission unless I approve it "
-        f"explicitly: overwrite_graded=True is only for grades I approved "
-        f"overwriting."
+        f"explicitly: \"overwrite\": true goes only on the rows whose grades I "
+        f"approved overwriting."
     )

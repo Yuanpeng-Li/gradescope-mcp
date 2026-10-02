@@ -473,32 +473,34 @@ def test_batch_rows_are_typed_and_strict() -> None:
     assert row["required"] == ["submission_id"]
     assert set(row["properties"]) == {
         "submission_id", "rubric_item_ids", "point_adjustment", "comment", "confidence",
+        "overwrite",
     }
+    # Overwrite approval is per row; there is no batch-wide flag.
+    assert "overwrite_graded" not in schema["properties"]
 
 
 def test_batch_rows_reach_the_implementation_as_plain_dicts(monkeypatch) -> None:
     seen = {}
 
-    def fake_batch(course_id, question_id, grades, confirm_write, overwrite_graded=None):
+    def fake_batch(course_id, question_id, grades, confirm_write):
         seen["grades"] = grades
-        seen["overwrite_graded"] = overwrite_graded
+        seen["confirm_write"] = confirm_write
         return "preview"
 
     monkeypatch.setattr(server, "apply_grade_batch", fake_batch)
 
     _call("tool_apply_grade_batch", {"course_id": "1", "question_id": "2", "grades": [
         {"submission_id": 55, "rubric_item_ids": [300]},
-        {"submission_id": "56", "comment": None, "confidence": "0.9"},
+        {"submission_id": "56", "comment": None, "confidence": "0.9", "overwrite": True},
     ]})
 
     # Only the keys the client sent, so omitted fields keep their current values.
     assert seen["grades"] == [
         {"submission_id": "55", "rubric_item_ids": ["300"]},
-        {"submission_id": "56", "comment": None, "confidence": 0.9},
+        {"submission_id": "56", "comment": None, "confidence": 0.9, "overwrite": True},
     ]
     assert all(type(g) is dict for g in seen["grades"])
-    # The wrapper always passes overwrite_graded through, False by default.
-    assert seen["overwrite_graded"] is False
+    assert seen["confirm_write"] is False
 
 
 @pytest.mark.parametrize("row", [
@@ -888,14 +890,18 @@ def test_grade_prompts_require_approval_for_overwrite_graded() -> None:
     assert _after(grade, "confirm_write=True alone will not write",
                   "overwrite_graded=True only if I explicitly approve")
 
+    # Batch overwrite approval is per row: the prompt never suggests a
+    # batch-wide flag, and rows the preview SKIPPED are left out.
     auto = prompts["auto_grade_question"]
     assert f"at most {MAX_BATCH_ROWS} rows per call" in auto
-    assert "Already graded rows are skipped unless overwrite_graded=True" in auto
-    assert _after(auto, "explicitly approve overwriting",
-                  "preview the batch again with overwrite_graded=True")
-    assert "overwrite_graded value exactly as previewed and confirm_write=True" in auto
+    assert "overwrite_graded" not in auto
+    assert 'Already graded rows are SKIPPED unless the row has "overwrite": true' in auto
+    assert _after(auto, "I explicitly approve overwriting",
+                  'add "overwrite": true to that row (never to other rows)')
+    assert "exactly as previewed (each row's overwrite key included)" in auto
+    assert "Leave out the rows the preview marked SKIPPED" in auto
     assert "SKIPPED, OVERWRITTEN or NEEDS HUMAN REVIEW" in auto
     assert "'Not written: already graded at write time'" in auto
     assert "already holding the requested grade" in auto
-    assert "overwrite_graded=True is only for grades I approved overwriting" in auto
+    assert '"overwrite": true goes only on the rows whose grades I approved overwriting' in auto
     assert "block id" in auto

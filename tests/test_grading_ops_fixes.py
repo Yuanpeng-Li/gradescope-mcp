@@ -503,8 +503,8 @@ def test_apply_grade_and_batch_report_the_same_score_for_kept_adjustment(monkeyp
         C, Q, "11", rubric_item_ids=["100"], confirm_write=True, overwrite_graded=True
     )
     batch = grading_ops.apply_grade_batch(
-        C, Q, [{"submission_id": "12", "rubric_item_ids": ["100"]}], confirm_write=True,
-        overwrite_graded=True,
+        C, Q, [{"submission_id": "12", "rubric_item_ids": ["100"], "overwrite": True}],
+        confirm_write=True,
     )
 
     payloads = _save_payloads(world)
@@ -668,24 +668,25 @@ def test_batch_preview_shows_live_state_and_escapes_cells(monkeypatch) -> None:
     preview = grading_ops.apply_grade_batch(
         C, Q, [
             {"submission_id": "61", "comment": None, "point_adjustment": None,
-             "rubric_item_ids": None, "confidence": 0.9} | {"comment": "x"},
+             "rubric_item_ids": None, "confidence": 0.9, "overwrite": True} | {"comment": "x"},
             {"submission_id": "62", "rubric_item_ids": ["100"], "comment": "a | b\nc"},
             {"submission_id": "63", "rubric_item_ids": ["300"], "comment": ""},
         ],
-        overwrite_graded=True,
     )
 
     assert "Write confirmation required for `apply_grade_batch`." in preview
-    assert "rows=3 (will write 3, skip 0 with confidence < 0.6)" in preview
+    assert (
+        "rows=3 (will write 3 (1 overwriting a grade), skip 0 with confidence < 0.6)"
+    ) in preview
     assert (
         "1 row(s) are already graded and will be OVERWRITTEN "
-        "(overwrite_graded=True): `61`"
+        "(overwrite=true on the row): `61`"
     ) in preview
     lines = preview.splitlines()
     row61 = next(line for line in lines if line.startswith("| 1 |"))
     row62 = next(line for line in lines if line.startswith("| 2 |"))
     row63 = next(line for line in lines if line.startswith("| 3 |"))
-    assert "6.0/10 (graded)" in row61
+    assert "6.0/10 (graded; OVERWRITTEN: overwrite=true)" in row61
     assert "keep current: `200` Sign error (4 pts)" in row61
     assert "keep (1.0)" in row61
     assert "7/10" in row61  # 10 - 4 + 1
@@ -1411,7 +1412,7 @@ def test_batch_skips_a_row_graded_after_the_preview(monkeypatch) -> None:
     assert gs.subs["22"]["score"] == 6.0 and gs.subs["22"]["applied"] == [200]
     assert gs.subs["22"]["comments"] == "TA: sign error"
     assert "- **succeeded:** 1" in result
-    assert "- **skipped (already graded at write time; overwrite_graded not set):** 1" in result
+    assert "- **skipped (already graded at write time; no overwrite=true on the row):** 1" in result
     assert "### ⚠️ Not written: already graded at write time" in result
     assert "- `22`: 6/10, rubric ['200'], has a comment" in result
     assert "`22`: 10/10" not in result
@@ -1423,12 +1424,10 @@ def test_batch_overwrite_opt_in_names_each_overwritten_grade(monkeypatch) -> Non
     gs.add("22", graded=True, score=6.0, applied=[200])
     grades = [
         {"submission_id": "21", "rubric_item_ids": ["100"]},
-        {"submission_id": "22", "rubric_item_ids": ["100"]},
+        {"submission_id": "22", "rubric_item_ids": ["100"], "overwrite": True},
     ]
 
-    result = grading_ops.apply_grade_batch(
-        C, Q, grades, confirm_write=True, overwrite_graded=True
-    )
+    result = grading_ops.apply_grade_batch(C, Q, grades, confirm_write=True)
 
     assert len(gs.posts()) == 2
     assert "- **overwrote existing grades:** 1" in result
@@ -1453,10 +1452,11 @@ def test_batch_preview_marks_graded_rows_as_skipped_without_opt_in(monkeypatch) 
     assert "rows=2 (will write 1, skip 0 with confidence < 0.6, skip 1 already graded)" in preview
     assert (
         "1 row(s) are already graded and will be SKIPPED (not written): `22`. "
-        "To overwrite them, re-run with overwrite_graded=True"
+        "Leave them out of the confirm_write=True call"
     ) in preview
+    assert 'set "overwrite": true on that row only' in preview
     row22 = next(line for line in preview.splitlines() if line.startswith("| 2 |"))
-    assert "6.0/10 (graded; SKIPPED unless overwrite_graded=True)" in row22
+    assert "6.0/10 (graded; SKIPPED unless overwrite=true on this row)" in row22
     assert gs.posts() == []
 
 
@@ -1598,10 +1598,14 @@ def test_missing_graded_flag_with_a_score_counts_as_graded() -> None:
     assert grading_ops._is_graded({"submission": {"graded": True, "score": None}})
 
 
-def test_overwrite_graded_is_exposed_on_both_per_submission_tools() -> None:
-    for name in ("tool_apply_grade", "tool_apply_grade_batch"):
-        prop = _tool_schema(name)["properties"]["overwrite_graded"]
-        assert prop["type"] == "boolean" and prop["default"] is False
+def test_overwrite_opt_in_is_per_submission_in_both_tools() -> None:
+    prop = _tool_schema("tool_apply_grade")["properties"]["overwrite_graded"]
+    assert prop["type"] == "boolean" and prop["default"] is False
+    # The batch has no batch-wide flag: each row carries its own approval.
+    batch = _tool_schema("tool_apply_grade_batch")
+    assert "overwrite_graded" not in batch["properties"]
+    row = batch["$defs"]["GradeRow"]["properties"]["overwrite"]
+    assert {"type": "boolean"} in row["anyOf"]
 
 
 # ---------------------------------------------------------------------------
@@ -2027,3 +2031,177 @@ def test_preview_footer_requires_explicit_user_approval() -> None:
 @pytest.mark.parametrize("value", [None, "", "  "])
 def test_sanitize_inline_handles_empty_values(value) -> None:
     assert common.sanitize_inline(value) == ""
+
+
+# ---------------------------------------------------------------------------
+# Round 3 [0] / [3]: batch overwrite approval belongs to a row, not the batch
+# ---------------------------------------------------------------------------
+
+SAVE = f"/courses/{C}/questions/{Q}/submissions/{{}}/save_grade"
+
+
+def _overwrite_world(monkeypatch) -> OfflineGradescope:
+    gs = OfflineGradescope().install(monkeypatch)
+    gs.add("20", graded=True, score=6.0, applied=[200])
+    gs.add("21")
+    gs.add("22")
+    return gs
+
+
+def test_batch_overwrite_covers_only_the_row_that_carries_it(monkeypatch) -> None:
+    """Reviewer repro Q1/blanket_overwrite.py, with the approval on row 20:
+    a TA grades row 22 after the preview, and the confirm must not touch it."""
+    gs = _overwrite_world(monkeypatch)
+    args = {"course_id": C, "question_id": Q, "grades": [
+        {"submission_id": "20", "rubric_item_ids": ["100"], "overwrite": True},
+        {"submission_id": "21", "rubric_item_ids": ["100"]},
+        {"submission_id": "22", "rubric_item_ids": ["100"]},
+    ]}
+
+    preview, is_error = _call_mcp("tool_apply_grade_batch", args)
+    assert not is_error
+    assert "rows=3 (will write 3 (1 overwriting a grade), skip 0 with confidence < 0.6)" in preview
+    assert (
+        "1 row(s) are already graded and will be OVERWRITTEN (overwrite=true on "
+        "the row): `20`. Only rows with overwrite=true can overwrite a grade"
+    ) in preview
+    # The re-read note is kept next to an approved overwrite.
+    assert (
+        "a row without overwrite=true that is graded by then (e.g. by another "
+        "grader after this preview) is skipped, not overwritten; a row with "
+        "overwrite=true overwrites the grade it holds at that time"
+    ) in preview
+    assert "| 3 | `22` | ungraded |" in preview
+
+    gs.subs["22"].update(
+        graded=True, score=6.0, applied=[200], comments="TA: sign error, see line 3"
+    )
+    result, is_error = _call_mcp("tool_apply_grade_batch", {**args, "confirm_write": True})
+
+    assert not is_error
+    assert gs.posts() == [SAVE.format("20"), SAVE.format("21")]
+    assert gs.subs["22"] == {
+        "graded": True, "score": 6.0, "applied": [200], "points": None,
+        "comments": "TA: sign error, see line 3",
+    }
+    assert "- **succeeded:** 2" in result
+    assert "- **overwrote existing grades:** 1" in result
+    assert "- `20`: 10/10 — rubric ['100']" in result
+    assert "⚠️ OVERWROTE existing grade (6/10, rubric ['200'])" in result
+    assert "- **skipped (already graded at write time; no overwrite=true on the row):** 1" in result
+    assert "### ⚠️ Not written: already graded at write time (no overwrite=true on the row)" in result
+    assert "- `22`: 6/10, rubric ['200'], has a comment" in result
+    assert "`22`: 10/10" not in result
+
+
+def test_batch_wide_overwrite_graded_is_gone_and_overwrites_nothing(monkeypatch) -> None:
+    """The batch-level flag was removed; a client still sending it gets the
+    default: graded rows are skipped, never overwritten."""
+    gs = _overwrite_world(monkeypatch)
+    args = {"course_id": C, "question_id": Q, "overwrite_graded": True, "grades": [
+        {"submission_id": "20", "rubric_item_ids": ["100"]},
+        {"submission_id": "21", "rubric_item_ids": ["100"]},
+    ]}
+
+    preview, _ = _call_mcp("tool_apply_grade_batch", args)
+    assert "SKIPPED (not written): `20`" in preview
+    assert "OVERWRITTEN" not in preview
+
+    result, is_error = _call_mcp("tool_apply_grade_batch", {**args, "confirm_write": True})
+
+    assert not is_error
+    assert gs.posts() == [SAVE.format("21")]
+    assert gs.subs["20"]["applied"] == [200] and gs.subs["20"]["score"] == 6.0
+    assert "- `20`: 6/10, rubric ['200']" in result
+    with pytest.raises(TypeError):
+        grading_ops.apply_grade_batch(C, Q, args["grades"], overwrite_graded=True)
+
+
+def test_batch_preview_refuses_overwrite_on_an_ungraded_row(monkeypatch) -> None:
+    """overwrite=true on a row the preview shows as ungraded could only
+    overwrite a grade entered after the preview, so a blanket opt-in is refused."""
+    gs = _overwrite_world(monkeypatch)
+    grades = [
+        {"submission_id": sid, "rubric_item_ids": ["100"], "overwrite": True}
+        for sid in ("20", "21", "22")
+    ]
+
+    result, is_error = _call_mcp(
+        "tool_apply_grade_batch", {"course_id": C, "question_id": Q, "grades": grades}
+    )
+
+    assert is_error
+    assert result.startswith("Error: batch refused; nothing was written.")
+    assert "- row 1 (21): overwrite=true, but this submission is not graded now." in result
+    assert "- row 2 (22): overwrite=true, but this submission is not graded now." in result
+    assert "row 0 (20)" not in result
+    assert gs.posts() == []
+
+
+def test_batch_row_overwrite_must_be_a_boolean(monkeypatch) -> None:
+    gs = _overwrite_world(monkeypatch)
+
+    result = grading_ops.apply_grade_batch(
+        C, Q, [{"submission_id": "20", "rubric_item_ids": ["100"], "overwrite": "yes"}],
+        confirm_write=True,
+    )
+    assert result.startswith("Error: invalid batch input:")
+    assert "row 0 (20): overwrite must be true, false or null" in result
+    assert gs.log == []
+
+    # null and false both mean "do not overwrite".
+    for value in (None, False):
+        preview, is_error = _call_mcp("tool_apply_grade_batch", {
+            "course_id": C, "question_id": Q,
+            "grades": [{"submission_id": "20", "rubric_item_ids": ["100"], "overwrite": value}],
+        })
+        assert not is_error
+        assert "SKIPPED (not written): `20`" in preview
+    assert gs.posts() == []
+
+
+def test_batch_preview_says_to_leave_skipped_rows_out(monkeypatch) -> None:
+    """Reviewer repro Q1/skipped_then_written.py. The write cannot know a row
+    was previewed as SKIPPED, so the preview tells the agent to leave it out;
+    the call it then confirms does not touch the row, even if its grade was
+    cleared in the meantime."""
+    gs = OfflineGradescope().install(monkeypatch)
+    gs.add("20", graded=True, score=6.0, applied=[200])
+    gs.add("21")
+    row20 = {"submission_id": "20", "rubric_item_ids": ["100"]}
+    row21 = {"submission_id": "21", "rubric_item_ids": ["100"]}
+
+    preview, _ = _call_mcp(
+        "tool_apply_grade_batch", {"course_id": C, "question_id": Q, "grades": [row20, row21]}
+    )
+    assert "rows=2 (will write 1, skip 0 with confidence < 0.6, skip 1 already graded)" in preview
+    assert (
+        "SKIPPED (not written): `20`. Leave them out of the confirm_write=True "
+        "call: a row left in is written if its grade is cleared before then"
+    ) in preview
+
+    gs.subs["20"].update(graded=False, score=None, applied=[])
+    result, is_error = _call_mcp("tool_apply_grade_batch", {
+        "course_id": C, "question_id": Q, "grades": [row21], "confirm_write": True,
+    })
+
+    assert not is_error
+    assert gs.posts() == [SAVE.format("21")]
+    assert gs.subs["20"]["graded"] is False
+
+
+def test_apply_grade_preview_flags_overwrite_on_an_ungraded_submission(monkeypatch) -> None:
+    gs = OfflineGradescope().install(monkeypatch)
+    gs.add("22")
+
+    preview = grading_ops.apply_grade(
+        C, Q, "22", rubric_item_ids=["100"], overwrite_graded=True
+    )
+
+    assert (
+        "⚠️ overwrite_graded=True, but the submission is not graded now: the "
+        "flag could only overwrite a grade entered after this preview"
+    ) in preview
+    assert "already graded" not in preview
+    assert gs.posts() == []
+
