@@ -13,6 +13,11 @@ class _FakeResponse:
     def __init__(self, content: bytes):
         self.content = content
 
+    def iter_content(self, chunk_size: int = 1):
+        # Page images are streamed (requests.Response.iter_content).
+        for start in range(0, len(self.content), chunk_size):
+            yield self.content[start:start + chunk_size]
+
     def close(self) -> None:
         return None
 
