@@ -6,6 +6,95 @@
 
 ---
 
+## Session 14 — 2026-10-02: Fixes From a Live Read-Only Test (L1-L6)
+
+### Why
+
+The tools were run against a real Gradescope account, read-only (every
+write tool only as a preview). Two write tools could not work on real
+pages: `tool_modify_assignment_dates` refused every partial update, and
+`tool_grade_answer_group` refused every group. Four smaller defects
+showed up in the read tools. The fixes are tested with synthetic fixtures
+that mirror the observed page structures; no write was run live.
+
+### Dates (`assignments.py`, L1)
+
+- The settings page has no date inputs in its server HTML (they are
+  rendered client-side). The current values sit in the
+  `SetupDueDateFormGroup` React props: `releaseDate`, `dueDate`,
+  `hardDueDateEnabled`, `hardDueDate` (present when enabled),
+  `syncLmsDueDate` and `timezone`, as course-local `YYYY-MM-DDTHH:MM`.
+  `_read_date_form` now prefers those props (`hardDueDateEnabled` is the
+  late-submission flag, `hardDueDate` the late due date) and keeps the
+  input reader as a fallback per value. The read-back uses the same
+  reader. A missing or unparseable value is still refused, never guessed.
+- The write still posts gradescopeapi's form field names
+  (`assignment[release_date_string]`, ...).
+- Preview and result name the course timezone the page reports (e.g.
+  `America/Los_Angeles (PDT)`) and warn when `syncLmsDueDate` is on, since
+  an LMS sync may overwrite the due date.
+
+### Group grading (`answer_groups.py`, L2, L3)
+
+- Gradescope serves `/answer_groups/{g}/grade` as a 302 to the
+  representative submission's `/submissions/{sid}/grade?group_mode=true`,
+  whose `urls.save_grade` already ends in `/save_many_grades`. Such a URL
+  is now used when the page is in group mode for this group: `group_mode`
+  true, `answer_group` equal to the group, the URL in this course and
+  question, its submission the page's `submission.id` and a confirmed
+  member (`_group_mode_problem`). `/save_grade` URLs are still rewritten;
+  anything else is refused. The page-identity checks (`_group_page_problem`)
+  now run before the save URL is resolved and cover both URL forms.
+- A group with no confirmed members is refused before its grade page is
+  fetched (Gradescope redirects it to the `/answer_groups` overview). The
+  Error lists the inferred members and points to the answer-grouping UI
+  or individual grading. A grade page that lands on that overview (an
+  `AnswerGrouper` page) for another reason is reported as such instead of
+  "SubmissionGrader component not found".
+
+### Read tools (L4-L6)
+
+- `tool_list_courses` (`courses.py`): the course box's count and its
+  child label were glued together by the upstream parser ("1
+  assignmentNo Published Grades"); they are now shown as
+  `1 assignment · No Published Grades`.
+- `tool_get_assignment_outline` (`grading.py`): AssignmentEditor props
+  carry no assignment type, so online assignments showed "Type: Unknown".
+  They now show "Online assignment"; a reported type (e.g. PDFAssignment)
+  is kept. `_get_outline_data` adds an `_outline_component` key.
+- `tool_get_assignments` (`assignments.py`): gradescopeapi drops
+  AssignmentsTable rows of type `assignment_container`, so a course box
+  could count 8 assignments while the tool listed 7. The tool now fetches
+  the page itself (same requests, gradescopeapi's parsers) and names the
+  containers in a note below the table; the table and total are
+  unchanged.
+
+### Tests
+
+- `tests/test_live_fixes.py` covers L1-L6. Run against the previous code,
+  its tests reproduce the live failures ("the settings page has no
+  release_date field", "unexpected save URL ... (expected a path ending in
+  /save_grade)", "SubmissionGrader component not found", "Type: Unknown").
+- Three existing tests that faked `conn.account.get_assignments` for
+  `get_assignments` now fake `_fetch_assignment_listing`; their assertions
+  are unchanged.
+
+### Behavior changes for MCP clients
+
+- `tool_modify_assignment_dates` works on the real settings page; preview
+  and result gain a timezone and an LMS-sync line.
+- `tool_grade_answer_group` accepts the group-mode page; zero-member
+  groups get a clearer Error without a page request.
+- `tool_list_courses`, `tool_get_assignment_outline` and
+  `tool_get_assignments` output as described above.
+
+### Current state
+
+- **38 tools** + **3 resources** + **7 prompts**
+- **918 automated tests** (`uv run pytest -q`), all passing
+
+---
+
 ## Session 13 — 2026-10-02: Round-3 Review Fixes and Follow-ups
 
 ### Why

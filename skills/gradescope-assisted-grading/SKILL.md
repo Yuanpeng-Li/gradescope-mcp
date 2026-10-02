@@ -405,7 +405,7 @@ Already-graded members:
 Preview first:
 - Call `tool_grade_answer_group(..., confirm_write=False)`
 - The preview lists the members with their graded counts and IDs, the items CHECKED and UNCHECKED for every member, the projected per-member score, and the member count to pass back as `expected_member_count`
-- Unknown rubric IDs, an unreadable rubric or a group without confirmed members are refused before any preview
+- Unknown rubric IDs, an unreadable rubric or a group without confirmed members are refused before any preview. Gradescope has no grading page for a group without confirmed members: ask the user to confirm its members in Gradescope's answer-grouping UI, or grade those submissions individually
 - So is a grade page that does not belong to the group (a redirect to another group's page, another `answer_group`, a save URL through another group's member): nothing is sent. Re-check the group ID and stop
 
 Then ask a direct approval question, including:

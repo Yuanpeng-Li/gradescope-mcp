@@ -133,7 +133,12 @@ simple CRUD wrappers.
   Course listing and custom roster parsing.
 - `src/gradescope_mcp/tools/assignments.py`
   Assignment listing, detail reads, date edits (merged and verified), rename,
-  autograder image. Also `parse_date_input` / `check_date_order` and
+  autograder image. The listing fetches the page itself with gradescopeapi's
+  parsers so it can also name the assignment containers they drop. Date
+  edits read the current values from the settings page's
+  `SetupDueDateFormGroup` React props (the date inputs are rendered
+  client-side; inputs are the fallback) and post gradescopeapi's form field
+  names. Also `parse_date_input` / `check_date_order` and
   `serialized_write` (a process-wide lock per Gradescope object, held across
   read, write and read-back of a confirmed write; waits up to 300 s, then
   `WriteInProgressError`), which `extensions.py` reuses.
@@ -167,7 +172,11 @@ simple CRUD wrappers.
   build crop-first read plans.
 - `src/gradescope_mcp/tools/answer_groups.py`
   AI-assisted answer-group inspection and batch grading. The grade page must
-  belong to the requested group (`_group_page_problem`).
+  belong to the requested group (`_group_page_problem`). Gradescope serves it
+  as the representative submission's group-mode page, whose save URL
+  already ends in `/save_many_grades` (`_group_mode_problem` ties it to the
+  group); a group without confirmed members is refused before its page is
+  fetched.
 - `src/gradescope_mcp/tools/regrades.py`
   Regrade list/detail scraping.
 - `src/gradescope_mcp/tools/statistics.py`
@@ -338,7 +347,9 @@ All tools are `openWorldHint=true`.
 ### Dates
 - Inputs are `YYYY-MM-DDTHH:MM` with an explicit time
 - Assignment dates are course-local wall-clock times without an offset;
-  omitted dates and the late-submission flag are preserved
+  omitted dates and the late-submission flag are preserved; previews and
+  results name the course timezone from the settings page and warn when
+  the due date is synced from an LMS
 - Extension dates without an offset use the course timezone Gradescope
   reports; the `timezone` argument only stands in when it reports none (a
   differing zone, or one that can't be checked because several or an

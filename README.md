@@ -269,14 +269,26 @@ submission is already graded) and repeats that call with
   offset. Omitted dates and the allow-late-submissions setting are read
   from the assignment settings and re-sent unchanged. Passing
   `late_due_date` turns late submissions on; the tool cannot turn them off.
-  The preview reads those current settings and lists all values that will
-  be sent, so it returns an error (`Authentication error` / `Error`) rather
-  than a partial preview when they can't be read; the write refuses for the
-  same reason. The result is verified by re-reading the settings, and
-  requested values that were already set are labelled as such.
+  The settings page renders its date fields in the browser, so the current
+  values come from the page's due-date settings data (release, due, late
+  due date and whether it is enabled, the LMS sync flag and the course
+  timezone); form inputs are the fallback. A value missing or unreadable
+  there is never guessed: the call is an `Error` that asks for that date
+  explicitly. The preview lists all values that will be sent, so it
+  returns an error (`Authentication error` / `Error`) rather than a
+  partial preview when they can't be read; the write refuses for the same
+  reason. Preview and result name the course timezone the page reports
+  (for example `America/Los_Angeles (PDT)`; the abbreviation is the one
+  Gradescope shows now) and warn when the due date is synced from an LMS,
+  since a later sync may overwrite it. The result is verified by
+  re-reading the settings the same way, and requested values that were
+  already set are labelled as such.
 - `tool_get_assignments` / `tool_get_assignment_details` show dates that
   Gradescope reports with a UTC offset with that offset (for example
-  `2026-10-01 23:59 UTC-07:00`).
+  `2026-10-01 23:59 UTC-07:00`). `tool_get_assignments` names assignment
+  containers on the staff page in a note below the table; they are not
+  assignments and are not counted, so the total can be lower than the
+  count `tool_list_courses` shows.
 - `tool_get_extensions` names the course timezone above the table and shows
   each date as course-local time and the UTC instant Gradescope stores
   (`2026-10-01 23:59 PDT = 2026-10-02T06:59:00Z`), plus an Other Settings
@@ -366,6 +378,18 @@ submission is already graded) and repeats that call with
   another `answer_group`, or a save URL outside the course and question or
   through another group's confirmed member refuses the write before
   anything is sent.
+- Gradescope serves a group's grade page by redirecting to its
+  representative submission in group mode, whose save URL already ends in
+  `/save_many_grades`. That URL is used only when the page is in group mode
+  for the requested group and saves through its own submission, which must
+  be a confirmed member of the group. A save URL ending in `/save_grade` is
+  still rewritten to `/save_many_grades`; any other URL is refused.
+- A group with no confirmed members is refused before its grade page is
+  fetched: Gradescope has no grading page for it (its grade URL redirects
+  to the answer-grouping overview). The Error lists the inferred members;
+  confirm the members in Gradescope's answer-grouping UI or grade the
+  submissions individually. A grade page that lands on that overview for
+  another reason is reported as such.
 - Pass the member count from the preview as `expected_member_count`
   together with `confirm_write=True`; the write aborts if the group's
   membership changed since the preview.
@@ -762,6 +786,10 @@ gradescope-mcp/
    HTML parsing or reverse-engineered endpoints, and some write behavior
    (for example how `save_many_grades` treats inferred members) can't be
    verified offline. The tools choose the conservative option and say so.
+   The pages the date and group-grading writes read (the settings page's
+   due-date data, the group grade page's redirect to a group-mode
+   submission page) were checked read-only against a live account; the
+   writes themselves have not been run against one.
 2. Roster parsing uses a custom parser because the upstream library parser is
    unreliable when sections are present.
 3. Some assignment types do not support the extensions API even for staff
