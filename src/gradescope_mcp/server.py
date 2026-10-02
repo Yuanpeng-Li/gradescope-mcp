@@ -5,8 +5,9 @@ Registers all tools, resources, and prompts with the MCP server.
 
 import json
 import logging
+from importlib.metadata import PackageNotFoundError, version
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from gradescope_mcp.auth import get_connection, AuthError
 from gradescope_mcp.tools.courses import list_courses, get_course_roster
@@ -61,8 +62,15 @@ from gradescope_mcp.tools.grading_workflow import (
 
 logger = logging.getLogger(__name__)
 
-# Create the MCP server
-mcp = FastMCP("Gradescope MCP Server")
+try:
+    _SERVER_VERSION = version("gradescope-mcp")
+except PackageNotFoundError:
+    _SERVER_VERSION = ""
+
+# Create the MCP server. mcp v2 reports an empty serverInfo.version unless one
+# is passed, and runs these sync tool functions on worker threads rather than
+# inline on the event loop (see auth.py for the thread-safety this requires).
+mcp = MCPServer("Gradescope MCP Server", version=_SERVER_VERSION)
 
 # ============================================================
 # Tools

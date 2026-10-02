@@ -6,6 +6,45 @@
 
 ---
 
+## Session 10 — 2026-09-29: Upgrade To MCP Python SDK v2 And gradescopeapi 1.8.1
+
+### What was done
+
+1. Migrated from `mcp` 1.26 (`FastMCP`) to `mcp` 2.2 (`MCPServer`). `mcp` 2.x
+   removed `mcp.server.fastmcp`, and the old unbounded `mcp>=1.26.0` pin let
+   non-lockfile installs resolve 2.x and crash at import.
+2. `server.py` now builds `MCPServer("Gradescope MCP Server", version=...)`;
+   v2 reports an empty `serverInfo.version` unless one is passed.
+3. `auth.py` guards singleton login/reset with a lock. v2 runs sync tool
+   functions on worker threads (v1 ran them inline on the event loop), so
+   concurrent first calls previously could all log in.
+4. Bumped `gradescopeapi` to 1.8.1. Its only change is the upstream roster
+   submissions-column fix; this project uses its own `_parse_roster`, which
+   was checked against the roster fixture shipped in the 1.8.1 wheel.
+5. Pinned `mcp>=2.2.0,<3` and `gradescopeapi>=1.8.1`.
+
+### Behavior changes
+
+- Tool calls no longer block the event loop, so pings and cancellation are
+  processed while a tool waits on Gradescope, and independent tool calls can
+  run concurrently (anyio's default worker-thread limit).
+- Tool results, error signalling (`isError`), argument validation, resources
+  and prompts are unchanged on the wire; verified over stdio with protocol
+  versions `2025-06-18` and `2025-11-25`.
+
+### New tests added
+
+- `tests/test_server_mcp.py`: registration counts, worker-thread execution,
+  write preview and argument validation through the `MCPServer` layer.
+- `tests/test_auth.py`: concurrent first `get_connection()` calls log in once.
+
+### Current state
+
+- **37 tools** + **3 resources** + **7 prompts**
+- **72 automated tests**
+
+---
+
 ## Session 9 — 2026-03-18: Full Project Audit And Documentation Refresh
 
 ### What was done

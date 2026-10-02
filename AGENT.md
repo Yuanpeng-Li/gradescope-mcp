@@ -3,8 +3,9 @@
 ## Project Objective
 
 This project exposes Gradescope course-management and grading capabilities
-through FastMCP so that MCP clients can inspect courses, plan grading, review
-student work, and execute carefully gated write operations.
+through the MCP Python SDK v2 (`MCPServer`) so that MCP clients can inspect
+courses, plan grading, review student work, and execute carefully gated write
+operations.
 
 The codebase is optimized for real-world instructor and TA workflows, especially
 for scanned exams and AI-assisted grading where the client needs more than just
@@ -12,13 +13,13 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 34 tools
+- 37 tools
 - 3 resources
 - 7 prompts
-- 30 automated tests
+- 72 automated tests
 - Python 3.10+
 - `uv` + `hatchling`
-- `mcp` FastMCP server
+- `mcp` v2 `MCPServer` (sync tools run on worker threads, not the event loop)
 - `gradescopeapi` plus direct HTTP/HTML/JSON scraping for unsupported cases
 
 ## Repository Map

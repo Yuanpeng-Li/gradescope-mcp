@@ -9,10 +9,15 @@ login and never reset, so the cached connection looked valid forever even
 after Gradescope's server-side cookie had expired. The recovery path here
 (``with_session_retry`` and ``request_with_retry``) provides that behavior
 explicitly so callers can opt in.
+
+Since mcp v2, sync tool functions run on worker threads and can execute
+concurrently, so creating and dropping the singleton is serialized with a
+lock. The shared ``requests.Session`` itself is used concurrently.
 """
 
 import logging
 import os
+import threading
 from typing import Callable, TypeVar
 
 import requests
@@ -22,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 # Singleton connection instance
 _connection: GSConnection | None = None
+# Guards creation and reset of ``_connection`` across tool worker threads.
+_connection_lock = threading.Lock()
 
 T = TypeVar("T")
 
@@ -42,30 +49,36 @@ def get_connection() -> GSConnection:
     """
     global _connection
 
-    if _connection is not None and _connection.logged_in:
-        return _connection
+    conn = _connection
+    if conn is not None and conn.logged_in:
+        return conn
 
-    email = os.environ.get("GRADESCOPE_EMAIL")
-    password = os.environ.get("GRADESCOPE_PASSWORD")
+    with _connection_lock:
+        # Another thread may have logged in while we waited for the lock.
+        if _connection is not None and _connection.logged_in:
+            return _connection
 
-    if not email or not password:
-        raise AuthError(
-            "Missing Gradescope credentials. "
-            "Set GRADESCOPE_EMAIL and GRADESCOPE_PASSWORD environment variables."
-        )
+        email = os.environ.get("GRADESCOPE_EMAIL")
+        password = os.environ.get("GRADESCOPE_PASSWORD")
 
-    try:
-        conn = GSConnection()
-        conn.login(email, password)
-        _connection = conn
-        logger.info("Logged in to Gradescope.")
-        return _connection
-    except ValueError as e:
-        raise AuthError(f"Gradescope login failed: {e}") from e
-    except Exception as e:
-        # repr() preserves the exception type when str(e) is empty
-        # (some requests exceptions stringify to "").
-        raise AuthError(f"Unexpected error during login: {e!r}") from e
+        if not email or not password:
+            raise AuthError(
+                "Missing Gradescope credentials. "
+                "Set GRADESCOPE_EMAIL and GRADESCOPE_PASSWORD environment variables."
+            )
+
+        try:
+            conn = GSConnection()
+            conn.login(email, password)
+            _connection = conn
+            logger.info("Logged in to Gradescope.")
+            return _connection
+        except ValueError as e:
+            raise AuthError(f"Gradescope login failed: {e}") from e
+        except Exception as e:
+            # repr() preserves the exception type when str(e) is empty
+            # (some requests exceptions stringify to "").
+            raise AuthError(f"Unexpected error during login: {e!r}") from e
 
 
 def reset_connection() -> None:
@@ -77,14 +90,15 @@ def reset_connection() -> None:
     primary contract is local state cleanup.
     """
     global _connection
-    if _connection is not None:
-        try:
-            logout = getattr(_connection, "logout", None)
-            if callable(logout):
-                logout()
-        except Exception as e:
-            logger.warning("Best-effort logout failed during reset: %r", e)
-    _connection = None
+    with _connection_lock:
+        if _connection is not None:
+            try:
+                logout = getattr(_connection, "logout", None)
+                if callable(logout):
+                    logout()
+            except Exception as e:
+                logger.warning("Best-effort logout failed during reset: %r", e)
+        _connection = None
 
 
 def is_session_expired_response(resp: requests.Response) -> bool:

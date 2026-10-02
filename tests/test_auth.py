@@ -109,3 +109,45 @@ def test_reset_connection_swallows_logout_failures() -> None:
     auth._connection = Conn()
     auth.reset_connection()
     assert auth._connection is None
+
+
+def test_get_connection_logs_in_once_under_concurrent_first_calls(monkeypatch) -> None:
+    """mcp v2 runs sync tools on worker threads, so first calls can race.
+
+    Without the lock every racing thread would log in (and the losers'
+    sessions would be dropped); with it exactly one login happens.
+    """
+    import threading
+    import time
+
+    logins = {"count": 0}
+
+    class FakeGSConnection:
+        def __init__(self) -> None:
+            self.logged_in = False
+
+        def login(self, email, password) -> None:
+            logins["count"] += 1
+            time.sleep(0.05)  # widen the race window
+            self.logged_in = True
+
+    monkeypatch.setattr(auth, "GSConnection", FakeGSConnection)
+    monkeypatch.setattr(auth, "_connection", None)
+    monkeypatch.setenv("GRADESCOPE_EMAIL", "prof@example.edu")
+    monkeypatch.setenv("GRADESCOPE_PASSWORD", "secret")
+
+    start = threading.Barrier(8)
+    results = []
+
+    def worker() -> None:
+        start.wait()
+        results.append(auth.get_connection())
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert logins["count"] == 1
+    assert len({id(conn) for conn in results}) == 1

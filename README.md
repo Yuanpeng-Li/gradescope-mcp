@@ -15,11 +15,12 @@ workflows.
 
 ## Current Status
 
-- 34 MCP tools
+- 37 MCP tools
 - 3 MCP resources
 - 7 MCP prompts
-- 30 automated tests
+- 72 automated tests
 - Python 3.10+
+- MCP Python SDK v2 (`mcp>=2.2,<3`, `MCPServer`)
 - Package manager: `uv`
 
 ## What The Project Provides
@@ -137,11 +138,13 @@ before any mutation is executed.
 
 ### Entry points
 - `src/gradescope_mcp/__main__.py`: loads `.env`, configures logging, runs the
-  FastMCP server
+  `MCPServer` (mcp v2) over stdio
 - `src/gradescope_mcp/server.py`: registers all tools, resources, and prompts
 
 ### Authentication
 - `src/gradescope_mcp/auth.py`: maintains a singleton `GSConnection`
+  (login and reset are lock-guarded because mcp v2 runs sync tools on
+  worker threads, so tool calls can execute concurrently)
 - Credentials come from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`
 - `.env` is loaded automatically when starting with `python -m gradescope_mcp`
 
