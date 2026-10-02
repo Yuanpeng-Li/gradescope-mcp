@@ -10,10 +10,15 @@ What MCP clients see:
   parameter); the workflow tools that only write files to the private local
   cache are neither. All are ``openWorldHint`` (they talk to Gradescope).
 - **IDs.** Every Gradescope ID parameter (course, assignment, question,
-  submission, group, rubric item, user) must be a string of digits. JSON
-  numbers are accepted and converted, surrounding whitespace and backticks
-  are stripped, and anything else is rejected before the tool runs. Blank
-  optional IDs mean "not given".
+  submission, group, rubric item, user) must be a string of ASCII digits
+  (``0-9``). JSON numbers are accepted and converted, surrounding
+  whitespace and backticks are stripped, leading zeros are dropped
+  (``"031"`` is ``"31"``), and anything else (including non-ASCII digits)
+  is rejected before the tool runs. Blank optional IDs mean "not given".
+- **Numbers.** Number parameters (point adjustments, confidences, rubric
+  weights, the expected member count) accept JSON numbers and numeric
+  strings but reject ``true``/``false``. ``tool_apply_grade_batch`` takes at
+  most ``MAX_BATCH_ROWS`` (50) rows per call.
 - **Errors.** A tool result that starts with ``Error``, ``Authentication
   error`` or ``❌`` is a handled failure and is returned with
   ``isError: true``; the text is unchanged. Previews (``Write confirmation
@@ -68,6 +73,7 @@ from gradescope_mcp.tools.statistics import get_assignment_statistics
 from gradescope_mcp.tools.grading_ops import (
     CONFIDENCE_REJECT_BELOW,
     CONFIDENCE_REVIEW_UP_TO,
+    MAX_BATCH_ROWS,
     get_submission_grading_context,
     apply_grade,
     apply_grade_batch,
@@ -109,16 +115,23 @@ mcp = MCPServer("Gradescope MCP Server", version=_SERVER_VERSION)
 # Argument types
 # ============================================================
 
-_ID_PATTERN = r"^\d+$"
+# ASCII digits only: ``\d`` would also match other Unicode digits (``١٢٣``,
+# ``１２３``), which pass for numbers in Python but not in a Gradescope URL.
+_ID_PATTERN = r"^[0-9]+$"
 _ID_RE = re.compile(_ID_PATTERN)
 
 
 def _coerce_id(value: Any) -> Any:
     """Normalize a Gradescope ID sent by a client, or reject it.
 
-    IDs go into request URLs, so only digit strings get through. A JSON
-    number is converted to its digits; whitespace and the backticks agents
-    copy from markdown tables are stripped.
+    IDs go into request URLs, so only ASCII digit strings get through. A
+    JSON number is converted to its digits; whitespace and the backticks
+    agents copy from markdown tables are stripped. Leading zeros are
+    dropped (``"031"`` becomes ``"31"``, ``"000"`` becomes ``"0"``):
+    Gradescope looks IDs up as integers, so both spellings name the same
+    object, and one canonical form keeps duplicate checks (e.g. the batch
+    rows' submission IDs) and comparisons with IDs read from Gradescope
+    exact.
     """
     if isinstance(value, int) and not isinstance(value, bool):
         value = str(value)
@@ -129,8 +142,10 @@ def _coerce_id(value: Any) -> Any:
         )
     text = value.strip().strip("`").strip()
     if not _ID_RE.fullmatch(text):
-        raise ValueError(f"must be a numeric Gradescope ID (digits only), got {value!r}")
-    return text
+        raise ValueError(
+            f"must be a numeric Gradescope ID (ASCII digits 0-9 only), got {value!r}"
+        )
+    return text.lstrip("0") or "0"
 
 
 def _blank_to_none(value: Any) -> Any:
@@ -139,13 +154,33 @@ def _blank_to_none(value: Any) -> Any:
     return value
 
 
-# A Gradescope ID: digits only. The pattern is what the JSON schema
-# advertises (it must come before the validator, or pydantic leaves it out
-# of the schema); the validator runs first, accepts JSON numbers and gives a
-# clearer message than a bare pattern mismatch.
+def _reject_bool(value: Any) -> Any:
+    """Refuse JSON ``true``/``false`` where a number is expected.
+
+    Pydantic's lax mode would turn them into 1 and 0, so a client sending
+    ``point_adjustment: true`` would write +1 point and ``confidence: true``
+    would pass as 1.0 (skipping the review flag). Numbers and numeric
+    strings pass through to the normal number validation.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"must be a number, not a boolean ({str(value).lower()})")
+    return value
+
+
+# A Gradescope ID: ASCII digits only, without leading zeros. The pattern is
+# what the JSON schema advertises (it must come before the validator, or
+# pydantic leaves it out of the schema); the validator runs first, accepts
+# JSON numbers, canonicalizes the digits and gives a clearer message than a
+# bare pattern mismatch.
 GradescopeID = Annotated[str, Field(pattern=_ID_PATTERN), BeforeValidator(_coerce_id)]
 # An optional ID: null, omitted or blank means "not given".
 OptionalGradescopeID = Annotated[GradescopeID | None, BeforeValidator(_blank_to_none)]
+
+# A number argument: JSON numbers and numeric strings, never booleans.
+Number = Annotated[float, BeforeValidator(_reject_bool)]
+# A non-negative whole number, never a boolean (the bound must come before
+# the validator to appear in the schema, as for GradescopeID).
+Count = Annotated[int, Field(ge=0), BeforeValidator(_reject_bool)]
 
 OutputFormat = Literal["markdown", "json"]
 
@@ -158,9 +193,16 @@ class GradeRow(TypedDict, total=False):
 
     submission_id: Required[GradescopeID]
     rubric_item_ids: list[GradescopeID] | None
-    point_adjustment: float | None
+    point_adjustment: Number | None
     comment: str | None
-    confidence: float | None
+    confidence: Number | None
+
+
+# At most MAX_BATCH_ROWS rows. The schema advertises the cap (``maxItems``)
+# and apply_grade_batch enforces it before any request, with an Error result
+# that tells the agent to split the batch. (Validating it here as well would
+# replace that result with a generic schema error.)
+GradeRows = Annotated[list[GradeRow], Field(json_schema_extra={"maxItems": MAX_BATCH_ROWS})]
 
 
 # ============================================================
@@ -810,9 +852,9 @@ def tool_apply_grade(
     question_id: GradescopeID,
     submission_id: GradescopeID,
     rubric_item_ids: list[GradescopeID] | None = None,
-    point_adjustment: float | None = None,
+    point_adjustment: Number | None = None,
     comment: str | None = None,
-    confidence: float | None = None,
+    confidence: Number | None = None,
     confirm_write: bool = False,
     overwrite_graded: bool = False,
 ) -> str:
@@ -842,16 +884,17 @@ def tool_apply_grade(
         rubric_item_ids: Rubric item IDs to apply (checked). Items NOT in
             this list will be unchecked. ``None`` keeps the current rubric
             state; ``[]`` clears all applied items.
-        point_adjustment: Submission-specific point adjustment (can be
-            negative). None keeps the current adjustment.
+        point_adjustment: Submission-specific point adjustment (a number,
+            can be negative; true/false are rejected). None keeps the
+            current adjustment.
         comment: Per-submission comment (Gradescope's "Provide comments
             specific to this submission" field). ``None`` keeps current,
             ``""`` clears, any other string overwrites. Stored separately
             from rubric items.
         confidence: Agent's self-assessed grading confidence (0.0-1.0).
             < 0.6 rejected (nothing written); 0.6-0.8 inclusive written but
-            flagged NEEDS HUMAN REVIEW; > 0.8 normal; NaN/inf rejected.
-            None skips confidence gating (manual mode).
+            flagged NEEDS HUMAN REVIEW; > 0.8 normal; NaN/inf and true/false
+            rejected. None skips confidence gating (manual mode).
         confirm_write: Must be True to save the grade. The default returns
             a preview and changes nothing. Setting it is not user approval:
             show the preview to the user first.
@@ -877,7 +920,7 @@ def tool_apply_grade(
 def tool_apply_grade_batch(
     course_id: GradescopeID,
     question_id: GradescopeID,
-    grades: list[GradeRow],
+    grades: GradeRows,
     confirm_write: bool = False,
     overwrite_graded: bool = False,
 ) -> str:
@@ -932,11 +975,9 @@ def tool_apply_grade_batch(
             graded when the write runs. Set it only with the user's explicit
             approval to overwrite existing grades.
     """
-    if overwrite_graded:
-        return apply_grade_batch(
-            course_id, question_id, grades, confirm_write, overwrite_graded=True
-        )
-    return apply_grade_batch(course_id, question_id, grades, confirm_write)
+    return apply_grade_batch(
+        course_id, question_id, grades, confirm_write, overwrite_graded=overwrite_graded
+    )
 
 
 @gs_tool(read_only("Get question rubric"))
@@ -963,7 +1004,7 @@ def tool_create_rubric_item(
     course_id: GradescopeID,
     question_id: GradescopeID,
     description: str,
-    weight: float,
+    weight: Number,
     confirm_write: bool = False,
     allow_negative: bool = False,
 ) -> str:
@@ -1091,7 +1132,7 @@ def tool_update_rubric_item(
     question_id: GradescopeID,
     rubric_item_id: GradescopeID,
     description: str | None = None,
-    weight: float | None = None,
+    weight: Number | None = None,
     confirm_write: bool = False,
     allow_negative: bool = False,
 ) -> str:
@@ -1212,11 +1253,11 @@ def tool_grade_answer_group(
     question_id: GradescopeID,
     group_id: GradescopeID,
     rubric_item_ids: list[GradescopeID],
-    point_adjustment: float | None = None,
+    point_adjustment: Number | None = None,
     comment: str | None = None,
     confirm_write: bool = False,
     overwrite_graded: bool = False,
-    expected_member_count: Annotated[int, Field(ge=0)] | None = None,
+    expected_member_count: Count | None = None,
 ) -> str:
     """Batch-grade ALL submissions in an answer group at once.
 

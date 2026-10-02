@@ -18,7 +18,12 @@ from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError
 
 from gradescope_mcp import server
 from gradescope_mcp.auth import AuthError
-from gradescope_mcp.tools.grading_ops import CONFIDENCE_REJECT_BELOW, CONFIDENCE_REVIEW_UP_TO
+from gradescope_mcp.tools import grading_ops
+from gradescope_mcp.tools.grading_ops import (
+    CONFIDENCE_REJECT_BELOW,
+    CONFIDENCE_REVIEW_UP_TO,
+    MAX_BATCH_ROWS,
+)
 
 ID_PARAMS = {
     "course_id", "assignment_id", "question_id", "submission_id", "group_id",
@@ -177,7 +182,7 @@ def test_every_id_parameter_requires_digits() -> None:
             strings = _string_schemas(sub)
             if is_id:
                 assert strings, (name, prop)
-                assert all(s.get("pattern") == r"^\d+$" for s in strings), (name, prop)
+                assert all(s.get("pattern") == "^[0-9]+$" for s in strings), (name, prop)
                 checked += 1
             else:
                 assert not base.endswith("_id"), (name, prop)
@@ -204,6 +209,151 @@ def test_invalid_ids_are_rejected_before_the_tool_runs(monkeypatch, value) -> No
 
     with pytest.raises(ToolError, match="course_id"):
         _call("tool_get_assignments", {"course_id": value})
+
+
+# Arabic-Indic, fullwidth, superscript, Devanagari and mixed digits: Python's
+# int() and a Unicode \d accept some of them, but they are not Gradescope IDs
+# and would reach the request URL percent-encoded.
+@pytest.mark.parametrize("value", ["\u0661\u0662\u0663", "\uff11\uff12\uff13", "\u00b2",
+                                   "\u0967\u0968", "1\u0663", " \uff11 "])
+def test_non_ascii_digit_ids_are_rejected(monkeypatch, value) -> None:
+    monkeypatch.setattr(server, "get_assignments", lambda *_a: pytest.fail("tool ran"))
+    monkeypatch.setattr(server, "apply_grade", lambda *_a: pytest.fail("tool ran"))
+
+    with pytest.raises(ToolError, match="ASCII digits"):
+        _call("tool_get_assignments", {"course_id": value})
+    with pytest.raises(ToolError, match="rubric_item_ids"):
+        _call("tool_apply_grade", {
+            "course_id": "1", "question_id": "2", "submission_id": "3",
+            "rubric_item_ids": ["10", value],
+        })
+    with pytest.raises(ResourceNotFoundError):
+        _read(f"gradescope://courses/{value}/assignments")
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("031", "31"), ("`0031`", "31"), (" 0100 ", "100"), ("0", "0"), ("000", "0"),
+    (0, "0"), (31, "31"),
+])
+def test_ids_are_canonicalized_without_leading_zeros(monkeypatch, value, expected) -> None:
+    seen = []
+    monkeypatch.setattr(server, "get_assignments", lambda course_id: seen.append(course_id) or "ok")
+
+    result = _call("tool_get_assignments", {"course_id": value})
+
+    assert result.is_error is False
+    assert seen == [expected]
+
+
+def test_leading_zero_ids_are_canonical_in_rubric_lists_and_resources(monkeypatch) -> None:
+    seen = {}
+    monkeypatch.setattr(server, "apply_grade", lambda *args: seen.setdefault("apply", args) and "ok")
+    monkeypatch.setattr(server, "get_assignments", lambda cid: seen.setdefault("resource", cid))
+
+    _call("tool_apply_grade", {
+        "course_id": "01", "question_id": "02", "submission_id": "0031",
+        "rubric_item_ids": ["0100", 200],
+    })
+    _read("gradescope://courses/042/assignments")
+
+    assert seen["apply"][:4] == ("1", "2", "31", ["100", "200"])
+    assert seen["resource"] == "42"
+
+
+def test_leading_zero_submission_ids_are_duplicates_in_a_batch(monkeypatch) -> None:
+    """'31' and '031' name one submission: refuse the batch instead of writing twice."""
+    monkeypatch.setattr(grading_ops, "get_connection", lambda: pytest.fail("Gradescope contacted"))
+
+    result = _call("tool_apply_grade_batch", {
+        "course_id": "1", "question_id": "2", "confirm_write": True, "grades": [
+            {"submission_id": "31", "rubric_item_ids": ["100"]},
+            {"submission_id": "031", "rubric_item_ids": ["200"]},
+        ],
+    })
+
+    assert result.is_error is True
+    text = result.content[0].text
+    assert text.startswith("Error: invalid batch input:")
+    assert "row 1 (31): duplicate submission_id (also in row 0)" in text
+
+
+# ------------------------------------------------------------------
+# Number arguments
+# ------------------------------------------------------------------
+
+_GRADE = {"course_id": "1", "question_id": "2", "submission_id": "3", "rubric_item_ids": ["10"]}
+_GROUP = {"course_id": "1", "question_id": "2", "group_id": "4", "rubric_item_ids": ["10"]}
+_RUBRIC = {"course_id": "1", "question_id": "2", "description": "d"}
+
+# (tool, implementation, fixed arguments, number parameter)
+_NUMBER_PARAMS = [
+    ("tool_apply_grade", "apply_grade", _GRADE, "point_adjustment"),
+    ("tool_apply_grade", "apply_grade", _GRADE, "confidence"),
+    ("tool_grade_answer_group", "grade_answer_group", _GROUP, "point_adjustment"),
+    ("tool_grade_answer_group", "grade_answer_group", _GROUP, "expected_member_count"),
+    ("tool_create_rubric_item", "create_rubric_item", _RUBRIC, "weight"),
+    ("tool_update_rubric_item", "update_rubric_item", {**_RUBRIC, "rubric_item_id": "5"}, "weight"),
+]
+
+
+@pytest.mark.parametrize("value", [True, False])
+@pytest.mark.parametrize("tool, impl, base, param", _NUMBER_PARAMS)
+def test_number_parameters_reject_booleans(monkeypatch, tool, impl, base, param, value) -> None:
+    """JSON true/false must not become 1/0 (a +1 adjustment, confidence 1.0, ...)."""
+    monkeypatch.setattr(server, impl, lambda *_a, **_k: pytest.fail("tool ran"))
+
+    with pytest.raises(ToolError, match=rf"{param}[\s\S]*not a boolean"):
+        _call(tool, {**base, param: value})
+
+
+@pytest.mark.parametrize("tool, impl, base, param", _NUMBER_PARAMS)
+def test_number_parameters_accept_numbers_and_numeric_strings(
+    monkeypatch, tool, impl, base, param
+) -> None:
+    sig = inspect.signature(getattr(server, impl))
+    seen = []
+    monkeypatch.setattr(
+        server, impl,
+        lambda *a, **k: seen.append(sig.bind(*a, **k).arguments[param]) or "ok",
+    )
+    if param == "expected_member_count":
+        cases = [(3, 3), ("3", 3), (0, 0)]
+    else:
+        cases = [(2, 2.0), (0.75, 0.75), ("0.75", 0.75), (-1.5, -1.5)]
+
+    for value, expected in cases:
+        result = _call(tool, {**base, param: value})
+        assert result.is_error is False, (value, result.content[0].text)
+    assert seen == [expected for _value, expected in cases]
+    assert all(type(v) is type(cases[0][1]) for v in seen)
+
+
+@pytest.mark.parametrize("field", ["point_adjustment", "confidence"])
+@pytest.mark.parametrize("value", [True, False])
+def test_batch_row_numbers_reject_booleans(monkeypatch, field, value) -> None:
+    monkeypatch.setattr(server, "apply_grade_batch", lambda *_a, **_k: pytest.fail("tool ran"))
+
+    with pytest.raises(ToolError, match=rf"grades[\s\S]*{field}[\s\S]*not a boolean"):
+        _call("tool_apply_grade_batch", {"course_id": "1", "question_id": "2", "grades": [
+            {"submission_id": "5", "rubric_item_ids": ["10"], field: value},
+        ]})
+
+
+def test_boolean_adjustment_never_reaches_gradescope(monkeypatch) -> None:
+    """The reviewer's repro: point_adjustment=true used to be saved as +1 point."""
+    monkeypatch.setattr(grading_ops, "get_connection", lambda: pytest.fail("Gradescope contacted"))
+
+    for args in (
+        {**_GRADE, "point_adjustment": True, "confirm_write": True},
+        {**_GRADE, "confidence": True, "confirm_write": True},
+    ):
+        with pytest.raises(ToolError, match="not a boolean"):
+            _call("tool_apply_grade", args)
+    with pytest.raises(ToolError, match="not a boolean"):
+        _call("tool_apply_grade_batch", {
+            "course_id": "1", "question_id": "2", "confirm_write": True,
+            "grades": [{"submission_id": "5", "rubric_item_ids": ["10"], "confidence": False}],
+        })
 
 
 def test_rubric_item_id_lists_are_validated_elementwise(monkeypatch) -> None:
@@ -325,8 +475,9 @@ def test_batch_rows_are_typed_and_strict() -> None:
 def test_batch_rows_reach_the_implementation_as_plain_dicts(monkeypatch) -> None:
     seen = {}
 
-    def fake_batch(course_id, question_id, grades, confirm_write):
+    def fake_batch(course_id, question_id, grades, confirm_write, overwrite_graded=None):
         seen["grades"] = grades
+        seen["overwrite_graded"] = overwrite_graded
         return "preview"
 
     monkeypatch.setattr(server, "apply_grade_batch", fake_batch)
@@ -342,6 +493,8 @@ def test_batch_rows_reach_the_implementation_as_plain_dicts(monkeypatch) -> None
         {"submission_id": "56", "comment": None, "confidence": 0.9},
     ]
     assert all(type(g) is dict for g in seen["grades"])
+    # The wrapper always passes overwrite_graded through, False by default.
+    assert seen["overwrite_graded"] is False
 
 
 @pytest.mark.parametrize("row", [
@@ -355,6 +508,27 @@ def test_bad_batch_rows_are_rejected_before_the_tool_runs(monkeypatch, row) -> N
 
     with pytest.raises(ToolError, match="grades"):
         _call("tool_apply_grade_batch", {"course_id": "1", "question_id": "2", "grades": [row]})
+
+
+def test_batch_size_cap_is_advertised_and_enforced_before_any_request(monkeypatch) -> None:
+    prop = _tools()["tool_apply_grade_batch"].input_schema["properties"]["grades"]
+    assert prop["maxItems"] == MAX_BATCH_ROWS == 50
+
+    seen = []
+    monkeypatch.setattr(server, "apply_grade_batch", lambda c, q, grades, *_a, **_k: seen.append(
+        len(grades)) or "preview")
+    rows = [{"submission_id": str(1000 + i), "rubric_item_ids": ["1"]} for i in range(51)]
+    _call("tool_apply_grade_batch", {"course_id": "1", "question_id": "2", "grades": rows[:50]})
+    assert seen == [50]
+
+    # Over the cap: the implementation refuses before contacting Gradescope.
+    monkeypatch.setattr(server, "apply_grade_batch", grading_ops.apply_grade_batch)
+    monkeypatch.setattr(grading_ops, "get_connection", lambda: pytest.fail("Gradescope contacted"))
+    result = _call("tool_apply_grade_batch", {
+        "course_id": "1", "question_id": "2", "grades": rows, "confirm_write": True,
+    })
+    assert result.is_error is True
+    assert result.content[0].text.startswith("Error: grades has 51 rows; at most 50 rows")
 
 
 # ------------------------------------------------------------------
