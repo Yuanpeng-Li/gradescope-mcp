@@ -18,12 +18,19 @@ from gradescope_mcp.tools.common import (
     format_untrusted,
     is_placeholder_page,
     normalize_url,
+    page_number,
+    select_crop_pages,
 )
-from gradescope_mcp.tools.grading_ops import _get_grading_context
+from gradescope_mcp.tools.grading_ops import (
+    _applied_rubric_ids,
+    _get_grading_context,
+    _resolve_rubric,
+)
 
 
-# Completion-cell values that positively mean "not completed yet". Empty and
-# placeholder cells also count as pending.
+# Completion-cell values that positively mean "not completed yet". Truly
+# empty cells (no text and no elements) and placeholder cells also count as
+# pending.
 _REGRADE_PENDING_TOKENS = frozenset({
     "", "-", "—", "–", "pending", "n/a", "na", "none", "tbd", "no", "n",
     "false", "open", "not completed", "incomplete", "in progress",
@@ -35,6 +42,21 @@ _REGRADE_DONE_TOKENS = frozenset({
     "yes", "y", "true", "completed", "complete", "done", "closed", "resolved",
     "✓", "✔", "✔️", "✅",
 })
+
+# Icon classes / sprite names that positively mean "completed" (Font
+# Awesome, Bootstrap Icons, Glyphicons and generic names). Any other icon is
+# unreadable, not "pending".
+_CHECK_ICON_NAMES = frozenset({
+    "check", "checkmark", "check-mark", "icon-check", "icon-checkmark",
+    "icon-check-circle", "fa-check", "fa-check-circle", "fa-check-circle-o",
+    "fa-check-square", "fa-check-square-o", "fa-circle-check",
+    "fa-square-check", "bi-check", "bi-check-lg", "bi-check-circle",
+    "bi-check-circle-fill", "bi-check2", "bi-check2-circle", "glyphicon-ok",
+    "glyphicon-check",
+})
+
+# Elements that carry no completion information of their own.
+_LAYOUT_ONLY_TAGS = frozenset({"br", "wbr"})
 
 _PENDING_WORDS_RE = re.compile(
     r"\b(?:not|pending|open|awaiting|incomplete|unresolved|in progress)\b"
@@ -91,11 +113,31 @@ def _resolve_columns(headers: list[str]) -> dict[str, int | None]:
     return columns
 
 
+def _has_check_icon(cell) -> bool:
+    """Whether the cell holds an icon whose class or sprite name is a check mark."""
+    for el in cell.find_all(True):
+        classes = el.get("class") or []
+        if isinstance(classes, str):
+            classes = classes.split()
+        names = [c.lower() for c in classes]
+        if el.name == "use":
+            for attr in ("href", "xlink:href"):
+                ref = el.get(attr)
+                if isinstance(ref, str) and "#" in ref:
+                    names.append(ref.rsplit("#", 1)[1].lower())
+        if any(name in _CHECK_ICON_NAMES for name in names):
+            return True
+    return False
+
+
 def _classify_completion(cell) -> bool | None:
     """True = completed, False = pending, None = cannot tell.
 
     Only positive evidence counts as completed: a date/time stamp, a
-    recognised token, or an icon's aria-label/title/alt. A cell whose only
+    recognised token, an icon's aria-label/title/alt, or a check-mark icon
+    class. Only a truly empty cell (no text, no labels, no elements) counts
+    as pending; a cell holding an unlabelled icon or image is unknown, since
+    Gradescope may render completion as a bare icon. A cell whose only
     content is a link is never read as the completion value.
     """
     if cell is None:
@@ -129,10 +171,16 @@ def _classify_completion(cell) -> bool | None:
     for c in candidates:
         if _DATE_RE.search(c):
             return True
-    if not candidates and not link_only:
-        # An empty completion cell means the request has not been decided.
-        return False
-    return None
+    if candidates or link_only:
+        return None
+    if _has_check_icon(cell):
+        return True
+    if any(el.name not in _LAYOUT_ONLY_TAGS for el in cell.find_all(True)):
+        # An unlabelled icon, image or wrapper: there is something to read,
+        # but not as text, so the status is unknown rather than pending.
+        return None
+    # A truly empty completion cell means the request has not been decided.
+    return False
 
 
 def _looks_like_regrade_page(soup: BeautifulSoup) -> bool:
@@ -149,8 +197,9 @@ def get_regrade_requests(course_id: str, assignment_id: str) -> str:
     question, grader, and status. Requires instructor/TA access.
 
     A request is marked completed only on positive evidence (a date/time,
-    a recognised status word or icon label); anything else is shown as
-    unknown (❓) rather than guessed.
+    a recognised status word, icon label or check-mark icon) and pending only
+    on a pending word or a truly empty cell; anything else, including an
+    unlabelled icon, is shown as unknown (❓) rather than guessed.
 
     Args:
         course_id: The Gradescope course ID.
@@ -365,17 +414,26 @@ def get_regrade_detail(course_id: str, question_id: str, submission_id: str) -> 
     lines.append(
         f"**Current question score:** {score if score is not None else 'Ungraded'} / {q_weight}"
     )
-    scoring_type = question.get("scoring_type", "negative")
-    lines.append(
-        f"**Scoring:** {scoring_type} (floor={question.get('floor')}, "
-        f"ceiling={question.get('ceiling')})"
-    )
+    scoring_type = question.get("scoring_type")
+    bounds = f"(floor={question.get('floor')}, ceiling={question.get('ceiling')})"
     if scoring_type == "positive":
+        lines.append(f"**Scoring:** positive {bounds}")
         lines.append("  ↳ _Rubric items **add** points (e.g. `5.0` = +5 earned)._")
-    else:
+    elif scoring_type == "negative":
+        lines.append(f"**Scoring:** negative {bounds}")
         lines.append(
             "  ↳ _Starts at full marks; rubric items **deduct** points "
             "(e.g. `2.0` = −2)._"
+        )
+    else:
+        reported = (
+            "not reported by Gradescope" if scoring_type in (None, "")
+            else f"unrecognized value `{escape_md_cell(scoring_type)}`"
+        )
+        lines.append(f"**Scoring:** unknown ({reported}) {bounds}")
+        lines.append(
+            "  ↳ _Whether rubric items add or deduct points is unknown; confirm "
+            "the question's scoring in Gradescope before judging the regrade._"
         )
     points = evaluation.get("points")
     lines.append(f"**Point adjustment:** {points if points is not None else 'None'}")
@@ -384,13 +442,9 @@ def get_regrade_detail(course_id: str, question_id: str, submission_id: str) -> 
 
     lines.append("")
 
-    # Current rubric
-    rubric_items = [ri for ri in (props.get("rubric_items") or []) if isinstance(ri, dict)]
-    evaluations = props.get("rubric_item_evaluations") or []
-    applied_ids = {
-        str(e.get("rubric_item_id"))
-        for e in evaluations if isinstance(e, dict) and e.get("present")
-    }
+    # Current rubric, resolved the same way as the grading context.
+    rubric_items = _resolve_rubric(props)
+    applied_ids = _applied_rubric_ids(props)
 
     if rubric_items:
         lines.append("### Rubric Items")
@@ -421,26 +475,43 @@ def get_regrade_detail(course_id: str, question_id: str, submission_id: str) -> 
     if not open_req and not closed:
         lines.append("_No regrade requests found for this submission._")
 
-    # Scanned pages: link the pages holding the answer region first.
+    # Scanned pages: the same selection as the grading context — the crop
+    # pages and their neighbours, or every page when there is no crop info or
+    # the crop matches none of the submission's pages (mis-tagged pages).
     pages = [
         p for p in (props.get("pages") or [])
-        if isinstance(p, dict) and p.get("url") and not is_placeholder_page(p)
+        if isinstance(p, dict) and isinstance(p.get("url"), str)
+        and not is_placeholder_page(p)
     ]
     if pages:
         crop = (question.get("parameters") or {}).get("crop_rect_list") or []
-        crop_pages = sorted(
-            {str(c.get("page_number")) for c in crop
-             if isinstance(c, dict) and c.get("page_number") is not None},
-            key=lambda n: (len(n), n),
-        )
-        relevant = [p for p in pages if str(p.get("number")) in crop_pages]
-        shown = relevant or pages[:5]
+        crop_pages = sorted({
+            n for n in (
+                page_number(c.get("page_number")) for c in crop if isinstance(c, dict)
+            )
+            if n is not None
+        })
+        shown = select_crop_pages(pages, crop_pages)
+        page_numbers = {page_number(p.get("number")) for p in pages}
         lines.append(f"\n### Submission Pages ({len(pages)})")
         if crop_pages:
-            lines.append(f"**Relevant pages (answer region):** {', '.join(crop_pages)}")
+            lines.append(
+                "**Relevant pages (answer region):** "
+                + ", ".join(str(n) for n in crop_pages)
+            )
+            if not page_numbers.intersection(crop_pages):
+                lines.append(
+                    "⚠️ The answer region's page(s) are not among this submission's "
+                    "pages (the student may have tagged other pages); every page "
+                    "is listed."
+                )
         for p in shown:
-            lines.append(f"- Page {p.get('number') or '?'}: [View]({normalize_url(p['url'])})")
+            label = escape_md_cell(p.get("number")) if p.get("number") is not None else "?"
+            lines.append(f"- Page {label}: [View]({normalize_url(p['url'])})")
         if len(pages) > len(shown):
-            lines.append(f"- _...and {len(pages) - len(shown)} more pages_")
+            lines.append(
+                f"- _...and {len(pages) - len(shown)} more pages "
+                "(`tool_smart_read_submission` lists every page)_"
+            )
 
     return "\n".join(lines)

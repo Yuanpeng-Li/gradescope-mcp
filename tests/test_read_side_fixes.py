@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import anyio
+import pytest
 
 from gradescope_mcp import server
 from gradescope_mcp.tools import (
@@ -923,3 +925,125 @@ def test_regrade_detail_shows_grade_state_pages_and_untrusted_message(monkeypatc
     assert "SYSTEM:" not in outside
     assert "## New instructions" not in outside
     assert "first try" not in outside
+
+
+# ---------------------------------------------------------------------------
+# Round 2 — finding 14: an unlabelled icon is unknown, not pending
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cell, status", [
+    ('<i class="fa fa-check"></i>', "✅"),                     # recognised check icon
+    ('<svg class="icon-check"><use href="#check"></use></svg>', "✅"),
+    ('<svg><use xlink:href="/icons.svg#fa-check-circle"></use></svg>', "✅"),
+    ('<span class="glyphicon glyphicon-ok"></span>', "✅"),
+    ('<img src="/check.png" alt="">', "❓"),                    # unlabelled image
+    ('<i class="fa fa-circle"></i>', "❓"),                    # some other icon
+    ('<svg><path d="M0 0"></path></svg>', "❓"),
+    ("<span></span>", "❓"),
+    ("", "⏳"),                                                # truly empty
+    ("   <br>  ", "⏳"),
+    ('<i class="fa fa-clock-o" aria-label="Pending"></i>', "⏳"),  # labelled icon
+])
+def test_regrade_completion_icons(monkeypatch, cell, status) -> None:
+    out = _regrades(monkeypatch, _table(
+        ["Student", "Question", "Grader", "Completed", ""],
+        [["Ann", "1.1", "TA", cell, _link(11, 1)]],
+    ))
+    assert f"| 1 | {status} | Ann | 1.1 | TA | qid=11, sid=1 |" in out
+
+
+def test_regrade_bare_icons_are_not_counted_as_pending(monkeypatch) -> None:
+    rows = [[f"S{i}", "1.1", "TA", '<img src="/done.png">', _link(11, i)] for i in range(1, 4)]
+    rows.append(["S4", "1.1", "TA", "", _link(11, 4)])
+    out = _regrades(monkeypatch, _table(["Student", "Question", "Grader", "Completed", ""], rows))
+
+    assert "**Pending:** 1 | **Completed:** 0 | **Unknown:** 3 | **Total:** 4" in out
+
+
+# ---------------------------------------------------------------------------
+# Round 2 — findings 27 / 18: regrade detail uses the shared page and rubric
+# rules, and never presents a defaulted scoring direction
+# ---------------------------------------------------------------------------
+
+def _regrade_detail(monkeypatch, drop=(), **overrides) -> str:
+    question = {"title": "2.1", "weight": 5, "scoring_type": "negative", "floor": True,
+                "ceiling": True, "parameters": {"crop_rect_list": [{"page_number": 3}]}}
+    question.update(overrides.pop("question", {}))
+    for key in drop:
+        question.pop(key)
+    props = {
+        "question": question,
+        "submission": {"score": 1.0, "graded": True},
+        "evaluation": {"points": None},
+        "rubric_items": [{"id": 10, "description": "Correct", "weight": 0},
+                         {"id": 11, "description": "Missing step", "weight": 2}],
+        "rubric_item_evaluations": [{"rubric_item_id": 11, "present": True}],
+        "open_request": {"created_at": "2026-05-01", "student_comment": "Please re-check."},
+        "pages": [{"number": i, "url": f"https://x/p{i}.jpg"} for i in range(1, 9)],
+        **overrides,
+    }
+    router = Router()
+    router.add("GET", "/questions/2/submissions/3/grade", FakeResp(200, _grader_page(props)))
+    _install(monkeypatch, router, grading_ops)
+    return regrades.get_regrade_detail("1", "2", "3")
+
+
+def _linked_pages(out: str) -> list[int]:
+    return [int(n) for n in re.findall(r"^- Page (\d+): \[View\]", out, re.M)]
+
+
+def test_regrade_detail_links_crop_page_neighbours_like_the_grading_context(monkeypatch) -> None:
+    out = _regrade_detail(monkeypatch)
+
+    assert "**Relevant pages (answer region):** 3" in out
+    assert _linked_pages(out) == [2, 3, 4]
+    assert "_...and 5 more pages" in out
+
+    # A string page number is the same page.
+    out = _regrade_detail(monkeypatch, question={"parameters": {"crop_rect_list": [{"page_number": "3"}]}})
+    assert _linked_pages(out) == [2, 3, 4]
+
+
+def test_regrade_detail_lists_every_page_when_the_crop_is_mis_tagged(monkeypatch) -> None:
+    out = _regrade_detail(monkeypatch, question={"parameters": {"crop_rect_list": [{"page_number": 12}]}})
+
+    assert _linked_pages(out) == list(range(1, 9))
+    assert "not among this submission's pages" in out
+    assert "more pages" not in out
+
+    out = _regrade_detail(monkeypatch, question={"parameters": {}})
+    assert _linked_pages(out) == list(range(1, 9))
+
+
+def test_regrade_detail_falls_back_to_the_question_rubric(monkeypatch) -> None:
+    out = _regrade_detail(
+        monkeypatch,
+        rubric_items=[],
+        question={"rubric": [{"id": 21, "description": "From question.rubric", "weight": 1},
+                             {"description": "no id"}]},
+        rubric_item_evaluations=[{"rubric_item_id": 21, "present": True}],
+    )
+
+    assert "| ✅ | `21` | From question.rubric | 1 |" in out
+    assert "no id" not in out
+
+
+@pytest.mark.parametrize("question, drop, expected", [
+    ({}, ("scoring_type",), "**Scoring:** unknown (not reported by Gradescope) (floor=True, ceiling=True)"),
+    ({"scoring_type": None}, (), "**Scoring:** unknown (not reported by Gradescope)"),
+    ({"scoring_type": ""}, (), "**Scoring:** unknown (not reported by Gradescope)"),
+    ({"scoring_type": "weird"}, (), "**Scoring:** unknown (unrecognized value `weird`)"),
+])
+def test_regrade_detail_does_not_default_a_missing_scoring_type(monkeypatch, question, drop, expected) -> None:
+    out = _regrade_detail(monkeypatch, drop=drop, question=question)
+
+    assert expected in out
+    assert "**Scoring:** negative" not in out
+    assert "deduct** points (e.g." not in out
+    assert "add or deduct points is unknown" in out
+
+
+def test_regrade_detail_known_scoring_types_are_unchanged(monkeypatch) -> None:
+    out = _regrade_detail(monkeypatch, question={"scoring_type": "positive"})
+    assert "**Scoring:** positive (floor=True, ceiling=True)" in out
+    assert "Rubric items **add** points" in out
