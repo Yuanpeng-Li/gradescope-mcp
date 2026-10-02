@@ -19,7 +19,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -30,7 +32,12 @@ from gradescope_mcp.tools.common import (
     normalize_rubric_ids,
     split_known_rubric_ids,
 )
-from gradescope_mcp.tools.grading_ops import _compute_new_score
+from gradescope_mcp.tools.grading_ops import (
+    _compute_new_score,
+    _scoring_assumed,
+    _scoring_assumption,
+    _scoring_type,
+)
 from gradescope_mcp.tools.safety import write_confirmation_required
 
 logger = logging.getLogger(__name__)
@@ -497,6 +504,74 @@ def _save_many_grades_path(props: dict[str, Any]) -> tuple[str | None, str | Non
     return save_url[: -len("/save_grade")] + "/save_many_grades", None
 
 
+_SAVE_GRADE_PATH_RE = re.compile(
+    r"^/courses/([^/?#]+)/questions/([^/?#]+)/submissions/([^/?#]+)/save_grade$"
+)
+
+
+def _group_page_problem(
+    resp: Any,
+    requested_url: str,
+    props: dict[str, Any],
+    course_id: str,
+    question_id: str,
+    group_id: str,
+    submissions: list[Any],
+) -> str | None:
+    """Why the loaded group grade page may not be ``group_id``'s, or ``None``.
+
+    The page is fetched following redirects and the batch is posted to the
+    save URL found on it, so a page for another group would grade that
+    group's members while the preview counted this one's. Refused: a
+    redirect to another group's page, a page whose ``answer_group`` is
+    another group, a redirect elsewhere that the page cannot tie back to
+    ``group_id``, and a save URL outside this course and question or through
+    a submission known to sit outside the group.
+    """
+    page_group = props.get("answer_group")
+    if isinstance(page_group, dict):
+        page_group = page_group.get("id")
+    final_url = getattr(resp, "url", None)
+    if isinstance(final_url, str) and final_url:
+        landed = urlsplit(final_url).path.rstrip("/")
+        if landed != urlsplit(requested_url).path.rstrip("/"):
+            landed_group = re.search(r"/answer_groups/([^/]+)", landed)
+            if (
+                (landed_group and landed_group.group(1) != str(group_id))
+                or (not landed_group and page_group is None)
+            ):
+                return (
+                    f"the grade page for answer group `{group_id}` redirected "
+                    f"to `{landed}`, which may belong to another group"
+                )
+    if page_group is not None and str(page_group) != str(group_id):
+        return (
+            f"the grade page loaded for answer group `{group_id}` belongs to "
+            f"answer group `{page_group}`"
+        )
+    save_url = (props.get("urls") or {}).get("save_grade")
+    match = _SAVE_GRADE_PATH_RE.match(save_url) if isinstance(save_url, str) else None
+    if match is None:
+        return None
+    save_course, save_question, save_sid = match.groups()
+    if (save_course, save_question) != (str(course_id), str(question_id)):
+        return (
+            f"the group grade page's save URL `{save_url}` is not in course "
+            f"`{course_id}`, question `{question_id}`"
+        )
+    listed = next(
+        (s for s in submissions if isinstance(s, dict) and str(s.get("id")) == save_sid),
+        None,
+    )
+    if listed is not None and str(listed.get("confirmed_group_id")) != str(group_id):
+        return (
+            f"the group grade page saves through submission `{save_sid}`, which "
+            f"is not a confirmed member of answer group `{group_id}` "
+            f"(confirmed group: `{listed.get('confirmed_group_id')}`)"
+        )
+    return None
+
+
 def _resolve_rubric(props: dict[str, Any]) -> list[dict[str, Any]]:
     """Rubric items from the grade page, falling back to question.rubric."""
     question = props.get("question") or {}
@@ -545,7 +620,11 @@ def grade_answer_group(
 
     Everything is validated before the preview: the rubric IDs must exist in
     the question's current rubric, the group must have confirmed members, and
-    the page must carry a CSRF token and a recognisable save URL.
+    the page must carry a CSRF token and a recognisable save URL. The grade
+    page must also be this group's: a redirect to another group's page (or
+    to a page that does not name ``group_id``), an ``answer_group`` other
+    than ``group_id``, or a save URL in another course/question or through a
+    submission known to be outside the group refuses the write.
 
     Args:
         course_id: The Gradescope course ID.
@@ -668,6 +747,13 @@ def grade_answer_group(
     if url_error:
         return f"Error: {url_error}"
 
+    page_problem = _group_page_problem(
+        resp, group_grade_url, props, course_id, question_id, group_id,
+        ag_data.get("submissions") or [],
+    )
+    if page_problem:
+        return f"Error: {page_problem}. Refusing to batch-grade; nothing was sent."
+
     rubric_items = _resolve_rubric(props)
     if not rubric_items:
         return (
@@ -716,7 +802,19 @@ def grade_answer_group(
         {**props, "rubric_items": rubric_items}, known_ids, point_adjustment
     )
     weight = question.get("weight", "?")
-    scoring_type = question.get("scoring_type", "negative")
+    scoring_type = _scoring_type(props)
+    scoring_assumed = _scoring_assumed(scoring_type)
+    projected_if_positive = None
+    if scoring_assumed:
+        projected_if_positive, _ = _compute_new_score(
+            {
+                **props,
+                "rubric_items": rubric_items,
+                "question": {**question, "scoring_type": "positive"},
+            },
+            known_ids,
+            point_adjustment,
+        )
 
     # Build JSON payload matching what the Gradescope frontend sends.
     # SAFETY: rubric_item_ids=None was already rejected above, and every
@@ -790,11 +888,19 @@ def grade_answer_group(
         details.append(f"comment: {comment_display}")
         details.append(
             f"projected score per member: {_format_points(projected)}/{weight} "
-            f"({scoring_type} scoring"
+            f"({'unknown direction' if scoring_assumed else scoring_type} scoring"
             + (", ignoring any existing per-member point adjustment"
                if point_adjustment is None else "")
             + ")"
         )
+        if scoring_assumed:
+            details.append(
+                f"⚠️ the projected score {_scoring_assumption(scoring_type)}: "
+                "rubric items are taken to DEDUCT points. Under positive "
+                "scoring it would be "
+                f"{_format_points(projected_if_positive)}/{weight}. Check the "
+                "question's scoring in Gradescope before approving"
+            )
         details.append(f"endpoint: POST {save_many_path}")
         details.append(
             f"expected_member_count={member_count} — pass it with "
@@ -887,6 +993,7 @@ def grade_answer_group(
         f"**Rubric items unchecked:** {[str(ri['id']) for ri in unchecked_items]}\n"
         f"**Point adjustment:** {pa_display}\n"
         f"**Comment:** {comment_display}\n"
-        f"**Projected score per member:** {_format_points(projected)}/{weight}\n"
-        f"{readback}"
+        f"**Projected score per member:** {_format_points(projected)}/{weight}"
+        + (f" ({_scoring_assumption(scoring_type)})" if scoring_assumed else "")
+        + f"\n{readback}"
     )

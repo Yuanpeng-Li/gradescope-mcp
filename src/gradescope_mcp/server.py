@@ -814,6 +814,7 @@ def tool_apply_grade(
     comment: str | None = None,
     confidence: float | None = None,
     confirm_write: bool = False,
+    overwrite_graded: bool = False,
 ) -> str:
     """Apply a grade to a student's question submission.
 
@@ -823,8 +824,16 @@ def tool_apply_grade(
     Every rubric item ID must be in the question's current rubric (numbers
     are accepted); otherwise nothing is sent. The preview shows the student,
     the current score, the items that will be checked AND unchecked, the
-    resolved adjustment and comment, and the projected score. After saving,
+    resolved adjustment and comment, and the projected score (with a warning
+    when Gradescope did not report the scoring direction). After saving,
     the result reports the score read back from Gradescope.
+
+    An already graded submission is refused unless ``overwrite_graded=True``.
+    The graded state is re-read when the write runs, so a grade entered
+    after the preview (e.g. by another grader) is never silently
+    overwritten. If it already holds exactly the requested grade, the
+    result says so and nothing is sent. The write is also refused if the
+    grading page Gradescope serves belongs to another submission.
 
     Args:
         course_id: The Gradescope course ID.
@@ -846,6 +855,10 @@ def tool_apply_grade(
         confirm_write: Must be True to save the grade. The default returns
             a preview and changes nothing. Setting it is not user approval:
             show the preview to the user first.
+        overwrite_graded: Must be True to save over a submission that is
+            already graded when the write runs; the result then names the
+            grade it overwrote. Set it only with the user's explicit
+            approval to overwrite that grade.
     """
     return apply_grade(
         course_id,
@@ -856,6 +869,7 @@ def tool_apply_grade(
         comment,
         confidence,
         confirm_write,
+        overwrite_graded,
     )
 
 
@@ -865,13 +879,15 @@ def tool_apply_grade_batch(
     question_id: GradescopeID,
     grades: list[GradeRow],
     confirm_write: bool = False,
+    overwrite_graded: bool = False,
 ) -> str:
     """Apply grades to many submissions for one question in a single call.
 
     Use this after the user approves a previewed batch. Subagents cannot
     call write-gated tools in the Claude Code harness, so all writes funnel
     through the main agent — batching cuts round-trips for large grading
-    runs.
+    runs. At most 50 rows per call: a larger batch is refused before
+    anything is read or written, so split it into calls of 50 or fewer.
 
     Each entry in ``grades`` is an object with these keys (unknown keys are
     rejected; an omitted key keeps the current value):
@@ -891,21 +907,35 @@ def tool_apply_grade_batch(
     Behavior:
     - ``confirm_write=False``: loads each row's grading page and returns a
       preview table (current score, items to check and uncheck, projected
-      score, confidence) with warnings for already-graded rows that would
-      be OVERWRITTEN and rows flagged for review; no writes.
+      score, confidence) with warnings for already-graded rows (SKIPPED, or
+      OVERWRITTEN with ``overwrite_graded=True``) and rows flagged for
+      review; no writes.
     - ``confirm_write=True``: re-reads each row right before saving it and
-      reads it back afterwards; returns succeeded / failed / skipped /
-      needs-review counts with per-row scores read back from Gradescope
-      and any read-back mismatches.
+      reads it back afterwards. A row that is graded at that point (even if
+      it was ungraded in the preview, e.g. graded by another grader since)
+      is skipped and listed as not written, unless ``overwrite_graded=True``;
+      then the result names each grade it overwrote. A graded row that
+      already holds exactly the requested grade is listed as such and not
+      re-sent. A row whose grading page belongs to another submission fails
+      without a write. Returns
+      succeeded / failed / skipped / needs-review counts with per-row
+      scores read back from Gradescope and any read-back mismatches.
 
     Args:
         course_id: The Gradescope course ID.
         question_id: The question ID that every entry in ``grades`` targets.
-        grades: List of per-submission grade entries (see above).
+        grades: List of per-submission grade entries (see above), at most 50.
         confirm_write: Must be True to save. The default returns a preview
             and changes nothing. Setting it is not user approval: show the
             preview to the user first.
+        overwrite_graded: Must be True to save over rows that are already
+            graded when the write runs. Set it only with the user's explicit
+            approval to overwrite existing grades.
     """
+    if overwrite_graded:
+        return apply_grade_batch(
+            course_id, question_id, grades, confirm_write, overwrite_graded=True
+        )
     return apply_grade_batch(course_id, question_id, grades, confirm_write)
 
 
@@ -1195,10 +1225,14 @@ def tool_grade_answer_group(
 
     Validated before the preview: the rubric IDs must be in the question's
     rubric (unknown IDs are refused), the group must have confirmed
-    members, and the page must carry a CSRF token and save URL. The preview
-    shows the members and their graded counts, the items CHECKED and
-    UNCHECKED for every member, the projected per-member score and the
-    member count to pass back as ``expected_member_count``.
+    members, and the page must carry a CSRF token and save URL. The grade
+    page must belong to ``group_id`` (no redirect to another group's page,
+    matching ``answer_group``, a save URL in this course and question whose
+    submission is not known to be outside the group); otherwise nothing is
+    sent. The preview shows the members and their graded counts, the items
+    CHECKED and UNCHECKED for every member, the projected per-member score
+    (with a warning when Gradescope did not report the scoring direction)
+    and the member count to pass back as ``expected_member_count``.
 
     Args:
         course_id: The Gradescope course ID.

@@ -27,6 +27,7 @@ from gradescope_mcp.tools.common import (
     normalize_rubric_ids,
     normalize_url,
     page_number,
+    sanitize_inline,
     select_crop_pages,
     split_known_rubric_ids,
 )
@@ -81,6 +82,8 @@ def _compute_new_score(
     except (TypeError, ValueError):
         return None, set()
 
+    # An absent or unrecognized scoring_type is projected as negative; the
+    # views and previews say so (see _scoring_type / _scoring_label).
     scoring_type = question.get("scoring_type", "negative")
     floor = question.get("floor")
     ceiling = question.get("ceiling")
@@ -116,6 +119,51 @@ def _compute_new_score(
     if ceiling and score > weight_f:
         score = weight_f
     return score, unknown_ids
+
+
+_SCORING_TYPES = ("positive", "negative")
+SCORING_UNKNOWN = "unknown (not reported by Gradescope; projections assume negative)"
+
+
+def _scoring_type(props: dict | None) -> str | None:
+    """The question's ``scoring_type`` as Gradescope reported it, or ``None``.
+
+    ``None`` means the grading page did not report one (or no page could be
+    read). Score projections then assume negative scoring; views must say
+    so (``_scoring_label``) instead of presenting the guess as fact.
+    """
+    if not props:
+        return None
+    value = (props.get("question") or {}).get("scoring_type")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _scoring_assumed(scoring_type: str | None) -> bool:
+    """True when projections rely on the assumed (negative) direction."""
+    return scoring_type not in _SCORING_TYPES
+
+
+def _scoring_label(scoring_type: str | None) -> str:
+    """Display form of a scoring type that flags an assumed direction."""
+    if scoring_type in _SCORING_TYPES:
+        return scoring_type
+    if scoring_type is None:
+        return SCORING_UNKNOWN
+    return (
+        f"{sanitize_inline(scoring_type)} (unrecognized; projections assume negative)"
+    )
+
+
+def _scoring_assumption(scoring_type: str | None) -> str:
+    """Why a projection assumes negative scoring, for use inside a sentence."""
+    if scoring_type is None:
+        return "assumes negative scoring (Gradescope did not report scoring_type)"
+    return (
+        "assumes negative scoring (unrecognized scoring_type "
+        f"`{sanitize_inline(scoring_type)}`)"
+    )
 
 
 def _format_score(score: float | None) -> str:
@@ -429,6 +477,7 @@ def get_submission_grading_context(
     parameters = question.get("parameters") or {}
     crop = parameters.get("crop_rect_list") or []
     selected_pages, crop_pages, real_page_count = _select_context_pages(pages, crop)
+    scoring_type = _scoring_type(props)
 
     if output_format == "json":
         result = {
@@ -436,7 +485,8 @@ def get_submission_grading_context(
             "submission_id": submission_id,
             "question_title": question.get("title", ""),
             "weight": question.get("weight"),
-            "scoring_type": question.get("scoring_type", "negative"),
+            # null when Gradescope did not report it: never a guessed value.
+            "scoring_type": scoring_type,
             "student": submission.get("owner_names", "Unknown"),
             "score": submission.get("score"),
             "graded": submission.get("graded", False),
@@ -472,24 +522,36 @@ def get_submission_grading_context(
             "page_count": real_page_count,
             "crop_regions": crop,
         }
+        if _scoring_assumed(scoring_type):
+            result["scoring_type_note"] = _scoring_label(scoring_type)
         return json.dumps(result, indent=2)
 
     # Markdown output
     score = submission.get("score")
     lines = [f"## Grading Context — {_heading_title(question, question_id)}"]
     lines.append(f"**Question ID:** `{question_id}` | **Question Submission ID:** `{submission_id}`")
-    lines.append(f"**Student:** {submission.get('owner_names', 'Unknown')}")
+    # The display name is student-controlled: keep it on one line.
+    lines.append(f"**Student:** {sanitize_inline(submission.get('owner_names', 'Unknown'))}")
     lines.append(f"**Weight:** {question.get('weight', '?')} pts")
     lines.append(f"**Current Score:** {'Ungraded' if score is None else score}")
     lines.append(f"**Graded:** {submission.get('graded', False)}")
 
     # Scoring type
-    scoring_type = question.get("scoring_type", "negative")
-    lines.append(f"**Scoring:** {scoring_type} (floor={question.get('floor')}, ceiling={question.get('ceiling')})")
+    lines.append(
+        f"**Scoring:** {_scoring_label(scoring_type)} "
+        f"(floor={question.get('floor')}, ceiling={question.get('ceiling')})"
+    )
     if scoring_type == "positive":
         lines.append("  ↳ _Rubric items **add** points. Weight values are positive (e.g., `5.0` = +5 earned)._")
-    else:
+    elif scoring_type == "negative":
         lines.append("  ↳ _Starts at full marks. Rubric items **deduct** points. Weight values are positive (e.g., `2.0` = −2 deducted). Gradescope handles the sign internally._")
+    else:
+        lines.append(
+            "  ↳ _Direction unknown: Gradescope did not report whether rubric "
+            "items add or deduct points. Projected scores assume deduction "
+            "(negative scoring); confirm the question's scoring in Gradescope "
+            "before grading._"
+        )
 
     # Current evaluation (comments + point adjustment)
     if evaluation:
@@ -651,11 +713,10 @@ def get_question_rubric(course_id: str, question_id: str) -> str:
         return f"No rubric items found for question `{question_id}`. You can create them with `tool_create_rubric_item`."
 
     weight = question.get("weight", "?")
-    scoring_type = question.get("scoring_type", "negative")
 
     lines = [f"## Rubric for Question `{question_id}`\n"]
     lines.append(f"**Weight:** {weight} pts")
-    lines.append(f"**Scoring:** {scoring_type}\n")
+    lines.append(f"**Scoring:** {_scoring_label(_scoring_type(props))}\n")
     lines.append("| ID | Description | Points |")
     lines.append("|----|-------------|--------|")
 
@@ -1128,6 +1189,105 @@ def _describe_comment(plan: dict) -> str:
     return plan["comment"]
 
 
+_SAVE_GRADE_PATH_RE = re.compile(
+    r"/courses/([^/?#]+)/questions/([^/?#]+)/submissions/([^/?#]+)/save_grade(?:[?#]|$)"
+)
+
+
+def _write_target_problem(
+    props: dict, course_id: str, question_id: str, submission_id: str,
+) -> str | None:
+    """Why a loaded grading page is not ``submission_id``'s, or ``None``.
+
+    The grading page is fetched following redirects and the grade is posted
+    to the save URL found on that page, so a page that belongs to another
+    submission would send the grade there. The save URL decides where the
+    grade goes, so when it has the usual
+    ``/courses/{c}/questions/{q}/submissions/{s}/save_grade`` form its
+    course, question and submission must match the request. Otherwise the
+    page's own submission ID, when present, must match.
+    """
+    save_url = (props.get("urls") or {}).get("save_grade")
+    match = _SAVE_GRADE_PATH_RE.search(save_url) if isinstance(save_url, str) else None
+    if match:
+        if match.groups() != (str(course_id), str(question_id), str(submission_id)):
+            return (
+                f"the grading page loaded for submission `{submission_id}` saves "
+                f"to `{save_url}`, not to course `{course_id}`, question "
+                f"`{question_id}`, submission `{submission_id}` (Gradescope "
+                f"served another page)"
+            )
+        return None
+    page_sid = (props.get("submission") or {}).get("id")
+    if page_sid is not None and str(page_sid) != str(submission_id):
+        return (
+            f"the grading page loaded for submission `{submission_id}` belongs "
+            f"to submission `{page_sid}` (Gradescope served another "
+            f"submission's page)"
+        )
+    return None
+
+
+def _is_graded(props: dict) -> bool:
+    """Whether Gradescope reports the submission as graded.
+
+    Without a ``graded`` flag a present score counts as graded, so an unclear
+    state is never treated as safe to overwrite.
+    """
+    submission = props.get("submission") or {}
+    graded = submission.get("graded")
+    if graded is None:
+        return submission.get("score") is not None
+    return bool(graded)
+
+
+def _describe_existing_grade(props: dict) -> str:
+    """The grade a submission holds now, for overwrite warnings."""
+    submission = props.get("submission") or {}
+    evaluation = props.get("evaluation") or {}
+    weight = (props.get("question") or {}).get("weight", "?")
+    score = _to_float(submission.get("score"))
+    parts = [
+        f"{_format_score(score)}/{weight}" if score is not None else "score not shown",
+        f"rubric {sorted(_applied_rubric_ids(props))}",
+    ]
+    if evaluation.get("points") not in (None, ""):
+        parts.append(f"adjustment {evaluation.get('points')}")
+    if _normalize_comment(evaluation.get("comments")):
+        parts.append("has a comment")
+    return ", ".join(parts)
+
+
+def _projection_notes(
+    props: dict, plan: dict | None, weight: Any, subject: str = "projected_score",
+) -> list[str]:
+    """Preview warnings for a projection that relies on an assumed direction.
+
+    With a ``plan``, the warning also gives the score the same write would
+    project under positive scoring.
+    """
+    scoring_type = _scoring_type(props)
+    if not _scoring_assumed(scoring_type):
+        return []
+    alternative = ""
+    if plan is not None:
+        question = props.get("question") or {}
+        as_positive, _unknown = _compute_new_score(
+            {**props, "question": {**question, "scoring_type": "positive"}},
+            plan["apply_set"],
+            plan["resolved_points"],
+            rubric_items=plan["rubric"],
+        )
+        alternative = (
+            f" Under positive scoring it would be {_format_score(as_positive)}/{weight}."
+        )
+    return [
+        f"⚠️ {subject} {_scoring_assumption(scoring_type)}: rubric items "
+        f"are taken to DEDUCT points.{alternative} Check the question's "
+        f"scoring in Gradescope before approving"
+    ]
+
+
 def _post_save_grade(ctx: dict, payload: dict):
     """POST a save_grade payload using a grading context's session and CSRF token."""
     save_url = (ctx["props"].get("urls") or {}).get("save_grade")
@@ -1162,7 +1322,19 @@ def _read_back_grade(
     except Exception as e:  # includes AuthError: the write itself succeeded
         return {"error": str(e) or type(e).__name__}
     props = ctx["props"]
+    problem = _write_target_problem(props, course_id, question_id, submission_id)
+    if problem:
+        return {"error": problem}
     submission = props.get("submission") or {}
+    return {
+        "score": submission.get("score"),
+        "graded": submission.get("graded"),
+        "mismatches": _grade_mismatches(props, plan),
+    }
+
+
+def _grade_mismatches(props: dict, plan: dict) -> list[str]:
+    """How the grade a page shows differs from a write plan (``[]`` if equal)."""
     evaluation = props.get("evaluation") or {}
     rubric_ids = {str(ri["id"]) for ri in plan["rubric"]}
     actual = _applied_rubric_ids(props) & rubric_ids
@@ -1182,11 +1354,17 @@ def _read_back_grade(
         plan["resolved_comments"]
     ):
         mismatches.append("the comment on Gradescope differs from the comment sent")
-    return {
-        "score": submission.get("score"),
-        "graded": submission.get("graded"),
-        "mismatches": mismatches,
-    }
+    return mismatches
+
+
+def _already_holds(props: dict, plan: dict) -> bool:
+    """True when a graded submission already holds exactly the planned grade.
+
+    Re-sending it would change nothing, so it is not an overwrite. This is
+    also what a write finds when the server re-runs a call after a session
+    expiry and this call's first attempt already saved the grade.
+    """
+    return _is_graded(props) and not _grade_mismatches(props, plan)
 
 
 def _score_text(plan: dict, readback: dict | None, weight: Any) -> str:
@@ -1213,6 +1391,7 @@ def apply_grade(
     comment: str | None = None,
     confidence: float | None = None,
     confirm_write: bool = False,
+    overwrite_graded: bool = False,
 ) -> str:
     """Apply a grade to a student's question submission.
 
@@ -1232,6 +1411,16 @@ def apply_grade(
     rubric; otherwise nothing is sent. The preview lists the items that will
     be checked and unchecked and the projected score. After saving, the
     grading page is read back and Gradescope's stored score is reported.
+
+    An already graded submission is only overwritten with
+    ``overwrite_graded=True``. The graded state is re-read at write time, so
+    a submission graded by someone else after the preview is refused rather
+    than silently overwritten. A graded submission that already holds
+    exactly the requested grade is reported as such and nothing is sent
+    (this is also what a server re-run after a session expiry finds when
+    the first attempt saved the grade). The grading page must belong to the
+    requested submission (its save URL, or its submission ID when the save
+    URL has an unusual form), or nothing is sent.
 
     Args:
         course_id: The Gradescope course ID.
@@ -1254,6 +1443,9 @@ def apply_grade(
             - > 0.8: Grade proceeds normally.
             - None: No confidence gating (manual grading mode).
         confirm_write: Must be True to save the grade.
+        overwrite_graded: Must be True to save over a submission that is
+            already graded when the write runs. Set it only with the user's
+            approval to overwrite that grade.
     """
     if not course_id or not question_id or not submission_id:
         return "Error: course_id, question_id, and submission_id are required."
@@ -1298,6 +1490,9 @@ def apply_grade(
     props = ctx["props"]
     if not (props.get("urls") or {}).get("save_grade"):
         return "Error: save_grade URL not found in grading context."
+    target_problem = _write_target_problem(props, course_id, question_id, submission_id)
+    if target_problem:
+        return f"Error: {target_problem}. Nothing was sent."
 
     try:
         plan = _plan_grade_write(props, rubric_item_ids, point_adjustment, comment)
@@ -1307,6 +1502,9 @@ def apply_grade(
     question = props.get("question") or {}
     submission = props.get("submission") or {}
     weight = question.get("weight", "?")
+    overwrite = overwrite_graded is True
+    graded = _is_graded(props)
+    unchanged = _already_holds(props, plan)
 
     if not confirm_write:
         current = submission.get("score")
@@ -1314,10 +1512,27 @@ def apply_grade(
             f"course_id=`{course_id}`",
             f"question_id=`{question_id}`",
             f"submission_id=`{submission_id}`",
-            f"student={submission.get('owner_names', 'Unknown')}",
+            f"student={sanitize_inline(submission.get('owner_names', 'Unknown'))}",
             f"current_score={'ungraded' if current is None else current}/{weight}"
             f" (graded={submission.get('graded', False)})",
         ]
+        if unchanged:
+            details.append(
+                f"already graded ({_describe_existing_grade(props)}) with exactly "
+                "this grade: confirm_write=True will send nothing"
+            )
+        elif graded and overwrite:
+            details.append(
+                f"⚠️ already graded ({_describe_existing_grade(props)}): this "
+                "write OVERWRITES that grade (overwrite_graded=True)"
+            )
+        elif graded:
+            details.append(
+                f"⚠️ already graded ({_describe_existing_grade(props)}): "
+                "confirm_write=True alone will NOT write. Add "
+                "overwrite_graded=True only if the user approved overwriting "
+                "this grade"
+            )
         if rubric_item_ids is not None:
             details.append(f"rubric_item_ids={rubric_item_ids}")
             details.append(f"will CHECK: {_describe_items(plan['checked'])}")
@@ -1339,9 +1554,27 @@ def apply_grade(
         details.append(
             f"projected_score={_format_score(plan['projected_score'])}/{weight}"
         )
+        details.extend(_projection_notes(props, plan, weight))
         if confidence is not None:
             details.append(f"confidence={_confidence_note(confidence)}")
         return write_confirmation_required("apply_grade", details)
+
+    if unchanged:
+        return (
+            f"✅ Submission `{submission_id}` already holds this grade "
+            f"({_describe_existing_grade(props)}); nothing was sent."
+        )
+    # The state was just re-read: a grade entered after the preview (e.g. by
+    # another grader) is never overwritten without the explicit opt-in.
+    if graded and not overwrite:
+        return (
+            f"Error: submission `{submission_id}` is already graded "
+            f"({_describe_existing_grade(props)}); it may have been graded "
+            "after the preview. Nothing was sent. Show the user its current "
+            "grade; re-run with overwrite_graded=True only if they approve "
+            "overwriting it."
+        )
+    existing_grade = _describe_existing_grade(props) if graded else None
 
     try:
         resp = _post_save_grade(ctx, plan["payload"])
@@ -1353,6 +1586,8 @@ def apply_grade(
 
     readback = _read_back_grade(course_id, question_id, submission_id, plan)
     lines = ["✅ Grade saved successfully!"]
+    if existing_grade is not None:
+        lines.append(f"⚠️ **Overwrote existing grade:** {existing_grade}")
     if _needs_review(confidence):
         lines.append(f"⚠️ **NEEDS HUMAN REVIEW** — confidence {confidence:.2f}")
     lines.extend([
@@ -1372,6 +1607,11 @@ def apply_grade(
 _BATCH_ROW_KEYS = (
     "submission_id", "rubric_item_ids", "point_adjustment", "comment", "confidence",
 )
+
+# Rows per apply_grade_batch call. Each row costs a page load, a POST and a
+# read-back, run one after another; a client that times out on a long batch
+# cannot tell which rows were saved, while the server keeps writing.
+MAX_BATCH_ROWS = 50
 
 
 def _normalize_batch_rows(grades: list) -> tuple[list[dict], list[str]]:
@@ -1472,7 +1712,9 @@ def _is_low_confidence(row: dict) -> bool:
     return row["confidence"] is not None and row["confidence"] < CONFIDENCE_REJECT_BELOW
 
 
-def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
+def _batch_preview(
+    course_id: str, question_id: str, rows: list[dict], overwrite: bool,
+) -> str:
     """Load every row's grading page and describe exactly what would be sent."""
     planned: list[tuple[dict, dict, dict]] = []
     problems: list[str] = []
@@ -1492,6 +1734,10 @@ def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
         props = ctx["props"]
         if not (props.get("urls") or {}).get("save_grade"):
             problems.append(f"{label}: save_grade URL not found in grading context")
+            continue
+        target_problem = _write_target_problem(props, course_id, question_id, sid)
+        if target_problem:
+            problems.append(f"{label}: {target_problem}")
             continue
         rubric = _resolve_rubric(props)
         if row["rubric_item_ids"]:
@@ -1533,7 +1779,8 @@ def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
         "| # | submission_id | current | check | uncheck | point_adj | comment | projected | confidence |",
         "|---|---------------|---------|-------|---------|-----------|---------|-----------|------------|",
     ]
-    overwritten: list[str] = []
+    already_graded: list[str] = []
+    unchanged: list[str] = []
     review: list[str] = []
     skipped: list[str] = []
     for n, row in enumerate(rows, 1):
@@ -1550,9 +1797,14 @@ def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
         submission = props.get("submission") or {}
         score = submission.get("score")
         current = "ungraded" if score is None else f"{score}/{weight}"
-        if submission.get("graded"):
-            current += " (graded)"
-            overwritten.append(sid)
+        if _already_holds(props, plan):
+            current += " (graded; already holds this grade, nothing to send)"
+            unchanged.append(sid)
+        elif _is_graded(props):
+            current += " (graded)" if overwrite else (
+                " (graded; SKIPPED unless overwrite_graded=True)"
+            )
+            already_graded.append(sid)
         if row["rubric_item_ids"] is None:
             check = "keep current: " + _describe_items(plan["checked"])
             uncheck = "—"
@@ -1592,17 +1844,41 @@ def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
             ]) + " |"
         )
 
+    skipped_graded = 0 if overwrite else len(already_graded)
     details = [
         f"course_id=`{course_id}`",
         f"question_id=`{question_id}`",
-        f"rows={len(rows)} (will write {len(planned)}, "
-        f"skip {len(skipped)} with confidence < {CONFIDENCE_REJECT_BELOW})",
+        f"rows={len(rows)} (will write "
+        f"{len(planned) - skipped_graded - len(unchanged)}, "
+        f"skip {len(skipped)} with confidence < {CONFIDENCE_REJECT_BELOW}"
+        + (f", skip {skipped_graded} already graded" if skipped_graded else "")
+        + (f", {len(unchanged)} already hold this grade" if unchanged else "")
+        + ")",
     ]
-    if overwritten:
+    graded_ids = ", ".join(f"`{s}`" for s in already_graded)
+    if already_graded and overwrite:
         details.append(
-            f"⚠️ {len(overwritten)} row(s) are already graded and will be "
-            f"OVERWRITTEN: " + ", ".join(f"`{s}`" for s in overwritten)
+            f"⚠️ {len(already_graded)} row(s) are already graded and will be "
+            f"OVERWRITTEN (overwrite_graded=True): {graded_ids}"
         )
+    elif already_graded:
+        details.append(
+            f"⚠️ {len(already_graded)} row(s) are already graded and will be "
+            f"SKIPPED (not written): {graded_ids}. To overwrite them, re-run "
+            "with overwrite_graded=True, only if the user approved "
+            "overwriting these grades"
+        )
+    if not overwrite:
+        details.append(
+            "each row is re-read right before it is written; a row graded by "
+            "then (e.g. by another grader after this preview) is skipped, "
+            "not overwritten"
+        )
+    if planned:
+        # scoring_type is per question, so the first row speaks for all.
+        details.extend(_projection_notes(
+            planned[0][1], None, weight, subject="the projected column"
+        ))
     if review:
         details.append(
             f"⚠️ {len(review)} row(s) have confidence {CONFIDENCE_REJECT_BELOW}–"
@@ -1621,6 +1897,7 @@ def apply_grade_batch(
     question_id: str,
     grades: list[dict],
     confirm_write: bool = False,
+    overwrite_graded: bool = False,
 ) -> str:
     """Apply grades to many submissions for one question in a single call.
 
@@ -1639,14 +1916,23 @@ def apply_grade_batch(
         - ``confidence``: float | None — per-row gate: < 0.6 is skipped,
           0.6-0.8 is written and flagged NEEDS HUMAN REVIEW.
 
-    All entries are applied to the same ``question_id``. Invalid rows refuse
-    the whole batch before anything is written. On ``confirm_write=False``
-    each row's grading page is loaded and a preview table shows the current
-    score, the items to check and uncheck, the projected score, and rows
-    that are already graded and would be overwritten. On
+    All entries are applied to the same ``question_id``. At most
+    ``MAX_BATCH_ROWS`` (50) rows per call; split larger batches. Invalid rows
+    refuse the whole batch before anything is written. On
+    ``confirm_write=False`` each row's grading page is loaded and a preview
+    table shows the current score, the items to check and uncheck, the
+    projected score, and rows that are already graded. On
     ``confirm_write=True`` returns an execution summary (succeeded / failed
-    / skipped-by-confidence / needs-review) with per-row scores read back
-    from Gradescope.
+    / skipped-by-confidence / skipped-already-graded / needs-review) with
+    per-row scores read back from Gradescope.
+
+    Already graded rows are skipped unless ``overwrite_graded=True``. Each
+    row is re-read right before its write, so a row graded after the
+    preview (e.g. by another grader) is skipped too; with
+    ``overwrite_graded=True`` the result names every grade it overwrote. A
+    graded row that already holds exactly the requested grade is listed as
+    such and not re-sent. A row whose grading page belongs to another
+    submission is not written.
 
     This is meant for the main agent's post-approval execution phase. Subagents
     cannot call write-gated tools in the Claude Code harness, so all writes
@@ -1657,13 +1943,21 @@ def apply_grade_batch(
         return "Error: course_id and question_id are required."
     if not isinstance(grades, list) or not grades:
         return "Error: grades must be a non-empty list."
+    if len(grades) > MAX_BATCH_ROWS:
+        return (
+            f"Error: grades has {len(grades)} rows; at most {MAX_BATCH_ROWS} "
+            "rows are accepted per call. Nothing was read or written. Split "
+            f"the batch into calls of at most {MAX_BATCH_ROWS} rows and "
+            "preview each one."
+        )
 
     rows, errors = _normalize_batch_rows(grades)
     if errors:
         return "Error: invalid batch input:\n" + "\n".join(f"- {e}" for e in errors)
 
+    overwrite = overwrite_graded is True
     if not confirm_write:
-        return _batch_preview(course_id, question_id, rows)
+        return _batch_preview(course_id, question_id, rows, overwrite)
 
     to_write = [r for r in rows if not _is_low_confidence(r)]
     skipped_confidence = [
@@ -1701,6 +1995,9 @@ def apply_grade_batch(
     succeeded: list[tuple[str, str, dict, dict]] = []
     failed: list[tuple[str, str]] = []
     review: list[tuple[str, float]] = []
+    skipped_graded: list[tuple[str, str]] = []
+    unchanged: list[tuple[str, str]] = []
+    overwrote: dict[str, str] = {}
     auth_failure: str | None = None
 
     for row in to_write:
@@ -1709,7 +2006,8 @@ def apply_grade_batch(
             failed.append((sid, f"not attempted: {auth_failure}"))
             continue
         try:
-            # Fresh state right before each write ("keep current" fields).
+            # Fresh state right before each write ("keep current" fields,
+            # graded state, page identity).
             ctx = contexts.pop(sid, None) or _get_grading_context(
                 course_id, question_id, sid
             )
@@ -1717,13 +2015,30 @@ def apply_grade_batch(
             if not (props.get("urls") or {}).get("save_grade"):
                 failed.append((sid, "save_grade URL not found in grading context"))
                 continue
+            target_problem = _write_target_problem(props, course_id, question_id, sid)
+            if target_problem:
+                failed.append((sid, f"{target_problem}; not written"))
+                continue
             plan = _plan_grade_write(
                 props, row["rubric_item_ids"], row["point_adjustment"], row["comment"]
             )
+            existing = _describe_existing_grade(props) if _is_graded(props) else None
+            if _already_holds(props, plan):
+                unchanged.append((sid, existing))
+                if _needs_review(row["confidence"]):
+                    review.append((sid, row["confidence"]))
+                continue
+            # A grade entered after the preview (e.g. by another grader) is
+            # never overwritten without the explicit opt-in.
+            if existing is not None and not overwrite:
+                skipped_graded.append((sid, existing))
+                continue
             resp = _post_save_grade(ctx, plan["payload"])
             if resp.status_code != 200:
                 failed.append((sid, f"HTTP {resp.status_code}: {resp.text[:200]}"))
                 continue
+            if existing is not None:
+                overwrote[sid] = existing
             readback = _read_back_grade(course_id, question_id, sid, plan)
             weight = (props.get("question") or {}).get("weight", "?")
             succeeded.append((sid, _score_text(plan, readback, weight), plan, readback))
@@ -1749,6 +2064,17 @@ def apply_grade_batch(
         f"- **failed:** {len(failed)}",
         f"- **skipped (confidence < {CONFIDENCE_REJECT_BELOW}):** {len(skipped_confidence)}",
     ]
+    if skipped_graded:
+        lines.append(
+            "- **skipped (already graded at write time; overwrite_graded not "
+            f"set):** {len(skipped_graded)}"
+        )
+    if unchanged:
+        lines.append(
+            f"- **already held the requested grade (nothing sent):** {len(unchanged)}"
+        )
+    if overwrote:
+        lines.append(f"- **overwrote existing grades:** {len(overwrote)}")
     if review:
         lines.append(
             f"- **needs human review (confidence {CONFIDENCE_REJECT_BELOW}–"
@@ -1760,11 +2086,32 @@ def apply_grade_batch(
         lines.append("")
         lines.append("### Saved")
         for sid, score_text, plan, _readback in succeeded:
-            lines.append(
+            line = (
                 f"- `{sid}`: {score_text} — rubric "
                 f"{[str(ri['id']) for ri in plan['checked']]}, adjustment "
                 f"{_describe_points(plan)}, comment {_describe_comment(plan)}"
             )
+            if sid in overwrote:
+                line += f" — ⚠️ OVERWROTE existing grade ({overwrote[sid]})"
+            lines.append(line)
+    if unchanged:
+        lines.append("")
+        lines.append("### Already holding the requested grade (nothing sent)")
+        for sid, existing in unchanged:
+            lines.append(f"- `{sid}`: {existing}")
+    if skipped_graded:
+        lines.append("")
+        lines.append(
+            "### ⚠️ Not written: already graded at write time "
+            "(overwrite_graded not set)"
+        )
+        lines.append(
+            "These rows were graded when the write ran, possibly by someone "
+            "else after the preview. Show the user their current grades and "
+            "re-run them with overwrite_graded=True only if they approve."
+        )
+        for sid, existing in skipped_graded:
+            lines.append(f"- `{sid}`: {existing}")
     if review:
         lines.append("")
         lines.append(
@@ -1799,9 +2146,10 @@ def _weight_effect(weight: float, scoring_type: str | None) -> str:
     points = _format_score(abs(weight))
     if weight == 0:
         return "applying this item changes the score by 0 points"
-    if scoring_type not in ("positive", "negative"):
+    if scoring_type not in _SCORING_TYPES:
         return (
-            "scoring_type unknown (no grading page could be read): under "
+            "scoring_type unknown (not reported by Gradescope, or no grading "
+            "page could be read): under "
             f"positive scoring applying this item would add {points} point(s), "
             f"under negative scoring it would deduct {points} point(s)"
         )
@@ -1836,12 +2184,6 @@ def _validate_rubric_weight(weight: Any, allow_negative: bool) -> float:
 
 def _find_rubric_item(rubric: list[dict], rubric_item_id: str) -> dict | None:
     return next((ri for ri in rubric if str(ri["id"]) == rubric_item_id), None)
-
-
-def _scoring_type(props: dict | None) -> str | None:
-    if not props:
-        return None
-    return (props.get("question") or {}).get("scoring_type", "negative")
 
 
 def _reload_rubric(course_id: str, question_id: str, rctx: dict) -> list[dict]:
