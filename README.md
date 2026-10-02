@@ -15,10 +15,10 @@ workflows.
 
 ## Current Status
 
-- 37 MCP tools
+- 38 MCP tools
 - 3 MCP resources
 - 7 MCP prompts
-- 72 automated tests
+- 77 automated tests
 - Python 3.10+
 - MCP Python SDK v2 (`mcp>=2.2,<3`, `MCPServer`)
 - Package manager: `uv`
@@ -39,6 +39,7 @@ workflows.
 - Setting student extensions
 - Modifying assignment dates
 - Renaming assignments
+- Changing a programming assignment's autograder Docker image
 - Applying grades
 - Creating, updating, and deleting rubric items
 - Batch grading answer groups
@@ -64,6 +65,7 @@ before any mutation is executed.
 | `tool_set_extension` | Add or update one student's extension |
 | `tool_modify_assignment_dates` | Change release / due / late-due dates |
 | `tool_rename_assignment` | Rename an assignment |
+| `tool_update_autograder_image` | Change a programming assignment's autograder Docker image |
 | `tool_get_assignment_submissions` | List assignment submissions |
 | `tool_get_student_submission` | Read one student's submission content |
 | `tool_get_assignment_graders` | View graders for a question |

@@ -16,6 +16,7 @@ from gradescope_mcp.tools.assignments import (
     get_assignment_details,
     modify_assignment_dates,
     rename_assignment,
+    update_autograder_image,
 )
 from gradescope_mcp.tools.submissions import (
     upload_submission,
@@ -249,6 +250,32 @@ def tool_rename_assignment(
         confirm_write: Must be True to perform the rename.
     """
     return rename_assignment(course_id, assignment_id, new_title, confirm_write)
+
+
+@mcp.tool()
+def tool_update_autograder_image(
+    course_id: str,
+    assignment_id: str,
+    image_name: str,
+    confirm_write: bool = False,
+) -> str:
+    """Change the Docker Hub image a programming assignment's autograder uses.
+
+    Only applies to programming assignments whose autograder is configured
+    with a Docker Hub image. Gradescope may accept an image that does not
+    exist, so run a test submission after updating.
+    Requires instructor access.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The programming assignment ID.
+        image_name: Docker Hub image reference, e.g.
+            ``gradescope/autograder-base:ubuntu-22.04``.
+        confirm_write: Must be True to perform the update.
+    """
+    return update_autograder_image(
+        course_id, assignment_id, image_name, confirm_write
+    )
 
 
 @mcp.tool()

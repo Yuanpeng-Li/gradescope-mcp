@@ -22,6 +22,13 @@
    submissions-column fix; this project uses its own `_parse_roster`, which
    was checked against the roster fixture shipped in the 1.8.1 wheel.
 5. Pinned `mcp>=2.2.0,<3` and `gradescopeapi>=1.8.1`.
+6. Audited the full gradescopeapi 1.8.1 surface (identical to upstream `main`)
+   against this server. The one released capability not yet exposed was
+   `update_autograder_image_name` (added upstream in 1.6.0), now wrapped as
+   the preview-first write tool `tool_update_autograder_image`.
+   `remove_student_extension` is still `NotImplementedError` upstream, and
+   create-assignment / edit-outline / submission-download exist only as open
+   upstream PRs, so nothing else was adopted.
 
 ### Behavior changes
 
@@ -37,11 +44,14 @@
 - `tests/test_server_mcp.py`: registration counts, worker-thread execution,
   write preview and argument validation through the `MCPServer` layer.
 - `tests/test_auth.py`: concurrent first `get_connection()` calls log in once.
+- `tests/test_assignments_and_grading_ops.py`: `update_autograder_image`
+  preview makes no requests, validation, upstream call, rejection and HTTP
+  error reporting.
 
 ### Current state
 
-- **37 tools** + **3 resources** + **7 prompts**
-- **72 automated tests**
+- **38 tools** + **3 resources** + **7 prompts**
+- **77 automated tests**
 
 ---
 

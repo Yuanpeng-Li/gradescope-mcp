@@ -13,10 +13,10 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 37 tools
+- 38 tools
 - 3 resources
 - 7 prompts
-- 72 automated tests
+- 77 automated tests
 - Python 3.10+
 - `uv` + `hatchling`
 - `mcp` v2 `MCPServer` (sync tools run on worker threads, not the event loop)
@@ -102,6 +102,7 @@ simple CRUD wrappers.
 32. `tool_update_rubric_item`
 33. `tool_delete_rubric_item`
 34. `tool_grade_answer_group`
+35. `tool_update_autograder_image`
 
 ## Operating Assumptions
 

@@ -57,6 +57,86 @@ def test_rename_assignment_rejects_whitespace_title() -> None:
     assert result == "Error: new_title cannot be all whitespace."
 
 
+def test_update_autograder_image_preview_makes_no_requests(monkeypatch) -> None:
+    def fail_get_connection():
+        raise AssertionError("preview must not touch Gradescope")
+
+    monkeypatch.setattr(assignments, "get_connection", fail_get_connection)
+
+    result = assignments.update_autograder_image(
+        "1", "2", "  gradescope/autograder-base:ubuntu-22.04 "
+    )
+
+    assert "Write confirmation required for `update_autograder_image`." in result
+    assert "image_name=`gradescope/autograder-base:ubuntu-22.04`" in result
+
+
+def test_update_autograder_image_rejects_whitespace_in_name() -> None:
+    result = assignments.update_autograder_image("1", "2", "gradescope/base: latest")
+    assert result.startswith("Error: image_name must be a Docker image reference")
+
+
+def test_update_autograder_image_confirm_calls_upstream(monkeypatch) -> None:
+    calls = []
+    fake_conn = SimpleNamespace(session=object())
+    monkeypatch.setattr(assignments, "get_connection", lambda: fake_conn)
+    monkeypatch.setattr(
+        assignments,
+        "update_autograder_image_name",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+
+    result = assignments.update_autograder_image(
+        "1", "2", "gradescope/autograder-base:ubuntu-22.04", confirm_write=True
+    )
+
+    assert calls == [
+        {
+            "session": fake_conn.session,
+            "course_id": "1",
+            "assignment_id": "2",
+            "image_name": "gradescope/autograder-base:ubuntu-22.04",
+        }
+    ]
+    assert result.startswith("✅ Autograder image for assignment `2` set to")
+
+
+def test_update_autograder_image_reports_rejected_image(monkeypatch) -> None:
+    monkeypatch.setattr(
+        assignments, "get_connection", lambda: SimpleNamespace(session=object())
+    )
+    monkeypatch.setattr(
+        assignments, "update_autograder_image_name", lambda **kwargs: False
+    )
+
+    result = assignments.update_autograder_image(
+        "1", "2", "nobody/missing:tag", confirm_write=True
+    )
+
+    assert result.startswith("❌ Gradescope did not accept image `nobody/missing:tag`")
+
+
+def test_update_autograder_image_reports_http_error(monkeypatch) -> None:
+    import requests
+
+    def raise_404(**kwargs):
+        response = requests.Response()
+        response.status_code = 404
+        raise requests.HTTPError("404 Client Error", response=response)
+
+    monkeypatch.setattr(
+        assignments, "get_connection", lambda: SimpleNamespace(session=object())
+    )
+    monkeypatch.setattr(assignments, "update_autograder_image_name", raise_404)
+
+    result = assignments.update_autograder_image(
+        "1", "2", "gradescope/autograder-base:ubuntu-22.04", confirm_write=True
+    )
+
+    assert "status 404" in result
+    assert "programming assignment" in result
+
+
 def test_get_submission_grading_context_json_filters_self_links_and_placeholder_pages(
     monkeypatch,
 ) -> None:

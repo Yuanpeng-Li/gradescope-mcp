@@ -2,9 +2,11 @@
 
 import datetime
 
+import requests
 from gradescopeapi.classes.assignments import (
     update_assignment_date,
     update_assignment_title,
+    update_autograder_image_name,
 )
 
 from gradescope_mcp.auth import get_connection, AuthError
@@ -234,3 +236,74 @@ def rename_assignment(
         return f"✅ Assignment `{assignment_id}` renamed to '{new_title}'."
     else:
         return f"❌ Failed to rename assignment `{assignment_id}`. Check your permissions."
+
+
+def update_autograder_image(
+    course_id: str,
+    assignment_id: str,
+    image_name: str,
+    confirm_write: bool = False,
+) -> str:
+    """Change the Docker Hub image a programming assignment's autograder uses.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID. Must be a programming assignment
+            whose autograder is configured with a Docker Hub image.
+        image_name: Docker Hub image reference, e.g.
+            ``gradescope/autograder-base:ubuntu-22.04``.
+        confirm_write: Must be True to perform the update.
+    """
+    if not all([course_id, assignment_id, image_name]):
+        return "Error: course_id, assignment_id, and image_name are all required."
+
+    image_name = image_name.strip()
+    if not image_name or any(ch.isspace() for ch in image_name):
+        return (
+            "Error: image_name must be a Docker image reference without "
+            "whitespace, e.g. `gradescope/autograder-base:ubuntu-22.04`."
+        )
+
+    if not confirm_write:
+        return write_confirmation_required(
+            "update_autograder_image",
+            [
+                f"course_id=`{course_id}`",
+                f"assignment_id=`{assignment_id}`",
+                f"image_name=`{image_name}`",
+                "Future autograder runs for this assignment use the new image.",
+                "Gradescope may accept an image that does not exist on Docker "
+                "Hub; run a test submission after updating.",
+            ],
+        )
+
+    try:
+        conn = get_connection()
+        success = update_autograder_image_name(
+            session=conn.session,
+            course_id=course_id,
+            assignment_id=assignment_id,
+            image_name=image_name,
+        )
+    except AuthError as e:
+        return f"Authentication error: {e}"
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "unknown"
+        return (
+            f"Error updating autograder image (status {status}). Check that "
+            f"assignment `{assignment_id}` is a programming assignment with a "
+            "Docker image autograder and that you have instructor access."
+        )
+    except Exception as e:
+        return f"Error updating autograder image: {e!r}"
+
+    if success:
+        return (
+            f"✅ Autograder image for assignment `{assignment_id}` set to "
+            f"`{image_name}`. Run a test submission to confirm the autograder "
+            "still works."
+        )
+    return (
+        f"❌ Gradescope did not accept image `{image_name}` for assignment "
+        f"`{assignment_id}` (it reported the Docker image was not found)."
+    )
