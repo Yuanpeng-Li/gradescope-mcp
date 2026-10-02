@@ -23,6 +23,7 @@ import anyio
 import pytest
 import requests
 from gradescopeapi.classes.account import Account
+from mcp.server.mcpserver.exceptions import ToolError
 from requests.adapters import BaseAdapter
 from requests.models import Response
 from requests.structures import CaseInsensitiveDict
@@ -794,8 +795,13 @@ def test_prepare_treats_empty_submission_id_as_omitted(monkeypatch) -> None:
 ])
 def test_workflow_tools_reject_non_numeric_ids_before_any_request(monkeypatch, tmp_path, tool) -> None:
     _, adapter = _install(monkeypatch, _pages_world([{"number": 1, "url": "https://s3.example/p1.jpg"}]))
+    bad_id = "21/grade#/../../../escaped-dir"
 
-    out = _call(tool, {**ARGS, "submission_id": "21/grade#/../../../escaped-dir"})
+    # The MCP argument schema rejects the ID before the tool runs ...
+    with pytest.raises(ToolError, match="(?s)submission_id.*must be a numeric Gradescope ID"):
+        _call(tool, {**ARGS, "submission_id": bad_id})
+    # ... and the implementation still refuses it on its own.
+    out = getattr(gw, tool.removeprefix("tool_"))("1", "7", "11", bad_id)
 
     assert out.startswith("Error: submission_id must be a numeric Gradescope ID")
     assert adapter.log == []

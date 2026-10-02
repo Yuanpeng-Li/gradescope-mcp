@@ -606,14 +606,21 @@ def test_every_tool_and_resource_is_registered_with_recovery() -> None:
 
 
 def test_recovery_wrappers_keep_registered_metadata_identical() -> None:
-    """Registering the unwrapped functions yields byte-identical listings."""
+    """Registering the unwrapped functions yields byte-identical listings.
+
+    Tools are registered with the same annotations, title and text-only
+    output as the server's ``gs_tool`` uses, so any difference comes from
+    the wrappers.
+    """
     baseline = MCPServer("baseline")
     for tool in server.mcp._tool_manager.list_tools():
-        baseline.tool()(tool.fn.__wrapped__)
+        baseline.tool(
+            title=tool.title, annotations=tool.annotations, structured_output=False
+        )(inspect.unwrap(tool.fn))
     for resource in server.mcp._resource_manager.list_resources():
-        baseline.resource(str(resource.uri))(resource.fn.__wrapped__)
+        baseline.resource(str(resource.uri))(inspect.unwrap(resource.fn))
     for template in server.mcp._resource_manager.list_templates():
-        baseline.resource(template.uri_template)(template.fn.__wrapped__)
+        baseline.resource(template.uri_template)(inspect.unwrap(template.fn))
 
     async def listing(mcp_server):
         return (
