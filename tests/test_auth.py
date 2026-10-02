@@ -5,16 +5,25 @@ The login runs against an offline fake Gradescope installed behind
 real ``requests.Session``, the timeout adapter, redirects, gradescopeapi's
 ``Account`` — is the production code path. Session-expiry detection and
 recovery are covered in ``test_session_recovery.py``.
+
+The ``.env`` loading of ``python -m gradescope_mcp`` (where the credentials
+usually come from) is tested at the end.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import shutil
 import socket
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+from pathlib import Path
 from urllib.parse import parse_qs, quote, quote_plus, urlsplit
 
 import anyio
@@ -25,6 +34,8 @@ from gradescopeapi.classes.connection import GSConnection
 from requests.adapters import HTTPAdapter
 from requests.structures import CaseInsensitiveDict
 
+import gradescope_mcp
+from gradescope_mcp import __main__ as entry
 from gradescope_mcp import auth, server
 
 BASE = "https://www.gradescope.com"
@@ -705,3 +716,166 @@ def test_get_connection_logs_in_once_under_concurrent_first_calls(fake_gs) -> No
     assert fake_gs.logins == 1
     assert len(results) == 8
     assert len({id(conn) for conn in results}) == 1
+
+
+# ------------------------------------------------------------------
+# .env loading (python -m gradescope_mcp)
+# ------------------------------------------------------------------
+
+
+def _write(path: Path, text: str, mode: int = 0o600) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(mode)
+    return path
+
+
+def _checkout(root: Path, name: str = "gradescope-mcp") -> Path:
+    """A source checkout layout; returns its package directory."""
+    _write(root / "pyproject.toml", f'[build-system]\n\n[project]\nname = "{name}"\n')
+    package = root / "src" / "gradescope_mcp"
+    package.mkdir(parents=True)
+    return package
+
+
+def test_dotenv_comes_from_cwd_and_the_source_checkout_only(tmp_path) -> None:
+    _write(tmp_path / ".env", "FROM=ancestor\n")
+    _write(tmp_path / "work" / ".env", "FROM=parent-of-cwd\n")
+    cwd = tmp_path / "work" / "sub"
+    cwd.mkdir(parents=True)
+    package = _checkout(tmp_path / "checkout")
+
+    assert entry.dotenv_candidates(cwd, package) == []
+
+    _write(tmp_path / "checkout" / ".env", "FROM=checkout\n")
+    assert entry.dotenv_candidates(cwd, package) == [tmp_path / "checkout" / ".env"]
+
+    _write(cwd / ".env", "FROM=cwd\n")
+    assert entry.dotenv_candidates(cwd, package) == [
+        cwd / ".env", tmp_path / "checkout" / ".env",
+    ]
+    # Run from the checkout itself, its .env is loaded once.
+    assert entry.dotenv_candidates(tmp_path / "checkout", package) == [
+        tmp_path / "checkout" / ".env",
+    ]
+
+
+@pytest.mark.parametrize("layout", ["site-packages", "other-project", "flat"])
+def test_installed_or_foreign_packages_have_no_checkout(tmp_path, layout) -> None:
+    if layout == "site-packages":
+        package = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "gradescope_mcp"
+        package.mkdir(parents=True)
+        _write(tmp_path / "venv" / "pyproject.toml", '[project]\nname = "gradescope-mcp"\n')
+    elif layout == "other-project":
+        package = _checkout(tmp_path / "other", name="something-else")
+    else:
+        package = tmp_path / "flat" / "gradescope_mcp"
+        package.mkdir(parents=True)
+        _write(tmp_path / "flat" / "pyproject.toml", '[project]\nname = "gradescope-mcp"\n')
+    _write(package.parent / ".env", "FROM=parent\n")
+    _write(package.parent.parent / ".env", "FROM=grandparent\n")
+
+    assert entry.source_checkout(package) is None
+    assert entry.dotenv_candidates(tmp_path / "elsewhere", package) == []
+
+
+def test_this_repository_is_recognized_as_a_source_checkout() -> None:
+    package = Path(gradescope_mcp.__file__).resolve().parent
+    assert entry.source_checkout(package) == Path(__file__).resolve().parent.parent
+
+
+def test_dotenv_precedence_is_env_then_cwd_then_checkout(tmp_path, monkeypatch) -> None:
+    package = _checkout(tmp_path / "checkout")
+    _write(tmp_path / "checkout" / ".env", "GS_T_A=checkout\nGS_T_B=checkout\nGS_T_C=checkout\n")
+    cwd = tmp_path / "work"
+    _write(cwd / ".env", "GS_T_A=cwd\nGS_T_B=cwd\n")
+    monkeypatch.setenv("GS_T_A", "client")
+    # Registered with monkeypatch so the values the loader sets are undone.
+    monkeypatch.setenv("GS_T_B", "")
+    monkeypatch.setenv("GS_T_C", "")
+    monkeypatch.delenv("GS_T_B")
+    monkeypatch.delenv("GS_T_C")
+
+    loaded, skipped = entry.load_env_files(cwd=cwd, package_dir=package)
+
+    assert loaded == [cwd / ".env", tmp_path / "checkout" / ".env"]
+    assert skipped == []
+    assert os.environ["GS_T_A"] == "client"
+    assert os.environ["GS_T_B"] == "cwd"
+    assert os.environ["GS_T_C"] == "checkout"
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX permissions")
+def test_world_writable_dotenv_is_skipped(tmp_path, monkeypatch) -> None:
+    cwd = tmp_path / "work"
+    _write(cwd / ".env", "GS_T_PLANTED=1\n", mode=0o666)
+    monkeypatch.delenv("GS_T_PLANTED", raising=False)
+
+    loaded, skipped = entry.load_env_files(cwd=cwd, package_dir=tmp_path / "pkg")
+
+    assert loaded == []
+    assert skipped == [(cwd / ".env", "it is writable by every user")]
+    assert "GS_T_PLANTED" not in os.environ
+
+
+def test_installed_server_ignores_ancestor_dotenv(tmp_path) -> None:
+    """Reviewer repro R2/dotenv/run.py, end to end in a fresh interpreter.
+
+    A copy of the package is installed under a directory whose parent has a
+    planted ``.env`` (proxy, upload root); the server's real ``main()`` is
+    started from a working directory with its own ``.env``. Before the fix
+    the planted file was loaded and the working directory's was ignored.
+    """
+    root = tmp_path / "dotenv"
+    site = root / "inst" / "lib" / "site-packages"
+    shutil.copytree(
+        Path(gradescope_mcp.__file__).resolve().parent,
+        site / "gradescope_mcp",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    _write(
+        root / ".env",
+        "HTTPS_PROXY=http://attacker.invalid:8080\nGRADESCOPE_MCP_UPLOAD_ROOT=/\n"
+        "FROM=parent-of-install\n",
+    )
+    _write(root / "inst" / ".env", "FROM=install-dir\n")
+    work = root / "work"
+    _write(work / ".env", "FROM=cwd\nGRADESCOPE_EMAIL=cwd@example.edu\n")
+    cache = tmp_path / "cache"
+    cache.mkdir(mode=0o700)
+
+    names = ("FROM", "HTTPS_PROXY", "GRADESCOPE_EMAIL", "GRADESCOPE_MCP_UPLOAD_ROOT")
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in names and k.lower() not in ("https_proxy", "pythonpath")
+    }
+    env["GRADESCOPE_MCP_CACHE_DIR"] = str(cache)
+    script = (
+        "import json, os, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from mcp.server.mcpserver import MCPServer\n"
+        "MCPServer.run = lambda self, *a, **k: None\n"
+        "import gradescope_mcp.__main__ as m\n"
+        f"before = {{k: os.environ.get(k) for k in {names!r}}}\n"
+        "m.main()\n"
+        "print(json.dumps({'file': m.__file__, 'before': before,\n"
+        f"                  'after': {{k: os.environ.get(k) for k in {names!r}}}}}))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(site)],
+        cwd=work, env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert report["file"].startswith(str(site))
+    # Importing the module loads nothing; main() does.
+    assert report["before"] == dict.fromkeys(names)
+    assert report["after"] == {
+        "FROM": "cwd",
+        "HTTPS_PROXY": None,
+        "GRADESCOPE_EMAIL": "cwd@example.edu",
+        "GRADESCOPE_MCP_UPLOAD_ROOT": None,
+    }
+    assert f"Loaded environment defaults from {work / '.env'}" in proc.stderr
+    assert "parent-of-install" not in proc.stderr
