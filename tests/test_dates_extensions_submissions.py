@@ -1796,3 +1796,112 @@ def test_preview_with_a_stale_expected_hash_is_an_error(upload_file) -> None:
 
     assert text.startswith("Error: the file content differs from the approved preview")
 
+
+# ---------------------------------------------------------------------------
+# Round 3: set_extension reports the visible flip (finding 6)
+# ---------------------------------------------------------------------------
+
+
+def test_same_dates_with_hidden_extension_report_the_visible_change(monkeypatch) -> None:
+    """Q3/ext_visible.py: the override had visible=false; re-applying the same
+    due date said "changed nothing itself" while visible became true."""
+    srv = ExtensionServer({"3": {"due_date": _abs("2026-10-03T06:59:00Z"), "visible": False}})
+    _use(monkeypatch, extensions, srv.session)
+    args = {"course_id": "1", "assignment_id": "2", "user_id": "3", "due_date": "2026-10-02T23:59"}
+
+    preview = _call_tool("tool_set_extension", args)
+    text = _call_tool("tool_set_extension", {**args, "confirm_write": True})
+
+    assert "- visible: false → true (visible=true is always sent)" in preview
+    assert "already has every requested date" not in preview
+    assert "re-sends the same values" not in preview
+    assert text.startswith("✅")
+    assert "- visible: false → true (visible=true is always sent)" in text
+    assert "changed nothing itself" not in text
+    assert srv.posted[0]["override"]["settings"]["visible"] is True
+
+
+def test_same_dates_with_visible_extension_still_say_nothing_changes(monkeypatch) -> None:
+    srv = ExtensionServer({"3": {"due_date": _abs("2026-10-03T06:59:00Z"), "visible": True}})
+    _use(monkeypatch, extensions, srv.session)
+
+    preview = extensions.set_extension("1", "2", "3", due_date="2026-10-02T23:59")
+    text = extensions.set_extension("1", "2", "3", due_date="2026-10-02T23:59", confirm_write=True)
+
+    assert "visible: " not in preview
+    assert "already has every requested date and visible=true; confirming re-sends" in preview
+    assert "already had every requested date and visible=true when this call read it" in text
+
+
+def test_read_back_with_visible_still_false_is_flagged(monkeypatch) -> None:
+    srv = ExtensionServer({"3": {"due_date": _abs("2026-10-03T06:59:00Z"), "visible": False}})
+    store = srv._post
+
+    def post_but_stay_hidden(url, kwargs):
+        response = store(url, kwargs)
+        srv.overrides["3"]["visible"] = False
+        return response
+
+    srv.session.routes[1] = ("POST", "/assignments/2/extensions", post_but_stay_hidden)
+    _use(monkeypatch, extensions, srv.session)
+
+    text = extensions.set_extension("1", "2", "3", due_date="2026-10-04T23:59", confirm_write=True)
+
+    assert text.startswith("⚠️")
+    assert "- visible: sent true, extensions page shows false" in text
+
+
+# ---------------------------------------------------------------------------
+# Round 3: a timezone argument can't override the course timezone (finding 8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.parametrize(
+    "date", ["2026-10-05T23:59", "2026-10-05T23:59-04:00"], ids=["naive", "offset"]
+)
+def test_timezone_that_conflicts_with_the_course_timezone_is_refused(monkeypatch, confirm, date) -> None:
+    """Q3/ext_tzarg.py: timezone=America/New_York silently won over the course's
+    America/Los_Angeles (the docs said it was used only when none is reported)."""
+    srv = ExtensionServer({"3": {"due_date": _abs("2026-10-03T06:59:00Z")}})
+    _use(monkeypatch, extensions, srv.session)
+
+    text, is_error = _call_tool_flagged("tool_set_extension", {
+        "course_id": "1", "assignment_id": "2", "user_id": "3", "late_due_date": date,
+        "timezone": "America/New_York", "confirm_write": confirm,
+    })
+
+    assert is_error
+    assert text.startswith(
+        "Error: timezone='America/New_York' differs from the course timezone "
+        "Gradescope reports (America/Los_Angeles)."
+    )
+    assert "Nothing was changed." in text
+    assert srv.posted == []
+
+
+def test_timezone_matching_the_course_timezone_is_accepted(monkeypatch) -> None:
+    srv = ExtensionServer({"3": {"due_date": _abs("2026-10-03T06:59:00Z")}})
+    _use(monkeypatch, extensions, srv.session)
+
+    preview = extensions.set_extension(
+        "1", "2", "3", late_due_date="2026-10-05T23:59", timezone="America/Los_Angeles"
+    )
+
+    assert "Write confirmation required" in preview
+    assert "= 2026-10-06T06:59:00Z" in preview
+    assert (
+        "Timezone for dates without an offset: America/Los_Angeles (timezone "
+        "argument, the course timezone Gradescope reports)" in preview
+    )
+    assert "⚠️" not in preview
+
+
+def test_timezone_argument_stands_in_when_no_course_timezone_is_reported(monkeypatch) -> None:
+    srv = ExtensionServer(overrides={}, timezone=None)
+    _use(monkeypatch, extensions, srv.session)
+
+    preview = extensions.set_extension("1", "2", "3", due_date="2026-10-01T23:59", timezone="America/New_York")
+
+    assert "= 2026-10-02T03:59:00Z" in preview
+    assert "(timezone argument; Gradescope reports no course timezone)" in preview

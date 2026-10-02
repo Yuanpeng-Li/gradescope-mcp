@@ -446,17 +446,20 @@ def set_extension(
     """Add or update an extension for a student on an assignment.
 
     Dates without a UTC offset are wall-clock times in the course's
-    timezone, read from Gradescope's extensions page (or given with
-    ``timezone``); dates with an offset (``Z``, ``-07:00``) are absolute.
-    Never the MCP host's timezone. Gradescope stores each date as a UTC
-    instant: the preview shows the resolved instant.
+    timezone, read from Gradescope's extensions page; ``timezone`` supplies
+    it when Gradescope reports none and is refused when it differs from the
+    one Gradescope reports. Dates with an offset (``Z``, ``-07:00``) are
+    absolute. Never the MCP host's timezone. Gradescope stores each date as
+    a UTC instant: the preview shows the resolved instant.
 
     The student's whole override is sent: the dates passed, every other
     current setting (other dates, a time limit, ...) re-sent unchanged, and
     ``visible=true``. The preview lists all of it, so it needs the
-    extensions page to be readable. After writing, the extension is read
-    back and any setting Gradescope changed or dropped is reported.
-    Confirmed changes to the same student's extension run one at a time.
+    extensions page to be readable; a stored visible that is not true is
+    reported as changing (``visible: false → true``) in preview and result.
+    After writing, the extension is read back and any setting Gradescope
+    changed or dropped is reported. Confirmed changes to the same student's
+    extension run one at a time.
 
     Args:
         course_id: The Gradescope course ID.
@@ -467,8 +470,9 @@ def set_extension(
         late_due_date: Extension late due date (YYYY-MM-DDTHH:MM, optional UTC offset), or None/"".
         confirm_write: Must be True to perform the update.
         timezone: IANA timezone (e.g. "America/New_York") for dates without
-            an offset. Defaults to the course timezone Gradescope reports;
-            needed when it reports none.
+            an offset. Needed only when Gradescope reports no course
+            timezone; if given, it must be the course timezone Gradescope
+            reports, or the call is an Error.
     """
     if not all([course_id, assignment_id, user_id]):
         return "Error: course_id, assignment_id, and user_id are all required."
@@ -557,14 +561,27 @@ def _apply_extension(
         )
 
     course_zone, zone_problem = _course_zone(page)
+    # Dates without an offset are course-local, so a timezone argument may
+    # only stand in for a course timezone Gradescope doesn't report.
+    if zone_arg is not None and course_zone is not None and zone_arg.key != course_zone.key:
+        return (
+            f"Error: timezone='{zone_arg.key}' differs from the course timezone "
+            f"Gradescope reports ({course_zone.key}). Dates without an offset are "
+            "wall-clock times in the course timezone: omit timezone (or pass "
+            f"'{course_zone.key}'), or give the dates with a UTC offset. Nothing "
+            "was changed."
+        )
     zone = zone_arg or course_zone
     # Stored values without an offset are in the course's timezone.
     stored_zone = course_zone or zone_arg
     zone_note = ""
     if zone_arg is not None:
-        zone_note = f"Timezone for dates without an offset: {zone_arg.key} (timezone argument)"
-        if course_zone is not None and course_zone.key != zone_arg.key:
-            zone_note += f". ⚠️ Gradescope reports the course timezone as {course_zone.key}"
+        source = (
+            "timezone argument, the course timezone Gradescope reports"
+            if course_zone is not None
+            else "timezone argument; Gradescope reports no course timezone"
+        )
+        zone_note = f"Timezone for dates without an offset: {zone_arg.key} ({source})"
     elif course_zone is not None:
         zone_note = (
             f"Timezone for dates without an offset: {course_zone.key} (course "
@@ -605,18 +622,30 @@ def _apply_extension(
         for key, entry in (current or {}).items()
         if key not in sent_keys and key != _VISIBLE_KEY
     }
+    # visible=true is always sent, so a stored visible other than true flips.
+    visible_before = None
+    visible_note = ""
+    if current is not None and _VISIBLE_KEY in current:
+        if _setting_text(current[_VISIBLE_KEY]) != "true":
+            visible_before = _setting_text(current[_VISIBLE_KEY])
+        else:
+            visible_note = " and visible=true"
 
-    def date_lines(preview: bool) -> tuple[list[str], bool]:
+    def change_lines(preview: bool) -> tuple[list[str], bool]:
+        """(One line per requested date and a visible flip, whether all were already set)."""
         lines, unchanged = [], True
         for arg, value in resolved:
             note, same = _date_change(arg, value, current, zone, stored_zone, preview)
             unchanged = unchanged and same
             separator = ": " if preview else " → "
             lines.append(f"{arg}{separator}{_describe_instant(value, zone)} {note}")
+        if visible_before is not None:
+            lines.append(f"visible: {visible_before} → true (visible=true is always sent)")
+            unchanged = False
         return lines, unchanged
 
     if not confirm_write:
-        lines, unchanged = date_lines(preview=True)
+        lines, unchanged = change_lines(preview=True)
         details = header + lines
         if zone_note:
             details.append(zone_note)
@@ -628,8 +657,8 @@ def _apply_extension(
         )
         if unchanged:
             details.append(
-                "The extension already has every requested date; confirming "
-                "re-sends the same values."
+                f"The extension already has every requested date{visible_note}; "
+                "confirming re-sends the same values."
             )
         return write_confirmation_required("set_extension", details)
 
@@ -654,17 +683,17 @@ def _apply_extension(
             "permissions and verify the user ID."
         )
 
-    lines, unchanged = date_lines(preview=False)
+    lines, unchanged = change_lines(preview=False)
     summary = "\n".join(f"- {line}" for line in lines)
     if kept:
         summary += f"\n- Kept unchanged: {_describe_sent(kept)}"
     if unchanged:
         # E.g. a call re-run after its first write went through.
         summary += (
-            "\nThe extension already had every requested date when this call "
-            "read it, so this write changed nothing itself (an earlier attempt "
-            "of the same change, e.g. one interrupted by a session expiry, may "
-            "have applied it)."
+            f"\nThe extension already had every requested date{visible_note} "
+            "when this call read it, so this write changed nothing itself (an "
+            "earlier attempt of the same change, e.g. one interrupted by a "
+            "session expiry, may have applied it)."
         )
     target = f"user `{user_id}` on assignment `{assignment_id}`"
     try:
@@ -703,6 +732,11 @@ def _apply_extension(
                 f"- {name}: was {_setting_text(entry)}, re-sent unchanged, but the "
                 f"extensions page now shows {_setting_text(stored[key])} (changed)"
             )
+    if _VISIBLE_KEY in stored and _setting_text(stored[_VISIBLE_KEY]) != "true":
+        differences.append(
+            f"- visible: sent true, extensions page shows "
+            f"{_setting_text(stored[_VISIBLE_KEY])}"
+        )
     if differences:
         return (
             f"⚠️ Extension for {target} was submitted (HTTP 200), but the "

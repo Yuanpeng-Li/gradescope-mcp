@@ -519,22 +519,24 @@ def tool_set_extension(
     """Add or update an extension for a student on an assignment.
 
     Dates are YYYY-MM-DDTHH:MM with an explicit time. Without a UTC offset
-    they are wall-clock times in the course timezone (read from Gradescope's
-    extensions page, or the ``timezone`` argument when Gradescope reports
-    none), never the server's timezone. With an offset (``Z``, ``-07:00``)
-    they are absolute. Don't mix the two styles. At least one date is
-    required and they must be in order: release_date <= due_date <=
-    late_due_date.
+    they are wall-clock times in the course timezone that Gradescope reports
+    on the extensions page, never the server's timezone. The ``timezone``
+    argument is needed only when Gradescope reports no course timezone; a
+    ``timezone`` that differs from the reported one is an Error and nothing
+    is sent. With an offset (``Z``, ``-07:00``) dates are absolute. Don't
+    mix the two styles. At least one date is required and they must be in
+    order: release_date <= due_date <= late_due_date.
 
     The student's whole extension is sent: the dates passed, every other
     current setting (other dates, a time limit, ...) re-sent unchanged, and
     visible=true. The preview lists all of it with each date's resolved UTC
     instant, and fails (Error / Authentication error) when the extensions
-    page or login is unavailable. After writing, the extension is read back and any setting
-    Gradescope dropped or changed is reported (⚠️). Confirmed changes to
-    one student's extension run one at a time (a call waits up to 300 s
-    for another one, then returns an Error). Requires instructor or TA
-    access.
+    page or login is unavailable. If the student's current extension has
+    visible=false, preview and result say so (``visible: false → true``).
+    After writing, the extension is read back and any setting Gradescope
+    dropped or changed is reported (⚠️). Confirmed changes to one student's
+    extension run one at a time (a call waits up to 300 s for another one,
+    then returns an Error). Requires instructor or TA access.
 
     Args:
         course_id: The Gradescope course ID.
@@ -548,8 +550,10 @@ def tool_set_extension(
             returns a preview and changes nothing. Setting it is not user
             approval: show the preview to the user first.
         timezone: IANA timezone (e.g. "America/New_York") for dates without
-            an offset. Defaults to the course timezone Gradescope reports;
-            needed when it reports none (e.g. no extensions exist yet).
+            an offset, needed only when Gradescope reports no course
+            timezone (e.g. no extensions exist yet). If given, it must be
+            the course timezone Gradescope reports; otherwise the call is
+            an Error.
     """
     return set_extension(
         course_id,

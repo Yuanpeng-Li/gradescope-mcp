@@ -281,9 +281,11 @@ submission is already graded) and repeats that call with
   date can be passed to `tool_set_extension`. When the course timezone is
   unknown, the line says so and dates are shown as stored.
 - `tool_set_extension`: dates without an offset are wall-clock times in the
-  course timezone Gradescope reports on the extensions page (or the
-  `timezone` argument, an IANA name, when Gradescope reports none), never
-  the server's timezone. Dates with an offset (`Z`, `-07:00`) are absolute.
+  course timezone Gradescope reports on the extensions page, never the
+  server's timezone. The `timezone` argument (an IANA name) is needed only
+  when Gradescope reports no course timezone; if it is given and differs
+  from the timezone Gradescope reports, the call is an `Error` naming both
+  and nothing is sent. Dates with an offset (`Z`, `-07:00`) are absolute.
   Don't mix the two styles. Dates must be in order (release <= due <= late
   due), including dates kept from the current extension.
 - `tool_set_extension` sends the student's whole extension: the requested
@@ -292,7 +294,9 @@ submission is already graded) and repeats that call with
   always sent. Existing dates don't need to be passed again. The preview
   lists every current and outgoing setting with each date's resolved UTC
   instant; preview and write return an error when the extensions page or
-  the login is unavailable. After writing, the extension is read back and
+  the login is unavailable. When the current extension has `visible=false`,
+  preview and result list `visible: false → true` instead of saying that
+  the write changes nothing. After writing, the extension is read back and
   any setting Gradescope removed or changed is reported (⚠️).
 - Confirmed date changes to one assignment, and confirmed extension changes
   for one student, run one at a time within the server process. A call
