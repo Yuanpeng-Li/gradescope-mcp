@@ -23,7 +23,33 @@ def test_upload_submission_requires_confirm(tmp_path: Path) -> None:
     assert "confirm_write=True" in result
 
 
-def test_modify_assignment_dates_requires_confirm() -> None:
+class _ReadOnlySession:
+    """Serves one GET page; any POST fails the test."""
+
+    def __init__(self, page: str) -> None:
+        self.page = page
+
+    def get(self, url, **_kwargs):
+        return SimpleNamespace(status_code=200, text=self.page, url=url)
+
+    def post(self, *_args, **_kwargs):
+        raise AssertionError("a preview must not write")
+
+
+def _read_only_conn(page: str) -> SimpleNamespace:
+    return SimpleNamespace(session=_ReadOnlySession(page), gradescope_base_url="https://x")
+
+
+def test_modify_assignment_dates_requires_confirm(monkeypatch) -> None:
+    form = (
+        '<form><input name="authenticity_token" value="T">'
+        '<input name="assignment[release_date_string]" value="2026-03-01T00:00">'
+        '<input name="assignment[due_date_string]" value="2026-03-19T12:00">'
+        '<input type="checkbox" name="assignment[allow_late_submissions]" value="1">'
+        '<input name="assignment[hard_due_date_string]" value=""></form>'
+    )
+    monkeypatch.setattr(assignments, "get_connection", lambda: _read_only_conn(form))
+
     result = assignments.modify_assignment_dates(
         "1",
         "2",
@@ -35,7 +61,25 @@ def test_modify_assignment_dates_requires_confirm() -> None:
     assert "due_date=2026-03-20T12:00" in result
 
 
-def test_set_extension_requires_confirm() -> None:
+def test_modify_assignment_dates_preview_fails_without_login() -> None:
+    # No credentials: the preview can't list the values that will be sent.
+    result = assignments.modify_assignment_dates("1", "2", due_date="2026-03-20T12:00")
+
+    assert result.startswith("Authentication error:")
+
+
+def test_set_extension_requires_confirm(monkeypatch) -> None:
+    props = {
+        "override": {"user_id": 9, "settings": {}},
+        "timezone": {"identifier": "America/New_York"},
+    }
+    page = (
+        '<table class="table js-overridesTable"><tbody><tr><td>'
+        '<div data-react-class="EditExtension" data-react-props="'
+        f'{html.escape(json.dumps(props))}"></div></td></tr></tbody></table>'
+    )
+    monkeypatch.setattr(extensions, "get_connection", lambda: _read_only_conn(page))
+
     result = extensions.set_extension(
         "1",
         "2",
@@ -46,6 +90,12 @@ def test_set_extension_requires_confirm() -> None:
     assert "Write confirmation required" in result
     assert "set_extension" in result
     assert "user_id=`3`" in result
+
+
+def test_set_extension_preview_fails_without_login() -> None:
+    result = extensions.set_extension("1", "2", "3", due_date="2026-03-20T12:00")
+
+    assert result.startswith("Authentication error:")
 
 
 def test_apply_grade_requires_confirm(monkeypatch) -> None:

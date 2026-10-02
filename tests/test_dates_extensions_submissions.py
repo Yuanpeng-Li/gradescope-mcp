@@ -5,10 +5,12 @@ Every HTTP call is served by in-memory fakes; nothing touches the network.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import html
 import json
 import os
+import threading
 import time
 from types import SimpleNamespace
 
@@ -27,12 +29,13 @@ from gradescope_mcp.tools import assignments, courses, extensions, submissions
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, text="", headers=None, json_data=None):
+    def __init__(self, status_code=200, text="", headers=None, json_data=None, url=""):
         self.status_code = status_code
         self.text = text
         self.content = text.encode()
         self.headers = headers if headers is not None else {"Content-Type": "text/html; charset=utf-8"}
         self._json = json_data
+        self.url = url
 
     def json(self):
         if self._json is not None:
@@ -73,6 +76,12 @@ def _call_tool(name: str, args: dict) -> str:
     return result.content[0].text
 
 
+def _call_tool_flagged(name: str, args: dict) -> tuple[str, bool]:
+    """(text, whether the MCP result is flagged isError)."""
+    result = anyio.run(server.mcp.call_tool, name, args)
+    return result.content[0].text, bool(result.is_error)
+
+
 def _no_connection():
     raise AssertionError("must not contact Gradescope")
 
@@ -97,7 +106,11 @@ def _edit_form(release, due, late, allow_late) -> str:
 
 
 class DateServer:
-    """Fake assignment settings form; applies POSTed fields when ``apply``."""
+    """Fake assignment settings form; applies POSTed fields when ``apply``.
+
+    ``get_hook`` (if set) runs after each form read is served, outside the
+    lock, so tests can make concurrent reads overlap.
+    """
 
     def __init__(self, *, release="2026-09-01T00:00", due="2026-10-01T23:59",
                  late="2026-10-04T23:59", allow_late=True, apply=True,
@@ -109,23 +122,32 @@ class DateServer:
         self.post_text = post_text
         self.edit_html = edit_html
         self.posted: dict | None = None
+        self.posts: list[dict] = []
+        self.get_hook = None
+        self.lock = threading.Lock()
         self.session = FakeSession([
             ("GET", "/assignments/2/edit", self._get_edit),
             ("POST", "/courses/1/assignments/2", self._post),
         ])
 
     def _get_edit(self, _url, _kwargs):
-        return FakeResponse(text=self.edit_html or _edit_form(**self.state))
+        with self.lock:
+            page = self.edit_html or _edit_form(**self.state)
+        if self.get_hook is not None:
+            self.get_hook()
+        return FakeResponse(text=page)
 
     def _post(self, _url, kwargs):
-        self.posted = {name: value for name, (_filename, value) in kwargs["files"]}
-        if self.apply and self.post_status < 400:
-            self.state = {
-                "release": self.posted["assignment[release_date_string]"],
-                "due": self.posted["assignment[due_date_string]"],
-                "late": self.posted["assignment[hard_due_date_string]"],
-                "allow_late": self.posted["assignment[allow_late_submissions]"] == "1",
-            }
+        with self.lock:
+            self.posted = {name: value for name, (_filename, value) in kwargs["files"]}
+            self.posts.append(self.posted)
+            if self.apply and self.post_status < 400:
+                self.state = {
+                    "release": self.posted["assignment[release_date_string]"],
+                    "due": self.posted["assignment[due_date_string]"],
+                    "late": self.posted["assignment[hard_due_date_string]"],
+                    "allow_late": self.posted["assignment[allow_late_submissions]"] == "1",
+                }
         return FakeResponse(self.post_status, self.post_text)
 
 
@@ -294,16 +316,17 @@ def test_modify_dates_empty_string_means_unchanged(monkeypatch) -> None:
     assert srv.posted["assignment[hard_due_date_string]"] == "2026-10-04T23:59"
 
 
-def test_modify_dates_preview_without_session_says_it_is_incomplete(monkeypatch) -> None:
+def test_modify_dates_preview_without_session_is_an_error(monkeypatch) -> None:
+    """R2-13: a request-only preview claimed omitted settings stay unchanged,
+    although a late_due_date turns late submissions on."""
     def no_login():
         raise AuthError("Missing Gradescope credentials.")
 
     monkeypatch.setattr(assignments, "get_connection", no_login)
 
-    preview = assignments.modify_assignment_dates("1", "2", due_date="2026-10-02T23:59")
-    assert "Write confirmation required" in preview
-    assert "due_date=2026-10-02T23:59" in preview
-    assert "could not be read" in preview
+    preview = assignments.modify_assignment_dates("1", "2", late_due_date="2026-10-08T23:59")
+    assert preview.startswith("Authentication error:")
+    assert "Write confirmation required" not in preview
 
     write = assignments.modify_assignment_dates(
         "1", "2", due_date="2026-10-02T23:59", confirm_write=True
@@ -341,13 +364,15 @@ def test_rename_reports_invalid_title_only_for_invalid_title(monkeypatch) -> Non
 # ---------------------------------------------------------------------------
 
 
-def _extensions_page(overrides: dict, timezone: str | None = "America/Los_Angeles") -> str:
+def _extensions_page(
+    overrides: dict, timezone: str | None = "America/Los_Angeles", names: dict | None = None
+) -> str:
     rows = []
     for user_id, settings in overrides.items():
         props = {
             "override": {"user_id": int(user_id), "settings": settings},
             "deletePath": f"/x/{user_id}",
-            "studentName": "Student",
+            "studentName": (names or {}).get(user_id, "Student"),
         }
         if timezone:
             props["timezone"] = {"identifier": timezone}
@@ -359,28 +384,45 @@ def _extensions_page(overrides: dict, timezone: str | None = "America/Los_Angele
 
 
 class ExtensionServer:
-    """Fake extensions page; stores POSTed overrides the way they were sent."""
+    """Fake extensions page; stores POSTed overrides the way they were sent.
 
-    def __init__(self, overrides=None, timezone="America/Los_Angeles", store=True):
-        self.overrides = dict(overrides or {})
+    A POST replaces the student's override (minus ``visible`` and any
+    ``drop_keys``) when ``store``; ``get_hook`` runs after each page read.
+    """
+
+    def __init__(self, overrides=None, timezone="America/Los_Angeles", store=True,
+                 drop_keys=(), post_status=200):
+        self.overrides = {k: dict(v) for k, v in (overrides or {}).items()}
         self.timezone = timezone
         self.store = store
+        self.drop_keys = set(drop_keys)
+        self.post_status = post_status
         self.posted: list[dict] = []
+        self.get_hook = None
+        self.lock = threading.Lock()
         self.session = FakeSession([
             ("GET", "/assignments/2/extensions", self._get),
             ("POST", "/assignments/2/extensions", self._post),
         ])
 
     def _get(self, _url, _kwargs):
-        return FakeResponse(text=_extensions_page(self.overrides, self.timezone))
+        with self.lock:
+            page = _extensions_page(self.overrides, self.timezone)
+        if self.get_hook is not None:
+            self.get_hook()
+        return FakeResponse(text=page)
 
     def _post(self, _url, kwargs):
         body = kwargs["json"]
-        self.posted.append(body)
-        if self.store:
-            settings = {k: v for k, v in body["override"]["settings"].items() if k != "visible"}
-            self.overrides[str(body["override"]["user_id"])] = settings
-        return FakeResponse(200, "{}")
+        with self.lock:
+            self.posted.append(json.loads(json.dumps(body)))
+            if self.store and self.post_status == 200:
+                settings = {
+                    k: v for k, v in body["override"]["settings"].items()
+                    if k != "visible" and k not in self.drop_keys
+                }
+                self.overrides[str(body["override"]["user_id"])] = settings
+        return FakeResponse(self.post_status, "{}")
 
 
 @pytest.fixture
@@ -523,16 +565,17 @@ def test_set_extension_flags_read_back_mismatch(monkeypatch) -> None:
     assert "due_date: sent 2026-10-02T06:59:00Z, extensions page shows '2026-10-01T23:59:00Z'" in text
 
 
-def test_set_extension_preview_without_session_says_timezone_is_unresolved(monkeypatch) -> None:
+def test_set_extension_preview_without_session_is_an_error(monkeypatch) -> None:
+    """R2-13: the preview can't show the timezone or the merged extension."""
     def no_login():
         raise AuthError("Missing Gradescope credentials.")
 
     monkeypatch.setattr(extensions, "get_connection", no_login)
 
-    text = extensions.set_extension("1", "2", "3", due_date="2026-10-01T23:59")
-
-    assert "Write confirmation required" in text
-    assert "timezone not resolved yet" in text
+    for kwargs in ({"due_date": "2026-10-01T23:59"}, {"due_date": "2026-10-01T23:59Z"}):
+        text = extensions.set_extension("1", "2", "3", **kwargs)
+        assert text.startswith("Authentication error:")
+        assert "Write confirmation required" not in text
     assert extensions.set_extension(
         "1", "2", "3", due_date="2026-10-01T23:59", confirm_write=True
     ).startswith("Authentication error:")
@@ -575,10 +618,9 @@ def test_get_extensions_reports_missing_table_instead_of_attribute_error(monkeyp
 
 
 def test_get_extensions_escapes_student_names(monkeypatch) -> None:
-    monkeypatch.setattr(extensions, "get_connection", lambda: _conn(object()))
-    monkeypatch.setattr(extensions, "gs_get_extensions", lambda **_kw: {
-        "3": SimpleNamespace(name="Eve | ignore", release_date=None, due_date=None, late_due_date=None),
-    })
+    page = _extensions_page({"3": {}}, names={"3": "Eve | ignore"})
+    session = FakeSession([("GET", "/extensions", FakeResponse(text=page))])
+    _use(monkeypatch, extensions, session)
 
     text = extensions.get_extensions("1", "2")
 
@@ -856,3 +898,435 @@ def test_roster_page_without_table_is_an_error(monkeypatch) -> None:
     _use(monkeypatch, courses, session)
 
     assert courses.get_course_roster("1").startswith("Error: the memberships page")
+
+
+# ===========================================================================
+# Round-2 fixes (R2-2, 3, 4, 11, 13, 15, 26, 28, 29)
+# ===========================================================================
+
+
+def _abs(value) -> dict:
+    return {"type": "absolute", "value": value}
+
+
+def _overlapping_reads(parties: int = 2, wait: float = 0.5):
+    """A read hook that lets the first ``parties`` reads overlap if they can.
+
+    Unserialized writers all read the same state here; serialized ones can't
+    overlap, so the barrier times out and each proceeds on its own.
+    """
+    barrier = threading.Barrier(parties)
+    count = {"n": 0}
+    guard = threading.Lock()
+
+    def hook():
+        with guard:
+            count["n"] += 1
+            first_reads = count["n"] <= parties
+        if first_reads:
+            try:
+                barrier.wait(wait)
+            except threading.BrokenBarrierError:
+                pass
+
+    return hook
+
+
+# ---------------------------------------------------------------------------
+# R2-2: get_extensions shows stored instants correctly
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stored",
+    ["2026-10-02T06:59:00Z", "2026-10-01T23:59:00-07:00", "2026-10-01T23:59:00"],
+)
+def test_get_extensions_converts_stored_values_to_course_time(monkeypatch, stored) -> None:
+    """A UTC value used to be shown as '2026-10-02 06:59 PDT' (offset dropped)."""
+    srv = ExtensionServer({"3": {"due_date": _abs(stored)}})
+    _use(monkeypatch, extensions, srv.session)
+
+    text, is_error = _call_tool_flagged("tool_get_extensions", {"course_id": "1", "assignment_id": "2"})
+
+    assert not is_error
+    row = next(line for line in text.splitlines() if line.startswith("| `3`"))
+    assert "| 2026-10-01 23:59 PDT = 2026-10-02T06:59:00Z |" in row
+    assert "06:59 PDT" not in text
+    assert "course-local wall-clock times (America/Los_Angeles)" in text
+
+
+def test_get_extensions_lists_other_settings(monkeypatch) -> None:
+    srv = ExtensionServer({"3": {"time_limit": _abs(135), "due_date": _abs("2026-10-02T06:59:00Z")}})
+    _use(monkeypatch, extensions, srv.session)
+
+    text = extensions.get_extensions("1", "2")
+
+    assert "Other Settings" in text
+    assert "| time_limit=135 |" in text
+
+
+def test_get_extensions_shown_time_round_trips_through_set_extension(monkeypatch) -> None:
+    """The manage_extensions_workflow chain: keep the date get_extensions shows."""
+    srv = ExtensionServer({"3": {"due_date": _abs("2026-10-02T06:59:00Z")}})
+    _use(monkeypatch, extensions, srv.session)
+
+    listing = extensions.get_extensions("1", "2")
+    row = next(line for line in listing.splitlines() if line.startswith("| `3`"))
+    shown_due = row.split("|")[4].strip()
+    keep_due = shown_due[:16].replace(" ", "T")
+
+    text = extensions.set_extension(
+        "1", "2", "3", due_date=keep_due, late_due_date="2026-10-03T23:59", confirm_write=True
+    )
+
+    assert text.startswith("✅")
+    assert srv.overrides["3"]["due_date"]["value"] == "2026-10-02T06:59:00Z"
+    assert "(already set before this write)" in text
+
+
+def test_get_extensions_without_a_single_timezone_shows_stored_values(monkeypatch) -> None:
+    first = _extensions_page({"3": {"due_date": _abs("2026-10-02T06:59:00Z")}}, "America/Los_Angeles")
+    second = _extensions_page({"4": {"due_date": _abs("2026-10-01T23:59:00")}}, "America/New_York")
+    # One table whose two rows report different timezones.
+    page = first.replace("</tbody>", second.split("<tbody>")[1].split("</tbody>")[0] + "</tbody>")
+    session = FakeSession([("GET", "/extensions", FakeResponse(text=page))])
+    _use(monkeypatch, extensions, session)
+
+    text = extensions.get_extensions("1", "2")
+
+    assert "course timezone is unknown" in text
+    assert "| 2026-10-02T06:59:00Z |" in text
+    assert "2026-10-01T23:59:00 (course-local; timezone unknown)" in text
+
+
+# ---------------------------------------------------------------------------
+# R2-3: set_extension keeps the student's other settings
+# ---------------------------------------------------------------------------
+
+
+def test_set_extension_resends_existing_settings_under_replace_semantics(monkeypatch) -> None:
+    """An extended due date and a time limit used to vanish when only a late
+    due date was added, and the tool still said ✅."""
+    srv = ExtensionServer({"3": {"due_date": _abs("2026-10-03T06:59:00Z"), "time_limit": _abs(135)}})
+    _use(monkeypatch, extensions, srv.session)
+
+    text, is_error = _call_tool_flagged("tool_set_extension", {
+        "course_id": "1", "assignment_id": "2", "user_id": "3",
+        "late_due_date": "2026-10-05T23:59", "confirm_write": True,
+    })
+
+    sent = srv.posted[0]["override"]["settings"]
+    assert sent["due_date"] == _abs("2026-10-03T06:59:00Z")
+    assert sent["time_limit"] == _abs(135)
+    assert sent["hard_due_date"] == _abs("2026-10-06T06:59:00Z")
+    assert sent["visible"] is True
+    assert srv.overrides["3"]["due_date"] == _abs("2026-10-03T06:59:00Z")
+    assert text.startswith("✅") and not is_error
+    assert "Kept unchanged: due_date=2026-10-03T06:59:00Z, time_limit=135" in text
+
+
+def test_set_extension_preview_lists_all_current_settings_and_visible(monkeypatch) -> None:
+    srv = ExtensionServer({"3": {
+        "due_date": _abs("2026-10-03T06:59:00Z"), "time_limit": _abs(135), "visible": False,
+    }})
+    _use(monkeypatch, extensions, srv.session)
+
+    text = extensions.set_extension("1", "2", "3", due_date="2026-10-03T23:59")
+
+    assert "Write confirmation required" in text
+    assert "time_limit=135" in text
+    assert "visible=false" in text  # the current value
+    assert (
+        "the student's whole extension is sent: due_date=2026-10-04T06:59:00Z, "
+        "time_limit=135, visible=true." in text
+    )
+    assert "visible=true is always sent" in text
+    assert "(currently 2026-10-02 23:59 America/Los_Angeles (PDT) = 2026-10-03T06:59:00Z)" in text
+    assert "Only the dates above are sent" not in text
+    assert srv.posted == []
+
+
+@pytest.mark.parametrize("dropped", ["time_limit", "due_date"])
+def test_set_extension_reports_settings_gradescope_dropped(monkeypatch, dropped) -> None:
+    srv = ExtensionServer(
+        {"3": {"due_date": _abs("2026-10-03T06:59:00Z"), "time_limit": _abs(135)}},
+        drop_keys=[dropped],
+    )
+    _use(monkeypatch, extensions, srv.session)
+
+    text = extensions.set_extension("1", "2", "3", late_due_date="2026-10-05T23:59", confirm_write=True)
+
+    assert text.startswith("⚠️")
+    assert f"- {dropped}: was " in text
+    assert "(removed)" in text
+
+
+def test_set_extension_reports_changed_kept_setting(monkeypatch) -> None:
+    srv = ExtensionServer({"3": {"time_limit": _abs(135)}})
+    _use(monkeypatch, extensions, srv.session)
+    original_post = srv._post
+
+    def post_and_alter(url, kwargs):
+        response = original_post(url, kwargs)
+        srv.overrides["3"]["time_limit"] = _abs(90)
+        return response
+
+    srv.session.routes[1] = ("POST", "/assignments/2/extensions", post_and_alter)
+
+    text = extensions.set_extension("1", "2", "3", due_date="2026-10-03T23:59", confirm_write=True)
+
+    assert text.startswith("⚠️")
+    assert "time_limit: was 135, re-sent unchanged, but the extensions page now shows 90 (changed)" in text
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        FakeResponse(text="<html><form action='/login'></form></html>"),
+        FakeResponse(500, "oops"),
+    ],
+)
+@pytest.mark.parametrize("confirm", [False, True])
+def test_set_extension_refuses_when_current_extension_is_unreadable(monkeypatch, response, confirm) -> None:
+    session = FakeSession([("GET", "/extensions", response)])
+    _use(monkeypatch, extensions, session)
+
+    text = extensions.set_extension(
+        "1", "2", "3", due_date="2026-10-03T23:59Z", confirm_write=confirm
+    )
+
+    assert text.startswith("Error: cannot read the extensions page")
+    assert "Nothing was changed" in text
+    assert session.methods() == ["GET"]
+
+
+def test_set_extension_checks_order_against_kept_dates(monkeypatch) -> None:
+    srv = ExtensionServer({"3": {"due_date": _abs("2026-10-03T06:59:00Z")}})
+    _use(monkeypatch, extensions, srv.session)
+
+    text = extensions.set_extension("1", "2", "3", late_due_date="2026-10-01T23:59", confirm_write=True)
+
+    assert text.startswith("Error: due_date")
+    assert "pass the conflicting one as well" in text
+    assert srv.posted == []
+
+
+def test_set_extension_reports_rejected_post(monkeypatch) -> None:
+    srv = ExtensionServer({}, post_status=422)
+    _use(monkeypatch, extensions, srv.session)
+
+    text, is_error = _call_tool_flagged("tool_set_extension", {
+        "course_id": "1", "assignment_id": "2", "user_id": "3",
+        "due_date": "2026-10-03T23:59Z", "confirm_write": True,
+    })
+
+    assert text.startswith("❌ Failed to set extension (HTTP 422)")
+    assert is_error
+
+
+# ---------------------------------------------------------------------------
+# R2-4: concurrent confirmed writes don't lose updates
+# ---------------------------------------------------------------------------
+
+
+def _run_threads(*targets) -> None:
+    threads = [threading.Thread(target=target) for target in targets]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+        assert not thread.is_alive()
+
+
+def test_concurrent_date_changes_on_one_assignment_both_survive(monkeypatch) -> None:
+    srv = DateServer()
+    srv.get_hook = _overlapping_reads()
+    _use(monkeypatch, assignments, srv.session)
+    out: dict[str, str] = {}
+
+    _run_threads(
+        lambda: out.__setitem__("a", assignments.modify_assignment_dates(
+            "1", "2", due_date="2026-10-02T23:59", confirm_write=True)),
+        lambda: out.__setitem__("b", assignments.modify_assignment_dates(
+            "1", "2", late_due_date="2026-10-08T23:59", confirm_write=True)),
+    )
+
+    assert out["a"].startswith("✅") and out["b"].startswith("✅")
+    assert srv.state["due"] == "2026-10-02T23:59"
+    assert srv.state["late"] == "2026-10-08T23:59"
+
+
+def test_concurrent_extension_changes_for_one_student_both_survive(monkeypatch) -> None:
+    srv = ExtensionServer({"9": {}})
+    srv.get_hook = _overlapping_reads()
+    _use(monkeypatch, extensions, srv.session)
+    out: dict[str, str] = {}
+
+    _run_threads(
+        lambda: out.__setitem__("a", extensions.set_extension(
+            "1", "2", "3", due_date="2026-10-03T23:59", confirm_write=True)),
+        lambda: out.__setitem__("b", extensions.set_extension(
+            "1", "2", "3", late_due_date="2026-10-05T23:59", confirm_write=True)),
+    )
+
+    assert out["a"].startswith("✅") and out["b"].startswith("✅")
+    assert srv.overrides["3"]["due_date"] == _abs("2026-10-04T06:59:00Z")
+    assert srv.overrides["3"]["hard_due_date"] == _abs("2026-10-06T06:59:00Z")
+
+
+def test_date_write_waits_for_a_running_write_and_gives_up(monkeypatch) -> None:
+    srv = DateServer()
+    _use(monkeypatch, assignments, srv.session)
+    monkeypatch.setattr(assignments, "_WRITE_LOCK_TIMEOUT", 0.05)
+
+    with assignments.serialized_write("assignment dates", "1", "2"):
+        text = assignments.modify_assignment_dates(
+            "1", "2", due_date="2026-10-02T23:59", confirm_write=True
+        )
+        # Previews don't take the lock.
+        preview = assignments.modify_assignment_dates("1", "2", due_date="2026-10-02T23:59")
+        # Other assignments are not blocked.
+        assert assignments.serialized_write("assignment dates", "1", "3") is not None
+
+    assert text.startswith("Error: another date change for assignment `2` is still running")
+    assert srv.posts == []
+    assert "Write confirmation required" in preview
+
+
+# ---------------------------------------------------------------------------
+# R2-13: previews fail when the current settings can't be read
+# ---------------------------------------------------------------------------
+
+
+def test_date_preview_auth_failure_is_an_mcp_error(monkeypatch) -> None:
+    def fail():
+        raise AuthError("Gradescope login failed: network error.")
+
+    monkeypatch.setattr(assignments, "get_connection", fail)
+    monkeypatch.setattr(extensions, "get_connection", fail)
+
+    text, is_error = _call_tool_flagged("tool_modify_assignment_dates", {
+        "course_id": "1", "assignment_id": "2", "late_due_date": "2026-10-08T23:59",
+    })
+    assert is_error and text.startswith("Authentication error:")
+    assert "late-submission setting unchanged" not in text
+
+    text, is_error = _call_tool_flagged("tool_set_extension", {
+        "course_id": "1", "assignment_id": "2", "user_id": "3", "due_date": "2026-10-08T23:59",
+    })
+    assert is_error and text.startswith("Authentication error:")
+
+
+# ---------------------------------------------------------------------------
+# R2-26: a write that finds its values already set doesn't say "unchanged"
+# ---------------------------------------------------------------------------
+
+
+def test_date_write_with_values_already_set_is_not_reported_as_unchanged(monkeypatch) -> None:
+    """The second run after a session expiry reads the already-updated form."""
+    srv = DateServer(due="2026-10-03T23:59")
+    _use(monkeypatch, assignments, srv.session)
+
+    preview = assignments.modify_assignment_dates("1", "2", due_date="2026-10-03T23:59")
+    assert "due_date=2026-10-03T23:59 (already the current value)" in preview
+    assert "confirming changes nothing" in preview
+
+    text = assignments.modify_assignment_dates(
+        "1", "2", due_date="2026-10-03T23:59", confirm_write=True
+    )
+
+    assert text.startswith("✅")
+    assert "due_date=2026-10-03T23:59 (already set before this write)" in text
+    assert "due_date=2026-10-03T23:59 (unchanged)" not in text
+    assert "release_date=2026-09-01T00:00 (unchanged)" in text
+    assert "an earlier attempt of the same change" in text
+
+
+def test_late_date_write_counts_the_late_flag_as_requested(monkeypatch) -> None:
+    srv = DateServer(late="2026-10-08T23:59", allow_late=True)
+    _use(monkeypatch, assignments, srv.session)
+
+    text = assignments.modify_assignment_dates(
+        "1", "2", late_due_date="2026-10-08T23:59", confirm_write=True
+    )
+
+    assert "allow_late_submissions=on (already set before this write)" in text
+    assert "late_due_date=2026-10-08T23:59 (already set before this write)" in text
+
+
+def test_partial_date_change_has_no_already_set_note(monkeypatch) -> None:
+    srv = DateServer()
+    _use(monkeypatch, assignments, srv.session)
+
+    text = assignments.modify_assignment_dates(
+        "1", "2", due_date="2026-10-01T23:59", late_due_date="2026-10-09T23:59",
+        confirm_write=True,
+    )
+
+    assert "due_date=2026-10-01T23:59 (already set before this write)" in text
+    assert "late_due_date=2026-10-09T23:59 (was 2026-10-04T23:59)" in text
+    assert "changed nothing itself" not in text
+
+
+def test_extension_write_with_values_already_set_says_so(monkeypatch) -> None:
+    srv = ExtensionServer({"3": {"due_date": _abs("2026-10-04T06:59:00Z")}})
+    _use(monkeypatch, extensions, srv.session)
+
+    text = extensions.set_extension("1", "2", "3", due_date="2026-10-03T23:59", confirm_write=True)
+
+    assert text.startswith("✅")
+    assert "(already set before this write)" in text
+    assert "an earlier attempt of the same change" in text
+
+
+# ---------------------------------------------------------------------------
+# R2-28 / R2-29: assignment details
+# ---------------------------------------------------------------------------
+
+
+def _assignment(assignment_id="5", **dates):
+    return SimpleNamespace(
+        assignment_id=assignment_id, name="HW", submissions_status=None, grade=None,
+        max_grade=None, release_date=dates.get("release"), due_date=dates.get("due"),
+        late_due_date=dates.get("late"),
+    )
+
+
+def _use_assignments(monkeypatch, items) -> None:
+    conn = SimpleNamespace(account=SimpleNamespace(get_assignments=lambda _cid: items))
+    monkeypatch.setattr(assignments, "get_connection", lambda: conn)
+
+
+def test_assignment_details_not_found_is_an_mcp_error(monkeypatch) -> None:
+    _use_assignments(monkeypatch, [_assignment()])
+
+    text, is_error = _call_tool_flagged("tool_get_assignment_details", {"course_id": "1", "assignment_id": "999"})
+
+    assert text == "Error: assignment `999` not found in course `1`."
+    assert is_error
+
+
+def test_assignment_dates_keep_their_utc_offset(monkeypatch) -> None:
+    utc = datetime.datetime(2026, 10, 2, 6, 59, tzinfo=datetime.timezone.utc)
+    pdt = datetime.datetime(2026, 10, 1, 23, 59, tzinfo=datetime.timezone(datetime.timedelta(hours=-7)))
+    ist = datetime.datetime(2026, 10, 2, 12, 29, tzinfo=datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
+    _use_assignments(monkeypatch, [_assignment(release=ist, due=utc, late=pdt)])
+
+    details = assignments.get_assignment_details("1", "5")
+    listing = assignments.get_assignments("1")
+
+    assert "- **Due Date:** 2026-10-02 06:59 UTC" in details
+    assert "- **Late Due Date:** 2026-10-01 23:59 UTC-07:00" in details
+    assert "- **Release Date:** 2026-10-02 12:29 UTC+05:30" in details
+    assert "modify_assignment_dates takes course-local wall-clock times" in details
+    assert "| 2026-10-02 06:59 UTC |" in listing
+    assert "modify_assignment_dates takes course-local wall-clock times" in listing
+
+
+def test_naive_assignment_dates_are_unchanged_and_have_no_note(monkeypatch) -> None:
+    _use_assignments(monkeypatch, [_assignment(due=datetime.datetime(2026, 10, 1, 23, 59))])
+
+    details = assignments.get_assignment_details("1", "5")
+
+    assert "- **Due Date:** 2026-10-01 23:59\n" in details
+    assert "UTC" not in details

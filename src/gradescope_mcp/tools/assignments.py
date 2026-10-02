@@ -1,7 +1,9 @@
 """Assignment-related MCP tools."""
 
+import contextlib
 import datetime
 import re
+import threading
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,11 +18,84 @@ from gradescope_mcp.auth import get_connection, AuthError
 from gradescope_mcp.tools.safety import write_confirmation_required
 
 
+def _format_utc_offset(offset: datetime.timedelta) -> str:
+    """``UTC`` for a zero offset, else e.g. ``UTC-07:00``."""
+    minutes = int(offset.total_seconds() // 60)
+    if minutes == 0:
+        return "UTC"
+    sign = "-" if minutes < 0 else "+"
+    hours, minutes = divmod(abs(minutes), 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
 def _format_datetime(dt: datetime.datetime | None) -> str:
-    """Format a datetime for display, handling None."""
+    """Format a datetime for display, handling None.
+
+    A timezone-aware value keeps its UTC offset (``2026-10-01 23:59
+    UTC-07:00``): Gradescope may report the same instant in UTC or in the
+    course's offset, and the wall-clock text alone would be ambiguous.
+    """
     if dt is None:
         return "N/A"
-    return dt.strftime("%Y-%m-%d %H:%M")
+    text = dt.strftime("%Y-%m-%d %H:%M")
+    offset = dt.utcoffset()
+    return text if offset is None else f"{text} {_format_utc_offset(offset)}"
+
+
+# Added below listings that show a date with a UTC offset.
+_DATE_OFFSET_NOTE = (
+    "_Dates are shown with the UTC offset Gradescope reported. "
+    "modify_assignment_dates takes course-local wall-clock times: convert "
+    "first, or read the current values from its preview, which shows them "
+    "in course-local time._"
+)
+
+
+def _has_offset(*values: datetime.datetime | None) -> bool:
+    return any(v is not None and v.utcoffset() is not None for v in values)
+
+
+# ---------------------------------------------------------------------------
+# Serialized writes (shared with extensions.py)
+# ---------------------------------------------------------------------------
+
+# How long a confirmed write waits for another write to the same object.
+_WRITE_LOCK_TIMEOUT = 300.0
+_write_locks: dict[tuple[str, ...], threading.Lock] = {}
+_write_locks_guard = threading.Lock()
+
+
+class WriteInProgressError(Exception):
+    """Another call is still writing the same Gradescope object."""
+
+
+@contextlib.contextmanager
+def serialized_write(*key: str):
+    """Hold a process-wide lock for one Gradescope object during a write.
+
+    The date and extension writes read the current settings, merge the
+    request into them and send everything back. mcp runs sync tools on
+    worker threads, so two approved calls on the same object could both
+    read the same state, and the later write would silently revert the
+    earlier one. Holding the lock across read, write and read-back makes
+    such calls run one after the other.
+
+    Raises:
+        WriteInProgressError: if another call holds the lock for longer than
+            ``_WRITE_LOCK_TIMEOUT`` seconds.
+    """
+    key = tuple(str(part) for part in key)
+    with _write_locks_guard:
+        lock = _write_locks.setdefault(key, threading.Lock())
+    if not lock.acquire(timeout=_WRITE_LOCK_TIMEOUT):
+        raise WriteInProgressError(
+            "another change to the same Gradescope settings is still running; "
+            "try again when it has finished."
+        )
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +209,8 @@ def check_date_order(
 def get_assignments(course_id: str) -> str:
     """Get all assignments for a specific course.
 
+    Dates Gradescope reports with a UTC offset are shown with it.
+
     Args:
         course_id: The Gradescope course ID.
     """
@@ -170,11 +247,15 @@ def get_assignments(course_id: str) -> str:
         )
 
     lines.append(f"\n**Total assignments:** {len(assignments)}")
+    if any(_has_offset(a.release_date, a.due_date, a.late_due_date) for a in assignments):
+        lines.append(_DATE_OFFSET_NOTE)
     return "\n".join(lines)
 
 
 def get_assignment_details(course_id: str, assignment_id: str) -> str:
     """Get detailed information about a specific assignment.
+
+    Dates Gradescope reports with a UTC offset are shown with it.
 
     Args:
         course_id: The Gradescope course ID.
@@ -199,7 +280,7 @@ def get_assignment_details(course_id: str, assignment_id: str) -> str:
             break
 
     if target is None:
-        return f"Assignment `{assignment_id}` not found in course `{course_id}`."
+        return f"Error: assignment `{assignment_id}` not found in course `{course_id}`."
 
     grade = "N/A" if target.grade is None else target.grade
     max_grade = "N/A" if target.max_grade is None else target.max_grade
@@ -213,6 +294,8 @@ def get_assignment_details(course_id: str, assignment_id: str) -> str:
         f"- **Submission Status:** {target.submissions_status or 'N/A'}",
         f"- **Grade:** {grade} / {max_grade}",
     ]
+    if _has_offset(target.release_date, target.due_date, target.late_due_date):
+        lines.append(f"\n{_DATE_OFFSET_NOTE}")
 
     return "\n".join(lines)
 
@@ -358,8 +441,32 @@ def _show_setting(value) -> str:
     return value or "(none)"
 
 
-def _describe_plan(plan: dict, before: dict | None, verb: str) -> list[str]:
-    """One line per form setting: the value sent and how it compares to ``before``."""
+def _requested_keys(requested: dict) -> frozenset[str]:
+    """Plan keys the caller asked to set (a late due date also sets the flag)."""
+    keys = {key for key, value in requested.items() if value is not None}
+    if "late" in keys:
+        keys.add("allow_late")
+    return frozenset(keys)
+
+
+def _already_set(plan: dict, before: dict, requested: frozenset[str]) -> bool:
+    """True when every requested value already had that value in ``before``."""
+    return all(before[key] == plan[key] for key in requested)
+
+
+def _describe_plan(
+    plan: dict,
+    before: dict | None,
+    verb: str,
+    requested: frozenset[str] = frozenset(),
+    already: str = "already the current value",
+) -> list[str]:
+    """One line per form setting: the value sent and how it compares to ``before``.
+
+    A requested value equal to ``before`` is labelled ``already`` rather than
+    "unchanged", so a write retried after it already went through doesn't
+    read as if nothing was changed.
+    """
 
     def line(name: str, key: str) -> str:
         text = f"{name}={_show_setting(plan[key])}"
@@ -368,7 +475,7 @@ def _describe_plan(plan: dict, before: dict | None, verb: str) -> list[str]:
         if before[key] is None:
             return f"{text} (current value unreadable)"
         if before[key] == plan[key]:
-            return f"{text} (unchanged)"
+            return f"{text} ({already if key in requested else 'unchanged'})"
         return f"{text} ({verb} {_show_setting(before[key])})"
 
     late = line("late_due_date", "late")
@@ -460,8 +567,11 @@ def modify_assignment_dates(
     update replaces all dates and the allow-late-submissions flag at once,
     so the current settings are read first and every omitted value is sent
     back unchanged. Supplying ``late_due_date`` turns late submissions on.
-    The preview lists every value that will be sent next to the current one;
-    after writing, the settings are read back and compared.
+    The preview lists every value that will be sent next to the current one
+    (so it fails when the settings can't be read); after writing, the
+    settings are read back and compared. Confirmed changes to the same
+    assignment run one at a time, so concurrent calls can't revert each
+    other.
 
     Args:
         course_id: The Gradescope course ID.
@@ -492,28 +602,32 @@ def modify_assignment_dates(
     if order_error:
         return f"Error: {order_error}"
 
+    if not confirm_write:
+        return _change_assignment_dates(course_id, assignment_id, requested, False)
+    try:
+        with serialized_write("assignment dates", course_id, assignment_id):
+            return _change_assignment_dates(course_id, assignment_id, requested, True)
+    except WriteInProgressError:
+        return (
+            f"Error: another date change for assignment `{assignment_id}` is "
+            "still running; try again when it has finished. Nothing was changed."
+        )
+
+
+def _change_assignment_dates(
+    course_id: str, assignment_id: str, requested: dict, confirm_write: bool
+) -> str:
+    """Read, plan and (with ``confirm_write``) write and verify a date change."""
     header = [f"course_id=`{course_id}`", f"assignment_id=`{assignment_id}`"]
+    requested_keys = _requested_keys(requested)
 
     try:
         conn = get_connection()
         current = _read_date_form(conn, course_id, assignment_id)
     except AuthError as e:
-        if confirm_write:
-            return f"Authentication error: {e}"
-        details = header + [
-            f"{label}={requested[key].strftime(_FORM_DATE_FORMAT)}"
-            for key, label, _ in _DATE_FORM_FIELDS
-            if requested[key] is not None
-        ]
-        details += [
-            _COURSE_LOCAL_NOTE,
-            f"⚠️ The current dates could not be read (Authentication error: "
-            f"{e}), so this preview cannot show the other values that will be "
-            "sent. With confirm_write=True the tool reads them first, keeps "
-            "every omitted date and the late-submission setting unchanged, "
-            "and refuses to write if it still cannot read them.",
-        ]
-        return write_confirmation_required("modify_assignment_dates", details)
+        # Also for the preview: it must show every value that will be sent,
+        # and the write needs the same login anyway.
+        return f"Authentication error: {e}"
     except Exception as e:
         return (
             f"Error: cannot read the current dates of assignment "
@@ -535,16 +649,17 @@ def modify_assignment_dates(
         )
 
     if not confirm_write:
-        return write_confirmation_required(
-            "modify_assignment_dates",
-            header
-            + _describe_plan(plan, current, "currently")
-            + [
-                _COURSE_LOCAL_NOTE,
-                "All four settings above are sent together; values marked "
-                "unchanged are re-sent as they are.",
-            ],
-        )
+        details = header + _describe_plan(plan, current, "currently", requested_keys) + [
+            _COURSE_LOCAL_NOTE,
+            "All four settings above are sent together; values marked "
+            "unchanged are re-sent as they are.",
+        ]
+        if _already_set(plan, current, requested_keys):
+            details.append(
+                "Gradescope already has every requested value, so confirming "
+                "changes nothing."
+            )
+        return write_confirmation_required("modify_assignment_dates", details)
 
     try:
         resp = _submit_date_form(conn, course_id, assignment_id, current["token"], plan)
@@ -563,7 +678,21 @@ def modify_assignment_dates(
             f"`{assignment_id}` (HTTP {resp.status_code}). Check your permissions."
         )
 
-    summary = "\n".join(f"- {line}" for line in _describe_plan(plan, current, "was"))
+    summary = "\n".join(
+        f"- {line}"
+        for line in _describe_plan(
+            plan, current, "was", requested_keys, "already set before this write"
+        )
+    )
+    if _already_set(plan, current, requested_keys):
+        # E.g. a call re-run after its first write went through: the dates
+        # did change, just not in this run.
+        summary += (
+            "\nGradescope already had every requested value when this call "
+            "read the settings, so this write changed nothing itself (an "
+            "earlier attempt of the same change, e.g. one interrupted by a "
+            "session expiry, may have applied it)."
+        )
     form_errors = _form_error_text(resp.text)
     try:
         after = _read_date_form(conn, course_id, assignment_id)

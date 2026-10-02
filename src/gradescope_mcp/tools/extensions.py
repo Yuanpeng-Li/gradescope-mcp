@@ -1,26 +1,23 @@
 """Extension management MCP tools (instructor/TA only)."""
 
+import copy
 import datetime
 import json
 import re
 import zoneinfo
 
 from bs4 import BeautifulSoup
-from gradescopeapi.classes.extensions import (
-    get_extensions as gs_get_extensions,
-    update_student_extension,
-)
+from gradescopeapi.classes.extensions import get_extensions as gs_get_extensions
 
 from gradescope_mcp.auth import get_connection, AuthError
-from gradescope_mcp.tools.assignments import check_date_order, parse_date_input
+from gradescope_mcp.tools.assignments import (
+    WriteInProgressError,
+    check_date_order,
+    parse_date_input,
+    serialized_write,
+)
 from gradescope_mcp.tools.common import escape_md_cell
 from gradescope_mcp.tools.safety import write_confirmation_required
-
-
-def _format_datetime(dt: datetime.datetime | None) -> str:
-    if dt is None:
-        return "N/A"
-    return dt.strftime("%Y-%m-%d %H:%M %Z")
 
 
 # gradescopeapi raises RuntimeError("Failed to get extensions for assignment
@@ -29,8 +26,31 @@ def _format_datetime(dt: datetime.datetime | None) -> str:
 _STATUS_CODE_RE = re.compile(r"Status code: (\d{3})\s*$")
 
 
+class _PageRecorder:
+    """Session stand-in that keeps the last response fetched through it.
+
+    gradescopeapi's ``get_extensions`` attaches the course timezone to each
+    stored value instead of converting it, so a UTC value such as
+    ``2026-10-02T06:59:00Z`` came out as 06:59 course time. The raw values
+    are re-read from the same response instead.
+    """
+
+    def __init__(self, session):
+        self._session = session
+        self.response = None
+
+    def get(self, *args, **kwargs):
+        self.response = self._session.get(*args, **kwargs)
+        return self.response
+
+
 def get_extensions(course_id: str, assignment_id: str) -> str:
     """Get all extensions for a specific assignment.
+
+    Each date is shown as course-local wall-clock time and the UTC instant
+    Gradescope stores (stored values with ``Z`` or an offset are absolute,
+    values without one are course-local). Other override settings, such as
+    a time limit, are listed as well.
 
     Args:
         course_id: The Gradescope course ID.
@@ -41,8 +61,9 @@ def get_extensions(course_id: str, assignment_id: str) -> str:
 
     try:
         conn = get_connection()
+        recorder = _PageRecorder(conn.session)
         extensions = gs_get_extensions(
-            session=conn.session,
+            session=recorder,
             course_id=course_id,
             assignment_id=assignment_id,
         )
@@ -80,17 +101,47 @@ def get_extensions(course_id: str, assignment_id: str) -> str:
 
     if not extensions:
         return f"No extensions found for assignment `{assignment_id}` in course `{course_id}`."
+    if recorder.response is None:
+        return (
+            f"Error: the stored extension values for assignment `{assignment_id}` "
+            "could not be read."
+        )
 
+    page = _parse_extensions_page(recorder.response.text)
+    zone, zone_problem = _course_zone(page)
     lines = [f"## Extensions for Assignment {assignment_id}\n"]
-    lines.append("| User ID | Name | Release Date | Due Date | Late Due Date |")
-    lines.append("|---------|------|-------------|----------|---------------|")
+    if zone is not None:
+        lines.append(
+            f"Dates are course-local wall-clock times ({zone.key}) followed by "
+            "the UTC instant Gradescope stores. set_extension accepts either: "
+            "the local time without an offset, or the UTC instant with its Z.\n"
+        )
+    else:
+        lines.append(
+            f"Dates are shown as Gradescope stores them; the course timezone is "
+            f"unknown ({zone_problem}).\n"
+        )
+    lines.append(
+        "| User ID | Name | Release Date | Due Date | Late Due Date | Other Settings |"
+    )
+    lines.append(
+        "|---------|------|-------------|----------|---------------|----------------|"
+    )
 
     for user_id, ext in extensions.items():
+        settings = page["overrides"].get(str(user_id))
+        if settings is None:
+            cells = ["(unreadable)"] * 4
+        else:
+            cells = [
+                _show_stored(_raw_setting(settings, key), zone)
+                for _arg, key in _EXTENSION_FIELDS
+            ]
+            cells.append(", ".join(_other_settings(settings)) or "—")
         lines.append(
             f"| `{escape_md_cell(user_id)}` | {escape_md_cell(ext.name)} | "
-            f"{_format_datetime(ext.release_date)} | "
-            f"{_format_datetime(ext.due_date)} | "
-            f"{_format_datetime(ext.late_due_date)} |"
+            + " | ".join(escape_md_cell(cell) for cell in cells)
+            + " |"
         )
 
     lines.append(f"\n**Total extensions:** {len(extensions)}")
@@ -103,6 +154,11 @@ _EXTENSION_FIELDS = (
     ("due_date", "due_date"),
     ("late_due_date", "hard_due_date"),
 )
+_FIELD_KEYS = dict(_EXTENSION_FIELDS)
+_ARG_NAMES = {key: arg for arg, key in _EXTENSION_FIELDS}
+_DATE_KEYS = frozenset(_FIELD_KEYS.values())
+# Sent with every extension (as gradescopeapi's update_student_extension does).
+_VISIBLE_KEY = "visible"
 
 
 class _ExtensionsPageError(Exception):
@@ -122,12 +178,47 @@ def _collect_timezones(obj, found: set[str]) -> None:
             _collect_timezones(value, found)
 
 
-def _read_extensions_page(conn, course_id: str, assignment_id: str) -> dict:
-    """Read the course timezone and the current overrides from the extensions page.
+def _parse_extensions_page(text: str) -> dict:
+    """Parse an extensions page.
 
-    Returns ``timezones`` (identifiers found in the page's React props) and
-    ``overrides`` (user ID -> override settings exactly as Gradescope
-    renders them).
+    Returns ``timezones`` (identifiers found in the page's React props),
+    ``overrides`` (user ID -> override settings exactly as Gradescope renders
+    them) and ``is_extensions_page`` (it has the extensions table or at least
+    one extension).
+    """
+    soup = BeautifulSoup(text or "", "html.parser")
+    timezones: set[str] = set()
+    overrides: dict[str, dict] = {}
+    found_extension = False
+    for element in soup.find_all(attrs={"data-react-props": True}):
+        try:
+            props = json.loads(element["data-react-props"])
+        except (TypeError, ValueError):
+            continue
+        _collect_timezones(props, timezones)
+        if element.get("data-react-class") != "EditExtension" or not isinstance(props, dict):
+            continue
+        found_extension = True
+        override = props.get("override")
+        if isinstance(override, dict) and override.get("user_id") is not None:
+            settings = override.get("settings")
+            overrides[str(override["user_id"])] = settings if isinstance(settings, dict) else {}
+    return {
+        "timezones": timezones,
+        "overrides": overrides,
+        "is_extensions_page": (
+            found_extension or soup.select_one("table.js-overridesTable") is not None
+        ),
+    }
+
+
+def _read_extensions_page(conn, course_id: str, assignment_id: str) -> dict:
+    """Fetch and parse the assignment's extensions page (see ``_parse_extensions_page``).
+
+    Raises:
+        _ExtensionsPageError: on a non-200 answer or a page that is not the
+            extensions page, where "no extension" can't be told from "not
+            readable".
     """
     url = (
         f"{conn.gradescope_base_url}/courses/{course_id}"
@@ -138,22 +229,13 @@ def _read_extensions_page(conn, course_id: str, assignment_id: str) -> dict:
         raise _ExtensionsPageError(
             f"the extensions page returned HTTP {resp.status_code}"
         )
-    soup = BeautifulSoup(resp.text, "html.parser")
-    timezones: set[str] = set()
-    overrides: dict[str, dict] = {}
-    for element in soup.find_all(attrs={"data-react-props": True}):
-        try:
-            props = json.loads(element["data-react-props"])
-        except (TypeError, ValueError):
-            continue
-        _collect_timezones(props, timezones)
-        if element.get("data-react-class") != "EditExtension" or not isinstance(props, dict):
-            continue
-        override = props.get("override")
-        if isinstance(override, dict) and override.get("user_id") is not None:
-            settings = override.get("settings")
-            overrides[str(override["user_id"])] = settings if isinstance(settings, dict) else {}
-    return {"timezones": timezones, "overrides": overrides}
+    page = _parse_extensions_page(resp.text)
+    if not page["is_extensions_page"]:
+        raise _ExtensionsPageError(
+            "the extensions page has no extensions table (unexpected page; "
+            "check the IDs and that you have staff access to the course)"
+        )
+    return page
 
 
 def _course_zone(page: dict) -> tuple[zoneinfo.ZoneInfo | None, str]:
@@ -203,41 +285,152 @@ def _describe_instant(value: datetime.datetime, zone: zoneinfo.ZoneInfo | None) 
     return f"{value.isoformat(timespec='minutes')} = {_utc_text(value)}"
 
 
-def _raw_setting(settings: dict, key: str):
-    entry = settings.get(key)
+def _entry_value(entry):
+    """A setting's value: settings are usually ``{"type": ..., "value": ...}``."""
     return entry.get("value") if isinstance(entry, dict) else entry
 
 
-def _describe_override(settings: dict | None) -> str:
-    if settings is None:
-        return "This student has no extension on this assignment yet."
-    parts = [
-        f"{arg}={_raw_setting(settings, key)}"
-        for arg, key in _EXTENSION_FIELDS
-        if _raw_setting(settings, key)
+def _raw_setting(settings: dict, key: str):
+    return _entry_value(settings.get(key))
+
+
+def _setting_text(entry) -> str:
+    """One override setting's value for display (``{"value": ...}`` unwrapped)."""
+    value = entry.get("value") if isinstance(entry, dict) and "value" in entry else entry
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return str(value)
+
+
+def _other_settings(settings: dict) -> list[str]:
+    """``key=value`` for every override setting other than the three dates."""
+    return [
+        f"{key}={_setting_text(entry)}"
+        for key, entry in settings.items()
+        if key not in _DATE_KEYS
     ]
-    return (
-        "Current extension for this student (as Gradescope stores it): "
-        + (", ".join(parts) or "no date overrides")
-    )
 
 
-def _stored_instant(raw, zone: zoneinfo.ZoneInfo | None) -> datetime.datetime | None:
-    """Interpret a stored override value; naive values are course-local."""
+def _parse_stored(raw) -> datetime.datetime | None:
+    """Parse a stored override date; naive when it has no offset, None if not a date."""
     if not isinstance(raw, str) or not raw.strip():
         return None
     text = raw.strip()
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
-        parsed = datetime.datetime.fromisoformat(text)
+        return datetime.datetime.fromisoformat(text)
     except ValueError:
+        return None
+
+
+def _stored_instant(raw, zone: zoneinfo.ZoneInfo | None) -> datetime.datetime | None:
+    """Interpret a stored override value; naive values are course-local."""
+    parsed = _parse_stored(raw)
+    if parsed is None:
         return None
     if parsed.tzinfo is None:
         if zone is None:
             return None
         parsed = parsed.replace(tzinfo=zone)
     return parsed
+
+
+def _show_stored(raw, zone: zoneinfo.ZoneInfo | None) -> str:
+    """A stored override date as ``local time = UTC instant`` for listings."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "N/A"
+    parsed = _parse_stored(raw)
+    if parsed is None:
+        return f"{raw} (unrecognized format)"
+    if parsed.tzinfo is None and zone is None:
+        return f"{raw} (course-local; timezone unknown)"
+    instant = _stored_instant(raw, zone)
+    if zone is None:
+        return _utc_text(instant)
+    return f"{instant.astimezone(zone):%Y-%m-%d %H:%M %Z} = {_utc_text(instant)}"
+
+
+def _describe_override(settings: dict | None, zone: zoneinfo.ZoneInfo | None) -> str:
+    """Every current override setting, dates with their course-local time."""
+    if settings is None:
+        return "This student has no extension on this assignment yet."
+    parts = []
+    for arg, key in _EXTENSION_FIELDS:
+        if key not in settings:
+            continue
+        raw = _raw_setting(settings, key)
+        part = f"{arg}={raw}"
+        instant = _stored_instant(raw, zone)
+        if instant is not None and zone is not None:
+            part += f" ({instant.astimezone(zone):%Y-%m-%d %H:%M %Z})"
+        parts.append(part)
+    parts += _other_settings(settings)
+    return (
+        "Current extension for this student (as Gradescope stores it): "
+        + (", ".join(parts) or "no settings")
+    )
+
+
+def _describe_sent(settings: dict) -> str:
+    """The override settings as they will be posted."""
+    return ", ".join(
+        f"{_ARG_NAMES.get(key, key)}={_setting_text(entry)}" for key, entry in settings.items()
+    )
+
+
+def _same_setting(before, after, zone: zoneinfo.ZoneInfo | None) -> bool:
+    """Whether a re-read setting still holds the value it had before."""
+    raw_before, raw_after = _entry_value(before), _entry_value(after)
+    first, second = _stored_instant(raw_before, zone), _stored_instant(raw_after, zone)
+    if first is not None and second is not None:
+        return abs(first - second) < datetime.timedelta(minutes=1)
+    return raw_before == raw_after
+
+
+def _date_change(
+    arg: str,
+    value: datetime.datetime,
+    current: dict | None,
+    zone: zoneinfo.ZoneInfo | None,
+    stored_zone: zoneinfo.ZoneInfo | None,
+    preview: bool,
+) -> tuple[str, bool]:
+    """(How a sent date compares to the current extension, whether it already had it).
+
+    Wording differs between the preview and the result after the write; a
+    date that was already set is never called "unchanged", so a write
+    retried after it went through doesn't read as if nothing changed.
+    """
+    key = _FIELD_KEYS[arg]
+    verb = "currently" if preview else "was"
+    if current is None or key not in current:
+        return ("(not set now)" if preview else "(newly set)"), False
+    raw = _raw_setting(current, key)
+    before = _stored_instant(raw, stored_zone)
+    if before is None:
+        return f"({verb} {raw!r})", False
+    if abs(before - value) < datetime.timedelta(minutes=1):
+        return (
+            "(already the current value)" if preview else "(already set before this write)"
+        ), True
+    return f"({verb} {_describe_instant(before, zone)})", False
+
+
+def _plan_settings(current: dict | None, resolved: list[tuple[str, datetime.datetime]]) -> dict:
+    """The full override to post: current settings with the requested dates replaced.
+
+    Settings that are not passed are re-sent exactly as Gradescope renders
+    them, so they are kept whether Gradescope merges or replaces the
+    override. ``visible`` is always sent as true, as gradescopeapi does.
+    """
+    settings = copy.deepcopy(current) if current else {}
+    for arg, value in resolved:
+        settings[_FIELD_KEYS[arg]] = {"type": "absolute", "value": _utc_text(value)}
+    settings[_VISIBLE_KEY] = True
+    return settings
 
 
 def set_extension(
@@ -256,8 +449,14 @@ def set_extension(
     timezone, read from Gradescope's extensions page (or given with
     ``timezone``); dates with an offset (``Z``, ``-07:00``) are absolute.
     Never the MCP host's timezone. Gradescope stores each date as a UTC
-    instant: the preview shows the resolved instant and the extension is
-    read back after writing. Only the dates passed are sent.
+    instant: the preview shows the resolved instant.
+
+    The student's whole override is sent: the dates passed, every other
+    current setting (other dates, a time limit, ...) re-sent unchanged, and
+    ``visible=true``. The preview lists all of it, so it needs the
+    extensions page to be readable. After writing, the extension is read
+    back and any setting Gradescope changed or dropped is reported.
+    Confirmed changes to the same student's extension run one at a time.
 
     Args:
         course_id: The Gradescope course ID.
@@ -309,6 +508,33 @@ def set_extension(
                 "as 'America/New_York'."
             )
 
+    if not confirm_write:
+        return _apply_extension(
+            course_id, assignment_id, user_id, provided, naive_args, zone_arg, False
+        )
+    try:
+        with serialized_write("extension", course_id, assignment_id, user_id):
+            return _apply_extension(
+                course_id, assignment_id, user_id, provided, naive_args, zone_arg, True
+            )
+    except WriteInProgressError:
+        return (
+            f"Error: another extension change for user `{user_id}` on assignment "
+            f"`{assignment_id}` is still running; try again when it has "
+            "finished. Nothing was changed."
+        )
+
+
+def _apply_extension(
+    course_id: str,
+    assignment_id: str,
+    user_id: str,
+    provided: list[tuple[str, datetime.datetime]],
+    naive_args: list[str],
+    zone_arg: zoneinfo.ZoneInfo | None,
+    confirm_write: bool,
+) -> str:
+    """Read, plan and (with ``confirm_write``) write and verify an extension."""
     header = [
         f"course_id=`{course_id}`",
         f"assignment_id=`{assignment_id}`",
@@ -316,23 +542,24 @@ def set_extension(
     ]
 
     # The extensions page provides the course timezone and the student's
-    # current extension (shown in the preview, compared after writing).
-    page = None
-    page_problem = ""
-    auth_failed = False
+    # current extension, which is merged into the write. Without it the
+    # preview can't show what will be sent, so both preview and write stop.
     try:
         conn = get_connection()
         page = _read_extensions_page(conn, course_id, assignment_id)
     except AuthError as e:
-        if confirm_write:
-            return f"Authentication error: {e}"
-        page_problem = f"Authentication error: {e}"
-        auth_failed = True
+        return f"Authentication error: {e}"
     except Exception as e:
-        page_problem = str(e) or repr(e)
+        return (
+            f"Error: cannot read the extensions page of assignment "
+            f"`{assignment_id}` ({str(e) or repr(e)}), so the student's current "
+            "extension is unknown and could not be kept. Nothing was changed."
+        )
 
-    course_zone, zone_problem = _course_zone(page) if page is not None else (None, page_problem)
+    course_zone, zone_problem = _course_zone(page)
     zone = zone_arg or course_zone
+    # Stored values without an offset are in the course's timezone.
+    stored_zone = course_zone or zone_arg
     zone_note = ""
     if zone_arg is not None:
         zone_note = f"Timezone for dates without an offset: {zone_arg.key} (timezone argument)"
@@ -345,18 +572,6 @@ def set_extension(
         )
 
     if naive_args and zone is None:
-        if auth_failed:
-            details = header + [
-                f"{arg}={value:%Y-%m-%dT%H:%M} (course-local time; timezone not resolved yet)"
-                for arg, value in provided
-            ]
-            details.append(
-                f"⚠️ Gradescope could not be read ({page_problem}), so the course "
-                "timezone and the student's current extension are unknown. With "
-                "confirm_write=True the tool looks up the course timezone first "
-                "and refuses to write if it cannot."
-            )
-            return write_confirmation_required("set_extension", details)
         return (
             f"Error: cannot tell which timezone {', '.join(naive_args)} "
             f"{'is' if len(naive_args) == 1 else 'are'} in: {zone_problem}. "
@@ -372,45 +587,85 @@ def set_extension(
     except ValueError as e:
         return f"Error: {e}"
 
-    date_lines = [f"{arg}: {_describe_instant(value, zone)}" for arg, value in resolved]
+    current = page["overrides"].get(str(user_id))
+    settings = _plan_settings(current, resolved)
+    merged_order = check_date_order([
+        (arg, _stored_instant(_raw_setting(settings, key), stored_zone))
+        for arg, key in _EXTENSION_FIELDS
+    ])
+    if merged_order:
+        return (
+            f"Error: {merged_order} The student's current extension dates you "
+            "don't pass are kept, so pass the conflicting one as well. Nothing "
+            "was changed."
+        )
+    sent_keys = {_FIELD_KEYS[arg] for arg, _value in resolved}
+    kept = {
+        key: entry
+        for key, entry in (current or {}).items()
+        if key not in sent_keys and key != _VISIBLE_KEY
+    }
+
+    def date_lines(preview: bool) -> tuple[list[str], bool]:
+        lines, unchanged = [], True
+        for arg, value in resolved:
+            note, same = _date_change(arg, value, current, zone, stored_zone, preview)
+            unchanged = unchanged and same
+            separator = ": " if preview else " → "
+            lines.append(f"{arg}{separator}{_describe_instant(value, zone)} {note}")
+        return lines, unchanged
 
     if not confirm_write:
-        details = header + date_lines
+        lines, unchanged = date_lines(preview=True)
+        details = header + lines
         if zone_note:
             details.append(zone_note)
-        if page is None:
-            details.append(f"Current extension: could not be read ({page_problem})")
-        else:
-            details.append(_describe_override(page["overrides"].get(str(user_id))))
+        details.append(_describe_override(current, stored_zone))
         details.append(
-            "Only the dates above are sent (as UTC instants). Whether Gradescope "
-            "keeps the student's other existing extension dates is not "
-            "verified; pass them again to be sure they are kept."
+            "With confirm_write=True the student's whole extension is sent: "
+            f"{_describe_sent(settings)}. Settings you don't pass are re-sent "
+            "unchanged so they are kept; visible=true is always sent."
         )
+        if unchanged:
+            details.append(
+                "The extension already has every requested date; confirming "
+                "re-sends the same values."
+            )
         return write_confirmation_required("set_extension", details)
 
-    values = dict(resolved)
+    url = (
+        f"{conn.gradescope_base_url}/courses/{course_id}"
+        f"/assignments/{assignment_id}/extensions"
+    )
+    body = {"override": {"user_id": user_id, "settings": settings}}
     try:
-        success = update_student_extension(
-            session=conn.session,
-            course_id=course_id,
-            assignment_id=assignment_id,
-            user_id=user_id,
-            release_date=values.get("release_date"),
-            due_date=values.get("due_date"),
-            late_due_date=values.get("late_due_date"),
-        )
+        resp = conn.session.post(url, json=body)
     except AuthError as e:
         return f"Authentication error: {e}"
-    except ValueError as e:
-        return f"Error: {e}"
     except Exception as e:
-        return f"Error setting extension: {e}"
+        return (
+            f"Error setting extension: the request failed ({e!r}); Gradescope "
+            "may or may not have applied it. Check with get_extensions."
+        )
 
-    if not success:
-        return "❌ Failed to set extension. Check your permissions and verify the user ID."
+    if resp.status_code != 200:
+        return (
+            f"❌ Failed to set extension (HTTP {resp.status_code}). Check your "
+            "permissions and verify the user ID."
+        )
 
-    summary = "\n".join(f"- {arg} → {_describe_instant(value, zone)}" for arg, value in resolved)
+    lines, unchanged = date_lines(preview=False)
+    summary = "\n".join(f"- {line}" for line in lines)
+    if kept:
+        summary += f"\n- Kept unchanged: {_describe_sent(kept)}"
+    if unchanged:
+        # E.g. a call re-run after its first write went through.
+        summary += (
+            "\nThe extension already had every requested date when this call "
+            "read it, so this write changed nothing itself (an earlier attempt "
+            "of the same change, e.g. one interrupted by a session expiry, may "
+            "have applied it)."
+        )
     target = f"user `{user_id}` on assignment `{assignment_id}`"
     try:
         after = _read_extensions_page(conn, course_id, assignment_id)
@@ -419,28 +674,39 @@ def set_extension(
             f"⚠️ Extension for {target} was submitted (HTTP 200) but could not "
             f"be verified: {e}. Check it with get_extensions.\n{summary}"
         )
-    settings = after["overrides"].get(str(user_id))
-    if settings is None:
+    stored = after["overrides"].get(str(user_id))
+    if stored is None:
         return (
             f"⚠️ Extension for {target} was submitted (HTTP 200), but no "
             "extension for this user appears on the extensions page. Check the "
             f"user ID and the Gradescope web UI.\n{summary}"
         )
 
-    read_zone = zone or _course_zone(after)[0]
+    read_zone = stored_zone or _course_zone(after)[0]
     differences = []
     for arg, value in resolved:
-        key = dict(_EXTENSION_FIELDS)[arg]
-        raw = _raw_setting(settings, key)
-        stored = _stored_instant(raw, read_zone)
-        if stored is None or abs(stored - value) >= datetime.timedelta(minutes=1):
+        raw = _raw_setting(stored, _FIELD_KEYS[arg])
+        instant = _stored_instant(raw, read_zone)
+        if instant is None or abs(instant - value) >= datetime.timedelta(minutes=1):
             differences.append(
                 f"- {arg}: sent {_utc_text(value)}, extensions page shows {raw!r}"
+            )
+    for key, entry in kept.items():
+        name = _ARG_NAMES.get(key, key)
+        if key not in stored:
+            differences.append(
+                f"- {name}: was {_setting_text(entry)}, re-sent unchanged, but it "
+                "is no longer on the extensions page (removed)"
+            )
+        elif not _same_setting(entry, stored[key], read_zone):
+            differences.append(
+                f"- {name}: was {_setting_text(entry)}, re-sent unchanged, but the "
+                f"extensions page now shows {_setting_text(stored[key])} (changed)"
             )
     if differences:
         return (
             f"⚠️ Extension for {target} was submitted (HTTP 200), but the "
-            "extensions page does not show the expected dates:\n"
+            "extensions page does not show what was sent:\n"
             + "\n".join(differences)
             + "\nCheck the extension in the Gradescope web UI."
         )
