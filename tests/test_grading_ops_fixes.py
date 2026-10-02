@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import anyio
 import pytest
 import requests
+from mcp.server.mcpserver.exceptions import ToolError
 from requests.adapters import BaseAdapter
 from requests.models import Response
 
@@ -2160,6 +2161,97 @@ def test_batch_row_overwrite_must_be_a_boolean(monkeypatch) -> None:
     assert gs.posts() == []
 
 
+def test_batch_preview_refuses_overwrite_on_a_row_that_already_holds_the_grade(
+    monkeypatch,
+) -> None:
+    """Round-4 C1 (reviewer repro round3-G1/already_holds_overwrite.py): a
+    retry re-previews a row an earlier confirm already wrote, keeping its
+    overwrite key. Nothing would be sent for it, so the flag could only
+    overwrite a grade entered after the preview; the preview refuses it
+    instead of counting the row as 'already holds this grade'."""
+    gs = OfflineGradescope().install(monkeypatch)
+    gs.add("20", graded=True, score=10.0, applied=[100])
+    gs.add("21")
+    rows = [
+        {"submission_id": "20", "rubric_item_ids": ["100"], "overwrite": True},
+        {"submission_id": "21", "rubric_item_ids": ["100"]},
+    ]
+
+    preview, is_error = _call_mcp(
+        "tool_apply_grade_batch", {"course_id": C, "question_id": Q, "grades": rows}
+    )
+
+    assert is_error
+    assert preview.startswith("Error: batch refused; nothing was written.")
+    assert (
+        "- row 0 (20): overwrite=true, but this submission already holds "
+        "exactly this grade (10/10, rubric ['100']), so nothing would be sent"
+    ) in preview
+    assert "Remove it from this row" in preview
+    assert "row 1 (21)" not in preview
+    assert gs.posts() == []
+
+    # Without the flag the row previews as unchanged, and a grade a TA
+    # enters before the confirm is skipped, not overwritten.
+    rows[0] = {"submission_id": "20", "rubric_item_ids": ["100"]}
+    args = {"course_id": C, "question_id": Q, "grades": rows}
+    preview, is_error = _call_mcp("tool_apply_grade_batch", args)
+    assert not is_error
+    assert "rows=2 (will write 1, skip 0 with confidence < 0.6, 1 already hold this grade)" in preview
+    gs.subs["20"].update(score=6.0, applied=[200], comments="TA: regraded after preview")
+
+    result, is_error = _call_mcp("tool_apply_grade_batch", {**args, "confirm_write": True})
+
+    assert not is_error
+    assert gs.posts() == [SAVE.format("21")]
+    assert gs.subs["20"]["applied"] == [200] and gs.subs["20"]["score"] == 6.0
+    assert "- `20`: 6/10, rubric ['200'], has a comment" in result
+    assert "OVERWROTE" not in result
+
+
+def test_apply_grade_preview_flags_overwrite_graded_when_nothing_is_overwritten(
+    monkeypatch,
+) -> None:
+    """Round-4 C1, single-submission side: overwrite_graded=True on a
+    submission that already holds the requested grade is disclosed."""
+    gs = OfflineGradescope().install(monkeypatch)
+    gs.add("20", graded=True, score=10.0, applied=[100])
+
+    preview = grading_ops.apply_grade(C, Q, "20", ["100"], overwrite_graded=True)
+
+    assert "with exactly this grade: confirm_write=True will send nothing" in preview
+    assert (
+        "⚠️ overwrite_graded=True, but there is nothing to overwrite now: the "
+        "flag could only overwrite a grade entered after this preview"
+    ) in preview
+    plain = grading_ops.apply_grade(C, Q, "20", ["100"])
+    assert "overwrite_graded=True, but" not in plain
+    assert gs.posts() == []
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "1", "on", 1, 1.0, "false", 0, "maybe", 2])
+def test_batch_row_overwrite_is_a_strict_boolean_at_the_mcp_layer(monkeypatch, value) -> None:
+    """Round-4 C3 (reviewer repro round3-G1/batch_attacks.py A5): pydantic's
+    lax mode turned "yes", "1", 1 and 1.0 into true, opting the row into an
+    overwrite. Only JSON true/false/null is accepted now."""
+    gs = _overwrite_world(monkeypatch)
+    grades = [{"submission_id": "20", "rubric_item_ids": ["100"], "overwrite": value}]
+
+    for confirm in (False, True):
+        with pytest.raises(ToolError, match=r"overwrite[\s\S]*must be true, false or null"):
+            anyio.run(server.mcp.call_tool, "tool_apply_grade_batch", {
+                "course_id": C, "question_id": Q, "grades": grades,
+                "confirm_write": confirm,
+            })
+
+    assert gs.log == []
+    assert gs.subs["20"]["applied"] == [200]
+    schema = _tool_schema("tool_apply_grade_batch")
+    assert schema["$defs"]["GradeRow"]["properties"]["overwrite"]["anyOf"] == [
+        {"type": "boolean"}, {"type": "null"},
+    ]
+
+
 def test_batch_preview_says_to_leave_skipped_rows_out(monkeypatch) -> None:
     """Reviewer repro Q1/skipped_then_written.py. The write cannot know a row
     was previewed as SKIPPED, so the preview tells the agent to leave it out;
@@ -2271,6 +2363,36 @@ def test_group_overwrite_with_the_previewed_ids_names_the_overwritten_members(mo
         "⚠️ **Overwrote existing grades** (members graded at write time): "
         "confirmed [`101`]\n**Members at write time:** 2 confirmed + 0 inferred"
     ) in result
+
+
+def test_repeated_group_overwrite_is_refused_and_says_why(monkeypatch) -> None:
+    """Round-4 C2 (reviewer repro round3-G1/group_attacks.py B7): the first
+    call graded member 102, so an identical repeat is refused (nothing is
+    sent). The docs said it sends the same full grade again; the message now
+    names the repeat as a possible cause."""
+    gs = _graded_group_world(monkeypatch)
+    confirm = {
+        **GROUP_OVERWRITE, "confirm_write": True, "expected_member_count": 2,
+        "expected_graded_ids": ["101"],
+    }
+
+    first, is_error = _call_mcp("tool_grade_answer_group", confirm)
+    assert not is_error, first
+    for member in gs.answer_groups["submissions"][:2]:
+        member["graded"] = True  # Gradescope applied the group grade
+
+    repeat, is_error = _call_mcp("tool_grade_answer_group", confirm)
+
+    assert is_error
+    assert repeat.startswith(
+        "Error: answer group `3`'s graded members changed since the preview. "
+        "Graded now but not in expected_graded_ids: [`102`]"
+    )
+    assert "If this repeats a call that already went through, that call graded these members" in repeat
+    assert gs.posts() == [SAVE_MANY]
+    doc = " ".join(server.gradescope_write.__doc__.split())
+    assert "with ``overwrite_graded=True`` sends the same full grade again" not in doc
+    assert "Only a repeated group grade whose ``expected_graded_ids`` already listed every member" in doc
 
 
 def test_group_expected_graded_ids_cover_inferred_members(monkeypatch) -> None:

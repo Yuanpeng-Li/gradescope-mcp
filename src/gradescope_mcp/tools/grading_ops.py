@@ -1521,6 +1521,13 @@ def apply_grade(
                 f"already graded ({_describe_existing_grade(props)}) with exactly "
                 "this grade: confirm_write=True will send nothing"
             )
+            if overwrite:
+                details.append(
+                    "⚠️ overwrite_graded=True, but there is nothing to "
+                    "overwrite now: the flag could only overwrite a grade "
+                    "entered after this preview, which the user has not "
+                    "seen. Drop it unless the user approved that"
+                )
         elif graded and overwrite:
             details.append(
                 f"⚠️ already graded ({_describe_existing_grade(props)}): this "
@@ -1729,9 +1736,11 @@ def _is_low_confidence(row: dict) -> bool:
 def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
     """Load every row's grading page and describe exactly what would be sent.
 
-    ``overwrite: true`` is refused on a row that is not graded now: it could
-    only ever overwrite a grade entered after this preview, which the user
-    has not seen, so it must stay on the rows whose grade the preview shows.
+    ``overwrite: true`` is refused on a row that is not graded now, or that
+    already holds exactly the requested grade (nothing is sent for it): in
+    both cases it could only ever overwrite a grade entered after this
+    preview, which the user has not seen, so it must stay on the rows whose
+    grade the preview shows as OVERWRITTEN.
     """
     planned: list[tuple[dict, dict, dict]] = []
     problems: list[str] = []
@@ -1784,6 +1793,16 @@ def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
         plan = _plan_grade_write(
             props, row["rubric_item_ids"], row["point_adjustment"], row["comment"]
         )
+        if row["overwrite"] and _already_holds(props, plan):
+            problems.append(
+                f"{label}: overwrite=true, but this submission already holds "
+                f"exactly this grade ({_describe_existing_grade(props)}), so "
+                "nothing would be sent and there is nothing to overwrite; "
+                "the flag could only let a grade entered after this preview "
+                "be overwritten. Remove it from this row (a row an earlier "
+                "confirm already wrote can stay without it, or be left out)"
+            )
+            continue
         planned.append((row, props, plan))
 
     if problems:
@@ -1969,8 +1988,9 @@ def apply_grade_batch(
     ``overwrite: true``, so a row graded after the preview (e.g. by another
     grader) is skipped and listed as not written, whatever the other rows
     say. The result names every grade it overwrote. The preview refuses
-    ``overwrite: true`` on a row that is not graded, since there it could
-    only overwrite a grade the user has not seen. Rows the preview marks
+    ``overwrite: true`` on a row that is not graded, or that already holds
+    exactly the requested grade, since there it could only overwrite a
+    grade the user has not seen. Rows the preview marks
     SKIPPED should be left out of the confirmed call: the write cannot know
     what the preview showed, so such a row is written if its grade was
     cleared in between. A graded row that already holds exactly the

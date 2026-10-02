@@ -167,6 +167,18 @@ def _reject_bool(value: Any) -> Any:
     return value
 
 
+def _require_bool(value: Any) -> Any:
+    """Accept only JSON ``true``, ``false`` or ``null`` for an opt-in flag.
+
+    Pydantic's lax mode would turn ``"yes"``, ``"true"``, ``"1"``, ``"on"``,
+    ``1`` and ``1.0`` into True, so a string or a number could switch on a
+    destructive opt-in such as a batch row's ``overwrite``.
+    """
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(f"must be true, false or null, not {value!r}")
+    return value
+
+
 # A Gradescope ID: ASCII digits only, without leading zeros. The pattern is
 # what the JSON schema advertises (it must come before the validator, or
 # pydantic leaves it out of the schema); the validator runs first, accepts
@@ -178,6 +190,8 @@ OptionalGradescopeID = Annotated[GradescopeID | None, BeforeValidator(_blank_to_
 
 # A number argument: JSON numbers and numeric strings, never booleans.
 Number = Annotated[float, BeforeValidator(_reject_bool)]
+# An optional flag: JSON true/false/null only, never strings or numbers.
+StrictOptionalBool = Annotated[bool | None, BeforeValidator(_require_bool)]
 # A non-negative whole number, never a boolean (the bound must come before
 # the validator to appear in the schema, as for GradescopeID).
 Count = Annotated[int, Field(ge=0), BeforeValidator(_reject_bool)]
@@ -196,7 +210,7 @@ class GradeRow(TypedDict, total=False):
     point_adjustment: Number | None
     comment: str | None
     confidence: Number | None
-    overwrite: bool | None
+    overwrite: StrictOptionalBool
 
 
 # At most MAX_BATCH_ROWS rows. The schema advertises the cap (``maxItems``)
@@ -282,11 +296,13 @@ def gradescope_write(title: str, *, idempotent: bool) -> ToolAnnotations:
     and False when each call creates something new (a submission, a rubric
     item). A repeated idempotent call may still return a different result,
     because it sees the state the first call left: a repeated delete
-    reports the item missing and a repeated group grade without
-    ``overwrite_graded`` is refused because the members are now graded
-    (neither sends anything), a repeated ``tool_apply_grade`` reports that
-    the grade is already held, and a repeated group grade with
-    ``overwrite_graded=True`` sends the same full grade again.
+    reports the item missing; a repeated group grade is refused because the
+    first call graded the members (without ``overwrite_graded`` because
+    they are graded, with it because the graded members no longer match
+    ``expected_graded_ids``); a repeated ``tool_apply_grade`` or batch row
+    reports that the grade is already held. None of these sends anything.
+    Only a repeated group grade whose ``expected_graded_ids`` already
+    listed every member sends the same full grade again.
     """
     return ToolAnnotations(
         title=title,
@@ -1037,8 +1053,9 @@ def tool_apply_grade_batch(
       preview table (current score, items to check and uncheck, projected
       score, confidence) with warnings for already-graded rows (SKIPPED, or
       OVERWRITTEN when the row has ``overwrite: true``) and rows flagged for
-      review; no writes. ``overwrite: true`` on a row that is not graded is
-      refused (it could only overwrite a grade entered after the preview).
+      review; no writes. ``overwrite: true`` on a row that is not graded,
+      or that already holds exactly the requested grade, is refused (there
+      it could only overwrite a grade entered after the preview).
     - ``confirm_write=True``: re-reads each row right before saving it and
       reads it back afterwards. A row that is graded at that point (even if
       it was ungraded in the preview, e.g. graded by another grader since)

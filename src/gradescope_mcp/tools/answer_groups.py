@@ -836,8 +836,11 @@ def grade_answer_group(
             f"the preview. Graded now but not in expected_graded_ids: "
             f"[{_format_id_list(newly_graded, None)}]; in expected_graded_ids "
             f"but not graded now: [{_format_id_list(no_longer, None)}]. "
-            "Nothing was sent. Re-run the preview and show the user the "
-            "graded members before overwriting any of them."
+            "Nothing was sent. (If this repeats a call that already went "
+            "through, that call graded these members; check the group with "
+            "tool_get_answer_group_detail before sending it again.) Re-run "
+            "the preview and show the user the graded members before "
+            "overwriting any of them."
         )
 
     if graded_total and not overwrite_graded:
