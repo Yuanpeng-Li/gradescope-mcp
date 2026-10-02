@@ -182,7 +182,9 @@ def test_partial_date_update_reads_the_current_dates_from_the_props(monkeypatch)
     assert "allow_late_submissions=off (unchanged)" in preview
     assert "late_due_date=(none) (unchanged); no effect while late submissions are off" in preview
     assert "unreadable" not in preview
-    assert "course's timezone, America/Los_Angeles (PDT)." in preview
+    # The IANA name only: the page's abbr (PDT) is wrong for winter dates.
+    assert "course's timezone, America/Los_Angeles." in preview
+    assert "(PDT)" not in preview
     assert "LMS" not in preview
     assert srv.session.methods() == ["GET"]
 
@@ -203,7 +205,7 @@ def test_partial_date_update_reads_the_current_dates_from_the_props(monkeypatch)
     # The read-back uses the same props reader and confirms the change.
     assert result.startswith("✅ Assignment `2` dates updated successfully (read back")
     assert "due_date=2024-11-06T09:45 (was 2024-11-05T09:45)" in result
-    assert "America/Los_Angeles (PDT)" in result
+    assert "America/Los_Angeles" in result and "(PDT)" not in result
     assert srv.session.methods() == ["GET", "GET", "POST", "GET"]
 
 
@@ -888,3 +890,11 @@ def test_get_assignments_reports_an_unreadable_listing_as_an_error(monkeypatch) 
 
     assert is_error
     assert result.startswith("Error fetching assignments: Gradescope answered")
+
+
+def test_timezone_text_never_shows_a_seasonal_abbreviation_as_fixed() -> None:
+    zone = {"abbr": "PDT", "zone": "Pacific Time (US & Canada)", "identifier": "America/Los_Angeles"}
+    assert assignments._timezone_text(zone) == "America/Los_Angeles"
+    no_identifier = {"abbr": "PDT", "zone": "Pacific Time (US & Canada)"}
+    assert assignments._timezone_text(no_identifier) == "Pacific Time (US & Canada) (currently PDT)"
+    assert assignments._timezone_text(None) is None

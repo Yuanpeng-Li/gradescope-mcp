@@ -278,8 +278,8 @@ submission is already graded) and repeats that call with
   returns an error (`Authentication error` / `Error`) rather than a
   partial preview when they can't be read; the write refuses for the same
   reason. Preview and result name the course timezone the page reports
-  (for example `America/Los_Angeles (PDT)`; the abbreviation is the one
-  Gradescope shows now) and warn when the due date is synced from an LMS,
+  (the IANA name, for example `America/Los_Angeles`; no DST abbreviation,
+  since the one Gradescope shows is only correct for today) and warn when the due date is synced from an LMS,
   since a later sync may overwrite it. The result is verified by
   re-reading the settings the same way, and requested values that were
   already set are labelled as such.

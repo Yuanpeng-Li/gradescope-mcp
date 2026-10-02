@@ -586,14 +586,22 @@ def _read_date_form(conn, course_id: str, assignment_id: str) -> dict:
 
 
 def _timezone_text(zone: dict | None) -> str | None:
-    """``America/Los_Angeles (PDT)`` from the page's timezone, if it has one."""
+    """The course timezone from the page, e.g. ``America/Los_Angeles``.
+
+    The page's ``abbr`` is the abbreviation in effect today (PDT in summer),
+    which is wrong for dates in the other DST period, so it is only shown
+    as "currently ..." when there is no IANA identifier to name the zone.
+    """
     if not zone:
         return None
-    name = zone.get("identifier") or zone.get("zone")
+    identifier = zone.get("identifier")
+    if identifier:
+        return identifier
+    name = zone.get("zone")
     if not name:
         return None
     abbr = zone.get("abbr")
-    return f"{name} ({abbr})" if abbr and abbr != name else name
+    return f"{name} (currently {abbr})" if abbr and abbr != name else name
 
 
 def _date_notes(current: dict) -> list[str]:
