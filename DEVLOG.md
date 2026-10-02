@@ -6,6 +6,153 @@
 
 ---
 
+## Session 13 — 2026-10-02: Round-3 Review Fixes and Follow-ups
+
+### Why
+
+A third adversarial review of the Session 12 state found more ways for a
+write to go beyond what the user approved. One batch overwrite approval
+covered every row graded at write time, and a group overwrite was not tied
+to the graded members the user saw. A rejected upload could be reported as
+a success, and the approved upload content was not bound to the write.
+`set_extension` hid a `visible` flip and let a `timezone` argument override
+the course's. A bad `.env` or a deleted working directory stopped the server
+from starting. A second session expiry was documented wrongly. A slow page
+download could run far past its 120 s budget, and hidden or generic check
+icons marked regrades completed. These were fixed in `2a194ab`..`ad87ec5`.
+Verifying those fixes found thirteen smaller follow-ups (round 4, C1-C13),
+fixed at the end of this session together with the documentation.
+
+### Grade writes (`grading_ops.py`, `answer_groups.py`, `server.py`)
+
+- Per-row batch overwrite (`2a194ab`): `tool_apply_grade_batch` no longer
+  has a batch-wide `overwrite_graded`. A row graded at write time is written
+  only if that row carries `"overwrite": true`. Otherwise it is listed under
+  "Not written: already graded at write time". A client that still sends
+  the batch flag gets graded rows skipped. The preview marks rows SKIPPED or
+  OVERWRITTEN and says to leave SKIPPED rows out of the confirmed call.
+- The batch preview refuses `"overwrite": true` on a row that is not graded.
+  It now also refuses it on a row that already holds exactly the requested
+  grade (C1): nothing is sent for that row, so the flag could only
+  overwrite a grade entered after the preview. A retry that re-previews a
+  row an earlier confirm already wrote hits this. `tool_apply_grade` warns
+  when `overwrite_graded=True` has nothing to overwrite.
+- A row's `overwrite` accepts only JSON `true`, `false` or `null` at the MCP
+  layer (C3). Before, pydantic's lax mode turned `"yes"`, `"1"`, `1` and
+  `1.0` into true.
+- Group overwrite (`5afa5ea`): `tool_grade_answer_group` takes
+  `expected_graded_ids`, the graded member IDs its preview prints. With
+  `confirm_write=True` and graded members, the list is required. The call
+  is refused, with nothing sent, unless exactly those members are graded.
+  An identical repeat of a call that went through is refused this way,
+  since that call graded the rest of the group. The message now says so
+  (C2).
+
+### Uploads (`submissions.py`)
+
+- `57f7f79`: success needs the upload POST's own redirect to a new
+  submission of this assignment, not one seen on the assignment page
+  before. The final page must be that submission and show no error.
+  `expected_sha256` binds the upload to the content the user approved.
+- Only a visible, error-styled flash message (`alert-danger`,
+  `flash-error`, ...) counts as an error (C4). Hidden elements, JS
+  templates and `<noscript>` content are ignored. A warning or unstyled
+  `role="alert"` on the new submission's page is quoted under a ⚠️ line of
+  the success result. A `❌` result quotes the error message on its own
+  line.
+
+### Extensions (`extensions.py`)
+
+- `fcff048`: a stored `visible` other than true is reported as changing.
+  A `timezone` that differs from the course timezone Gradescope reports is
+  an Error.
+- When the page reports several timezones, or one this server can't load,
+  a `timezone` argument is refused as well, and the Error names what was
+  reported (C5). It no longer passes with a note claiming Gradescope
+  reports no timezone. The refusal tells the user to omit `timezone` or
+  pass the course's (C6); it no longer offers "give the dates with a UTC
+  offset" as a fix on its own.
+- When the argument stood in for an unreported zone and the read-back after
+  the write reports a different one, the result is a ⚠️ warning naming both
+  zones and the dates in course time, not ✅ (C7).
+
+### Start-up and session recovery (`__main__.py`, `auth.py`, `server.py`)
+
+- `2ddeb48`: an unreadable `.env` or a deleted working directory is skipped
+  with a logged reason instead of stopping the server.
+- `eb62fd0` and C12: README, AGENT, `with_session_recovery` and the
+  `gs_tool` docstring state both results of a second expiry. A re-run that
+  had a write accepted returns its output plus the notice. Otherwise the
+  result is the recovery error followed by an earlier output.
+
+### Page downloads (`grading_workflow.py`, `auth.py`, `pyproject.toml`)
+
+- `8130bf1`: the 120 s deadline bounds the whole download. Bodies are read
+  with urllib3's `read1`, and a watchdog shuts down a read still blocked at
+  the deadline.
+- `urllib3>=2.3` is declared (`read1` is from 2.2, `shutdown()` from 2.3)
+  (C8). With an older urllib3 the reader falls back to `iter_content`
+  instead of failing every page.
+- The session-expiry hook no longer reads a streamed body (C10, C13). For a
+  same-site HTML answer it leaves the logged-out-page check to the reader
+  (`auth.check_streamed_body`). The reader runs that check after its
+  bounded read, so the deadline and the 25 MB cap now also hold for a
+  Gradescope-hosted URL answered as HTML. A JPEG labelled `text/html` is
+  again recognized. A body another hook already read is taken from
+  `resp.content`.
+
+### Regrades (`regrades.py`, `server.py`)
+
+- `ad87ec5`: only visible, specific evidence is ✅. That means a checked
+  checkbox, a date, a status word or label, or an icon-library check
+  mark. Hidden or greyed-out icons and a generic `check` class are ❓.
+- A checkbox whose state contradicts the cell's visible text or labels is
+  ❓ (C9). Examples are a checked box next to "Pending" and an unchecked
+  one next to "Completed". Before, the box alone decided, so the first
+  example was ✅. The `tool_get_regrade_requests` description now states
+  these rules (C11).
+
+### Known limitations (documented, not fixed)
+
+- The write cannot know which rows a preview marked SKIPPED. A SKIPPED row
+  left in the confirmed call is written if its grade is cleared in the
+  meantime. The preview, docstrings and skill say to leave such rows out.
+- An approved overwrite (`"overwrite": true`, `overwrite_graded=True`)
+  replaces whatever grade the submission holds at write time, even one
+  changed after the preview. The result names the grade it overwrote. A
+  per-row expected-state check would close this.
+
+### Corrections to earlier entries
+
+- Session 12 (R2-0) says `tool_apply_grade_batch` takes
+  `overwrite_graded`. That is superseded by the per-row `"overwrite": true`
+  above.
+- Session 12 (R2-9) says a second expiry returns the recovery error
+  followed by the first attempt's output. That holds only when the re-run
+  had no write accepted.
+- Session 12 (R2-14) says a check-mark icon is ✅. Now only a visible
+  icon-library check mark counts, and conflicting evidence is ❓.
+
+### Behavior changes for MCP clients
+
+- `tool_apply_grade_batch`: `overwrite_graded` is gone (ignored). There is
+  a per-row `overwrite` (strict boolean), and the preview refuses it on
+  ungraded rows and rows already holding the grade.
+- `tool_grade_answer_group`: `expected_graded_ids` is required to confirm
+  over graded members.
+- `tool_upload_submission`: optional `expected_sha256`. More `❌ Upload not
+  confirmed` outcomes, and fewer for messages that are not errors.
+- `tool_set_extension`: new timezone Errors, a ⚠️ result when the read-back
+  reveals another zone, and a `visible` flip line.
+- `tool_get_regrade_requests`: more rows are ❓ instead of ✅ or ⏳.
+
+### Current state
+
+- **38 tools** + **3 resources** + **7 prompts**
+- **875 automated tests** (`uv run pytest -q`), all passing
+
+---
+
 ## Session 12 — 2026-10-02: Round-2 Review Fixes
 
 ### Why

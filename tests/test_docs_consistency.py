@@ -344,3 +344,32 @@ def test_untrusted_block_markers_are_documented_as_rendered() -> None:
 def test_docs_do_not_repeat_superseded_claims(phrase) -> None:
     for path in (README, AGENT, SKILL, ENV_EXAMPLE):
         assert phrase.lower() not in _flat(_text(path)).lower(), (path.name, phrase)
+
+
+def test_agent_md_describes_the_per_row_batch_overwrite() -> None:
+    """Round-4 C2: AGENT.md said both grade tools need overwrite_graded=True;
+    the batch has a per-row "overwrite": true and no batch-wide flag."""
+    agent = _flat(_text(AGENT))
+    assert "without `overwrite_graded=True`; a batch takes" not in agent
+    assert "refuse graded ones unless `overwrite_graded=True`" not in agent
+    assert '`"overwrite": true` on that batch row (there is no batch-wide flag' in agent
+    assert "plus the `expected_graded_ids` the preview printed" in agent
+
+
+def test_readme_lists_expected_graded_ids_and_the_strict_overwrite_flag() -> None:
+    readme = _flat(_text(README))
+    assert "`rubric_item_ids` and `expected_graded_ids` elements" in readme
+    assert "A batch row's `overwrite` accepts only JSON `true`, `false` or `null`" in readme
+
+
+def test_gs_tool_docstring_states_both_second_expiry_results() -> None:
+    """Round-4 C12: the gs_tool docstring described only the no-write case."""
+    doc = _flat(server.gs_tool.__doc__)
+    assert "a re-run that had a write accepted returns its output plus the same notice" in doc
+    assert "(or the re-run's, if the first attempt raised)" in doc
+
+
+def test_devlog_records_the_round_3_fixes() -> None:
+    devlog = _text(ROOT / "DEVLOG.md")
+    assert "## Session 13" in devlog
+    assert devlog.index("## Session 13") < devlog.index("## Session 12")

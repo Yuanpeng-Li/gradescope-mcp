@@ -334,8 +334,11 @@ def gs_tool(annotations: ToolAnnotations):
     is not re-run, and the first result is returned with a notice that the
     session expired after N accepted write(s), so what the call could not
     confirm must be checked with the read tools. When the re-run also
-    expires, the result is ``SESSION_RECOVERY_FAILED_MESSAGE`` followed by
-    the first attempt's output. The function is then wrapped in
+    expires, a re-run that had a write accepted returns its output plus the
+    same notice (not an error result); otherwise the result is
+    ``SESSION_RECOVERY_FAILED_MESSAGE`` followed by the first attempt's
+    output (or the re-run's, if the first attempt raised). The function is
+    then wrapped in
     ``_signal_errors``, which returns handled failures with ``isError:
     true``. Both wrappers keep the function's name, docstring and
     signature, so the input schema is built from the function itself. The

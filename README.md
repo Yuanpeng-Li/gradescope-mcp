@@ -169,8 +169,8 @@ submission is already graded) and repeats that call with
 ### IDs
 - Every Gradescope ID parameter (`course_id`, `assignment_id`,
   `question_id`, `submission_id`, `group_id`, `rubric_item_id`, `user_id`,
-  `rubric_item_ids` elements and batch-row IDs) is a string of ASCII digits
-  (`^[0-9]+$` in the input schema).
+  `rubric_item_ids` and `expected_graded_ids` elements, and batch-row IDs)
+  is a string of ASCII digits (`^[0-9]+$` in the input schema).
 - JSON numbers are accepted and converted; surrounding whitespace and
   backticks are stripped, and leading zeros are dropped (`"031"` is the
   same ID as `"31"`, `"000"` is `"0"`). Anything else (`"../1"`, `"-1"`,
@@ -184,6 +184,9 @@ submission is already graded) and repeats that call with
   rows) accept JSON numbers and numeric strings. `true` and `false` are
   rejected (`must be a number, not a boolean`) instead of being read as 1
   and 0. `expected_member_count` must be a whole number of at least 0.
+- A batch row's `overwrite` accepts only JSON `true`, `false` or `null`.
+  Strings and numbers (`"yes"`, `"true"`, `1`) are rejected (`must be
+  true, false or null`) instead of opting the row into an overwrite.
 
 ### Submission IDs
 - `tool_get_assignment_submissions` returns assignment-level Global
@@ -285,8 +288,14 @@ submission is already graded) and repeats that call with
   server's timezone. The `timezone` argument (an IANA name) is needed only
   when Gradescope reports no course timezone; if it is given and differs
   from the timezone Gradescope reports, the call is an `Error` naming both
-  and nothing is sent. Dates with an offset (`Z`, `-07:00`) are absolute.
-  Don't mix the two styles. Dates must be in order (release <= due <= late
+  and nothing is sent. When the page reports several timezones, or one the
+  server doesn't know, a `timezone` argument can't be checked and is
+  refused too (the `Error` names what was reported); give the dates with a
+  UTC offset then. Dates with an offset (`Z`, `-07:00`) are absolute.
+  Don't mix the two styles. When `timezone` stood in for an unreported
+  course timezone and the read-back after the write reports a different
+  one, the result is a ⚠️ warning that dates without an offset were
+  resolved in the wrong zone. Dates must be in order (release <= due <= late
   due), including dates kept from the current extension.
 - `tool_set_extension` sends the student's whole extension: the requested
   dates replace the current ones, every other current setting (other
@@ -319,13 +328,13 @@ submission is already graded) and repeats that call with
   graded`) unless `overwrite_graded=True`. `tool_apply_grade_batch` has no
   batch-wide flag: a graded row is skipped unless that row has
   `"overwrite": true`, and the preview refuses `"overwrite": true` on a row
-  that is not graded (there it could only overwrite a grade entered after
-  the preview). Set either only after the user approved overwriting those
-  grades. The graded state is re-read when the write runs, so a grade
-  entered after the preview (for example by another grader) is protected
-  too: the batch lists such rows under "Not written: already graded at
-  write time", whatever the other rows carry. The result names every grade
-  it overwrote. A graded submission that already holds exactly the
+  that is not graded or already holds exactly the requested grade (there
+  it could only overwrite a grade entered after the preview). Set either
+  only after the user approved overwriting those grades. The graded state
+  is re-read when the write runs, so a grade entered after the preview
+  (for example by another grader) is protected too: the batch lists such
+  rows under "Not written: already graded at write time", whatever the
+  other rows carry. The result names every grade it overwrote. A graded submission that already holds exactly the
   requested grade is reported as such, and nothing is sent.
 - The grade is posted to the save URL of the grading page Gradescope
   serves. If that page belongs to another submission, nothing is sent:
@@ -385,10 +394,15 @@ existing submissions. Success is reported only when all of these hold:
 - That submission was not among the existing ones.
 - The final page is that submission's page, or a page below it such as
   the PDF page-selection step.
-- The final page shows no error message.
+- The final page shows no visible error-styled message (`alert-danger`,
+  `alert-error`, `flash-error` and the like). Hidden elements, JavaScript
+  templates and `<noscript>` content are ignored.
 
 Any other outcome is `❌ Upload not confirmed`, with the redirect target,
-the final page and any message Gradescope showed. A rejected upload that
+the final page and any message Gradescope showed (an error message is
+quoted on its own line). A visible message that is not styled as an error
+or a success (a warning, a bare `role="alert"`) does not turn a confirmed
+upload into a failure: the success result quotes it under a ⚠️ line. A rejected upload that
 ends on an older submission is therefore not reported as a success. Check
 the assignment in Gradescope before uploading again, since every upload
 creates a new submission.
@@ -413,8 +427,10 @@ creates a new submission.
   the rest of the crop page, adjacent pages, then every other page, plus
   rubric text and user-provided reference notes.
 - `tool_cache_relevant_pages` streams each page image and drops a page
-  that exceeds 25 MB or takes more than 120 s; failed pages are listed and
-  the rest are cached.
+  that exceeds 25 MB or takes more than 120 s (from the request on, also
+  for a Gradescope-hosted URL answered as HTML); failed pages are listed
+  and the rest are cached. A Gradescope-hosted page that turns out to be
+  the logged-out page is a session expiry, as for any other request.
 - Without a usable `assignment_id`, the workflow helpers find the question's
   assignment by scanning the course: unreadable assignments (no access,
   non-JSON pages) are skipped, while three non-JSON pages in a row or an

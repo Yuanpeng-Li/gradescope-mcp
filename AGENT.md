@@ -89,7 +89,11 @@ simple CRUD wrappers.
     redirect is followed), on the login page itself, on a 401 "must be
     logged in", or on the logged-out home page (a same-site HTML page with
     a form posting to `/login` and no `/logout` link), and flags the
-    current thread (`_local.expired`). Responses that are not expiry
+    current thread (`_local.expired`). It never reads a streamed body: for
+    a streamed same-site HTML answer (page downloads) it leaves the
+    logged-out-page check to the reader, which calls
+    `check_streamed_body(resp, body)` after its bounded read, so the
+    download's size cap and deadline hold. Responses that are not expiry
     signals go through `_note_write`, which counts the same-site write
     requests (not GET/HEAD/OPTIONS/TRACE) Gradescope answered with a 2xx in
     `_local.writes`; a write answered with a redirect stays
@@ -150,9 +154,13 @@ simple CRUD wrappers.
   thresholds (`CONFIDENCE_REJECT_BELOW`, `CONFIDENCE_REVIEW_UP_TO`), the
   batch cap `MAX_BATCH_ROWS` (50), rubric CRUD, question-submission
   discovery, navigation. Grade writes re-read each submission at write time
-  and refuse graded ones unless `overwrite_graded=True`, don't re-send a
-  grade the submission already holds, and refuse a grading page whose save
-  URL targets another submission (`_write_target_problem`).
+  and never overwrite a graded one without that submission's own approval
+  (`overwrite_graded=True` for `apply_grade`, `"overwrite": true` on the
+  batch row; there is no batch-wide flag), don't re-send a grade the
+  submission already holds, and refuse a grading page whose save URL
+  targets another submission (`_write_target_problem`). The batch preview
+  refuses `"overwrite": true` on a row that is not graded or already holds
+  the requested grade.
 - `src/gradescope_mcp/tools/grading_workflow.py`
   Workflow helpers that write artifacts to the private cache, compute
   readiness (pre-read context, not grading confidence), cache pages, and
@@ -213,8 +221,10 @@ Grouped by annotation class. `tests/test_server_mcp.py` pins these sets.
 `idempotentHint=false` for upload and rubric-item creation, true otherwise.
 Idempotent follows the MCP definition (a repeat with the same arguments has
 no additional effect), not "returns the same result": a repeated delete
-reports the item missing, and a repeated group grade without
-`overwrite_graded` is refused because the members are now graded.
+reports the item missing, and a repeated group grade is refused because
+the first call graded the members (without `overwrite_graded`, or with
+an `expected_graded_ids` that no longer matches the graded members);
+nothing is sent.
 
 25. `tool_upload_submission`
 26. `tool_set_extension`
@@ -288,10 +298,14 @@ All tools are `openWorldHint=true`.
 - Rubric updates and deletions are cascading operations
 - Batch answer-group writes can affect many submissions at once, including
   inferred members; already-graded members need `overwrite_graded=True`
+  plus the `expected_graded_ids` the preview printed (refused, nothing
+  sent, when the members graded at write time differ)
 - `tool_apply_grade` and `tool_apply_grade_batch` re-read each submission
   when writing and never overwrite a graded one (including one graded after
-  the preview) without `overwrite_graded=True`; a batch takes at most 50
-  rows
+  the preview) without its own approval: `overwrite_graded=True` for
+  `tool_apply_grade`, `"overwrite": true` on that batch row (there is no
+  batch-wide flag; a client still sending `overwrite_graded` to the batch
+  gets graded rows skipped); a batch takes at most 50 rows
 - Date and extension writes are serialized per assignment / per student
   within the process
 
@@ -325,8 +339,12 @@ All tools are `openWorldHint=true`.
 - Inputs are `YYYY-MM-DDTHH:MM` with an explicit time
 - Assignment dates are course-local wall-clock times without an offset;
   omitted dates and the late-submission flag are preserved
-- Extension dates without an offset use the course timezone (or the
-  `timezone` argument); dates with an offset are absolute
+- Extension dates without an offset use the course timezone Gradescope
+  reports; the `timezone` argument only stands in when it reports none (a
+  differing zone, or one that can't be checked because several or an
+  unknown zone are reported, is an Error), and a stand-in contradicted by
+  the read-back after the write is a ⚠️ warning; dates with an offset are
+  absolute
 - `tool_set_extension` keeps the student's other current extension
   settings (it re-sends them), so existing dates need not be passed again
 
