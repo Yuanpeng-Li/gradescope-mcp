@@ -867,6 +867,10 @@ def test_other_prompts_use_tools_that_provide_what_they_promise() -> None:
     assert "confirm_write=False" in extensions
     assert "Only the dates passed are sent" not in extensions
     assert "re-sends them unchanged" in extensions
+    # A timezone argument is refused when several or unknown zones are
+    # reported, so the prompt must not send the agent down that path.
+    assert "give every date with a UTC offset instead" in extensions
+    assert "course timezone is unknown, ask me for it" not in extensions
 
     assert "do not count those submissions as ungraded" in stats
 

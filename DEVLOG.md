@@ -145,11 +145,14 @@ fixed at the end of this session together with the documentation.
 - `tool_set_extension`: new timezone Errors, a ⚠️ result when the read-back
   reveals another zone, and a `visible` flip line.
 - `tool_get_regrade_requests`: more rows are ❓ instead of ✅ or ⏳.
+- `manage_extensions_workflow` and the stand-in timezone warning now advise
+  UTC offsets (not a timezone argument) when the page reports several zones
+  or one this server can't load.
 
 ### Current state
 
 - **38 tools** + **3 resources** + **7 prompts**
-- **875 automated tests** (`uv run pytest -q`), all passing
+- **876 automated tests** (`uv run pytest -q`), all passing
 
 ---
 

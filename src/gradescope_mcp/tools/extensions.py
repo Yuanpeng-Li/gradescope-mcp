@@ -785,11 +785,19 @@ def _apply_extension(
                     for arg, value in resolved
                     if arg in naive_args
                 ) + ")"
-            zone_mismatch += (
-                ". If the dates were meant as course-local times, the stored "
-                "dates are wrong: preview the extension again without "
-                "timezone and confirm it."
-            )
+            if after_zone is not None:
+                zone_mismatch += (
+                    ". If the dates were meant as course-local times, the stored "
+                    "dates are wrong: preview the extension again without "
+                    "timezone and confirm it."
+                )
+            else:
+                zone_mismatch += (
+                    ". If the dates were meant as course-local times, the stored "
+                    "dates are wrong: preview the extension again with every "
+                    "date given as a UTC offset (no timezone argument) and "
+                    "confirm it."
+                )
         else:
             summary += (
                 f"\n- The extensions page now reports the course timezone "

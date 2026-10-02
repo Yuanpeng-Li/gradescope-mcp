@@ -2115,6 +2115,24 @@ def test_stand_in_timezone_contradicted_by_the_read_back_is_flagged(monkeypatch)
     assert len(srv.posted) == 1
 
 
+def test_stand_in_timezone_contradicted_by_an_unknown_zone_advises_offsets(monkeypatch) -> None:
+    """When the read-back reveals a zone this server can't load, previewing
+    again without timezone would be refused, so the advice is UTC offsets."""
+    srv = ExtensionServer(overrides={}, timezone=None)
+    _zone_revealed_by_the_write(srv, "Mars/Olympus_Mons")
+    _use(monkeypatch, extensions, srv.session)
+
+    text = extensions.set_extension(
+        "1", "2", "3", due_date="2026-10-04T23:59", timezone="America/New_York",
+        confirm_write=True,
+    )
+
+    assert text.startswith("⚠️ Extension for user `3` on assignment `2` was written")
+    assert "now reports Mars/Olympus_Mons" in text
+    assert "with every date given as a UTC offset (no timezone argument)" in text
+    assert "again without timezone" not in text
+
+
 def test_stand_in_timezone_confirmed_by_the_read_back_is_success(monkeypatch) -> None:
     srv = ExtensionServer(overrides={}, timezone=None)
     _zone_revealed_by_the_write(srv, "America/New_York")
