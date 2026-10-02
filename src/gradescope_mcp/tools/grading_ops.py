@@ -1934,10 +1934,11 @@ def apply_grade_batch(
     such and not re-sent. A row whose grading page belongs to another
     submission is not written.
 
-    This is meant for the main agent's post-approval execution phase. Subagents
-    cannot call write-gated tools in the Claude Code harness, so all writes
-    must funnel through the main agent; a batch variant cuts round-trips
-    dramatically for large grading runs.
+    This is meant for the main agent's post-approval execution phase:
+    subagents (if any) should only propose rows, and the main agent previews
+    the batch, gets the user's approval and writes it. The server cannot
+    tell which agent calls it, so this is guidance, not enforcement. A batch
+    variant cuts round-trips dramatically for large grading runs.
     """
     if not course_id or not question_id:
         return "Error: course_id and question_id are required."

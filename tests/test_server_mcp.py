@@ -41,7 +41,11 @@ GRADESCOPE_WRITES = {
 LOCAL_CACHE_WRITES = {
     "tool_prepare_grading_artifact", "tool_cache_relevant_pages", "tool_prepare_answer_key",
 }
-# Writes that create something new on every call.
+# Writes that create something new on every call. Everything else that writes
+# is idempotent in the MCP sense (a repeat has no additional effect), even when
+# a repeat returns a different result: a repeated tool_delete_rubric_item finds
+# the item gone, a repeated tool_grade_answer_group without overwrite_graded is
+# refused because the members are now graded.
 NON_IDEMPOTENT = {"tool_upload_submission", "tool_create_rubric_item"}
 
 
@@ -736,6 +740,54 @@ def test_tool_descriptions_do_not_hardcode_the_old_cache_path() -> None:
         assert "/tmp/gradescope-mcp" not in tool.description, name
 
 
+def test_descriptions_state_the_implementation_limits() -> None:
+    from gradescope_mcp.tools import assignments, grading_workflow
+
+    tools = _tools()
+
+    def doc(name):
+        return " ".join(tools[name].description.split())
+
+    mb = grading_workflow._MAX_PAGE_BYTES / (1024 * 1024)
+    deadline = grading_workflow._PAGE_DEADLINE_SECONDS
+    assert f"exceeds {mb:g} MB or takes more than {deadline:g} s" in doc("tool_cache_relevant_pages")
+    wait = f"waits up to {assignments._WRITE_LOCK_TIMEOUT:g} s"
+    assert wait in doc("tool_set_extension") and wait in doc("tool_modify_assignment_dates")
+    assert f"At most {MAX_BATCH_ROWS} rows per call" in doc("tool_apply_grade_batch")
+
+
+def test_descriptions_make_no_claims_about_a_client_harness() -> None:
+    """The server can't know or enforce what a client lets subagents call."""
+    for name, tool in _tools().items():
+        text = " ".join(tool.description.split())
+        assert "Claude Code" not in text and "harness" not in text, name
+        assert "Subagents cannot" not in text, name
+    batch = " ".join(_tools()["tool_apply_grade_batch"].description.split())
+    assert "subagents (if any) should only propose rows" in batch
+    assert "At most 50 rows per call" in batch
+
+
+def test_descriptions_document_the_untrusted_block_id() -> None:
+    doc = " ".join(_tools()["tool_get_student_submission"].description.split())
+    assert "block id" in doc and "same random block id closes a block" in doc
+
+
+def test_descriptions_match_the_round_two_behavior() -> None:
+    tools = _tools()
+
+    def doc(name):
+        return " ".join(tools[name].description.split())
+
+    assert "Only the dates passed are sent" not in doc("tool_set_extension")
+    assert "every other current setting" in doc("tool_set_extension")
+    assert "Other Settings" in doc("tool_get_extensions")
+    assert "not found in course" in doc("tool_get_assignment_details")
+    assert "Upload not confirmed" in doc("tool_upload_submission")
+    assert "unknown is not the same as ungraded" in doc("tool_get_assignment_submissions")
+    assert "crop matches none of the pages" in doc("tool_get_regrade_detail")
+    assert "unknown" in doc("tool_get_question_rubric")
+
+
 _PROMPT_ARGS = {
     "course_id": "101",
     "assignment_id": "202",
@@ -811,3 +863,39 @@ def test_other_prompts_use_tools_that_provide_what_they_promise() -> None:
 
     extensions = prompts["manage_extensions_workflow"]
     assert "confirm_write=False" in extensions
+    assert "Only the dates passed are sent" not in extensions
+    assert "re-sends them unchanged" in extensions
+
+    assert "do not count those submissions as ungraded" in stats
+
+
+def _after(text: str, first: str, then: str) -> bool:
+    start = text.find(first)
+    return start != -1 and text.find(then, start) > start
+
+
+def test_grade_prompts_require_approval_for_overwrite_graded() -> None:
+    prompts = _render_prompts()
+
+    # A regraded submission is already graded: the previewed call carries
+    # overwrite_graded=True and is repeated unchanged after approval.
+    regrades = prompts["review_regrade_requests"]
+    assert _after(regrades, "overwrite_graded=True, confirm_write=False", "explicit approval")
+    assert _after(regrades, "explicit approval", "repeat the same call with confirm_write=True")
+    assert "block id" in regrades
+
+    grade = prompts["grade_submission_with_rubric"]
+    assert _after(grade, "confirm_write=True alone will not write",
+                  "overwrite_graded=True only if I explicitly approve")
+
+    auto = prompts["auto_grade_question"]
+    assert f"at most {MAX_BATCH_ROWS} rows per call" in auto
+    assert "Already graded rows are skipped unless overwrite_graded=True" in auto
+    assert _after(auto, "explicitly approve overwriting",
+                  "preview the batch again with overwrite_graded=True")
+    assert "overwrite_graded value exactly as previewed and confirm_write=True" in auto
+    assert "SKIPPED, OVERWRITTEN or NEEDS HUMAN REVIEW" in auto
+    assert "'Not written: already graded at write time'" in auto
+    assert "already holding the requested grade" in auto
+    assert "overwrite_graded=True is only for grades I approved overwriting" in auto
+    assert "block id" in auto
