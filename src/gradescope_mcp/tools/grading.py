@@ -19,22 +19,10 @@ from gradescope_mcp.tools.common import (
     escape_md_cell,
     format_untrusted,
     normalize_url,
+    sanitize_inline,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _sanitize_inline(value) -> str:
-    """Make student-controlled text (e.g. a display name) safe on one line.
-
-    Newlines and runs of whitespace collapse to single spaces, so the text
-    cannot start its own markdown line (a heading or a fake instruction),
-    and ``|`` is escaped so it cannot split a table cell. ``None`` renders as
-    an empty string.
-    """
-    if value is None:
-        return ""
-    return " ".join(str(value).split()).replace("|", "\\|")
 
 
 def _get_outline_data(course_id: str, assignment_id: str) -> dict:
@@ -405,7 +393,7 @@ def get_student_assignment_link(
         for r in matches:
             sub = (r.get("Submission ID") or "").strip()
             options.append(
-                f"- {_sanitize_inline(_row_email(r)) or '(no email)'}: "
+                f"- {sanitize_inline(_row_email(r)) or '(no email)'}: "
                 f"{_url(sub) if sub else 'no submission'}"
             )
         return (
@@ -904,11 +892,11 @@ def get_student_submission_content(course_id: str, assignment_id: str,
 
     # Names and emails come from the roster export and may be student-edited:
     # keep them on one line in every heading below.
-    student_email = _sanitize_inline(_row_email(row))
+    student_email = sanitize_inline(_row_email(row))
     sub_id = (row.get("Submission ID") or "").strip()
     if row.get("Status") == "Missing" or not sub_id:
         return f"Student {student_email} has no submission for this assignment."
-    student_name = _sanitize_inline(_row_full_name(row)) or student_email
+    student_name = sanitize_inline(_row_full_name(row)) or student_email
     csv_total = _csv_total_display(row)
 
     # Fetch the submission page
