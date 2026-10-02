@@ -200,7 +200,9 @@ def test_get_submission_grading_context_json_filters_self_links_and_placeholder_
     parsed = json.loads(result)
 
     assert parsed["student"] == "Student A"
-    assert parsed["text_answer"] == "final answer\n[Uploaded file ID: abc123]"
+    # Student-authored text is fenced as untrusted data.
+    assert parsed["text_answer"].startswith("<<<BEGIN UNTRUSTED STUDENT ANSWER")
+    assert "final answer\n[Uploaded file ID: abc123]" in parsed["text_answer"]
     assert parsed["navigation"] == {
         "previous_ungraded": {"question_id": "2", "submission_id": "88"},
         "next_submission": {"question_id": "2", "submission_id": "100"},
@@ -257,7 +259,8 @@ def test_get_submission_grading_context_markdown_shows_real_pages_only(monkeypat
 
     result = grading_ops.get_submission_grading_context("1", "2", "99")
 
-    assert "## Grading Context — QIntegral" in result
+    assert "## Grading Context — Integral" in result
+    assert "**Current Score:** Ungraded" in result
     assert "**Scoring:** negative (floor=0, ceiling=10)" in result
     assert "Rubric items **deduct** points" in result
     assert "- **next_submission**: qid=`2`, sid=`100`" in result
@@ -378,30 +381,45 @@ def _make_fake_batch_ctx_builder(posts: list, status_by_sid: dict | None = None)
     """Build a _get_grading_context substitute that records POSTs per submission.
 
     Returns a callable suitable for monkeypatching ``_get_grading_context``.
+    A successful POST is reflected in later page loads of that submission,
+    so the post-write read-back sees what was saved.
     """
     status_by_sid = status_by_sid or {}
+    saved: dict = {}
 
     def _builder(_course_id, _question_id, submission_id):
         class _Session:
             def post(self, url, **kwargs):
                 posts.append({"submission_id": submission_id, "url": url, **kwargs})
                 status = status_by_sid.get(submission_id, 200)
+                if status == 200:
+                    saved[submission_id] = kwargs["json"]
                 return SimpleNamespace(
                     status_code=status,
                     json=lambda: {"score": 1.0 if status == 200 else None},
                     text="" if status == 200 else "boom",
                 )
 
+        state = saved.get(submission_id)
+        evaluations = []
+        evaluation = {"points": None, "comments": None}
+        if state is not None:
+            evaluations = [
+                {"rubric_item_id": int(rid), "present": item["score"] == "true"}
+                for rid, item in state["rubric_items"].items()
+            ]
+            evaluation = dict(state["question_submission_evaluation"])
+
         return {
             "props": {
                 "question": {"weight": 1},
                 "submission": {"score": None},
-                "evaluation": {"points": None, "comments": None},
+                "evaluation": evaluation,
                 "rubric_items": [
                     {"id": 100, "description": "Correct", "weight": 0},
                     {"id": 200, "description": "Not attempted", "weight": 1},
                 ],
-                "rubric_item_evaluations": [],
+                "rubric_item_evaluations": evaluations,
                 "urls": {"save_grade": f"/save/{submission_id}"},
             },
             "csrf_token": "csrf",
@@ -471,8 +489,8 @@ def test_apply_grade_batch_applies_all_approved_rows(monkeypatch) -> None:
     assert payload_aa["rubric_items"]["200"] == {"score": "false"}
 
 
-def test_apply_grade_batch_surfaces_unknown_rubric_ids(monkeypatch) -> None:
-    """A row that references a rubric ID not present in the question must be flagged."""
+def test_apply_grade_batch_refuses_unknown_rubric_ids(monkeypatch) -> None:
+    """A row that references a rubric ID not in the question refuses the whole batch."""
     posts: list = []
     monkeypatch.setattr(
         grading_ops,
@@ -485,19 +503,17 @@ def test_apply_grade_batch_surfaces_unknown_rubric_ids(monkeypatch) -> None:
         question_id="2",
         grades=[
             {"submission_id": "aa", "rubric_item_ids": ["100"], "confidence": 0.9},
-            # 999 does not exist on the question; should still POST and warn.
+            # 999 does not exist on the question.
             {"submission_id": "bb", "rubric_item_ids": ["100", "999"], "confidence": 0.9},
         ],
         confirm_write=True,
     )
 
-    assert "**succeeded:** 2" in result
-    assert "Unknown rubric IDs" in result
-    # Only the bb row had unknowns — aa must not appear in the warning section.
-    warning_section = result.split("Unknown rubric IDs", 1)[1]
-    assert "`bb`" in warning_section
-    assert "'999'" in warning_section
-    assert "`aa`" not in warning_section
+    assert result.startswith("Error: batch refused; nothing was written.")
+    assert "row 1 (bb)" in result and "['999']" in result
+    assert "row 0 (aa)" not in result
+    assert "`100`" in result and "`200`" in result  # valid IDs are listed
+    assert posts == []
 
 
 def test_apply_grade_batch_low_confidence_rows_are_skipped(monkeypatch) -> None:
@@ -877,8 +893,8 @@ def test_graded_flag_column_only_treats_affirmative_tokens_as_graded(monkeypatch
     }
 
 
-def test_graded_heuristic_handles_headerless_tables(monkeypatch) -> None:
-    """Fallback path: when no <thead>, scanning still skips the leading row-index cell."""
+def test_graded_status_is_unknown_for_headerless_tables(monkeypatch) -> None:
+    """Without Score/Graded? headers the status is reported as unknown, not guessed."""
     html = """
     <table>
       <tr><td>1</td><td>Alice 3rd</td><td>8/10</td><td><a href="/courses/1/questions/2/submissions/301/grade">grade</a></td></tr>
@@ -890,34 +906,29 @@ def test_graded_heuristic_handles_headerless_tables(monkeypatch) -> None:
     entries = grading_ops._fetch_question_submission_entries("1", "2")
     graded_map = {e["submission_id"]: e["graded"] for e in entries}
 
-    assert graded_map == {"301": True, "302": False}
+    assert graded_map == {"301": None, "302": None}
+    # The row index is still skipped when looking for the name.
+    assert [e["student_name"] for e in entries] == ["Alice 3rd", "Bob Example"]
 
 
-def test_get_next_ungraded_uses_props_sid_after_auto_discovery(monkeypatch) -> None:
-    """After auto-discovery, current_sid should come from props, not the stale input."""
+def test_get_next_ungraded_falls_back_to_listing_for_invalid_submission_id(monkeypatch) -> None:
+    """A 404 submission ID (e.g. a Global ID) opens the first ungraded submission."""
     call_log = []
 
     def fake_get_grading_context(course_id, question_id, submission_id):
         call_log.append(("ctx", submission_id))
         if submission_id == "GLOBAL_99999":
-            raise ValueError("404 Not Found")
-        return {
-            "props": {
-                "submission": {"id": "200", "graded": True},
-                "navigation_urls": {
-                    # next_ungraded points to a different sid than the discovered one
-                    "next_ungraded": f"/courses/{course_id}/questions/{question_id}/submissions/300/grade",
-                },
-                "num_graded_submissions": 4,
-                "num_submissions": 5,
-            }
-        }
+            raise ValueError("Cannot access grading page (status 404).")
+        raise AssertionError("navigation should come from the listing")
 
     monkeypatch.setattr(grading_ops, "_get_grading_context", fake_get_grading_context)
     monkeypatch.setattr(
         grading_ops,
-        "_find_question_submission_id",
-        lambda *_args, **_kwargs: "200",
+        "_fetch_question_submission_entries",
+        lambda *_args, **_kwargs: [
+            {"submission_id": "200", "student_name": "A", "graded": True},
+            {"submission_id": "300", "student_name": "B", "graded": False},
+        ],
     )
     monkeypatch.setattr(
         grading_ops,
@@ -930,7 +941,5 @@ def test_get_next_ungraded_uses_props_sid_after_auto_discovery(monkeypatch) -> N
     # Pass a global submission ID that will 404
     result = grading_ops.get_next_ungraded("1", "2", "GLOBAL_99999", output_format="json")
 
-    # next_ungraded points to 300, which is different from props sid 200,
-    # so it should navigate to 300
     assert result == "CTX 1 2 300 json"
-
+    assert call_log == [("ctx", "GLOBAL_99999")]
