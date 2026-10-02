@@ -13,8 +13,11 @@ import logging
 import socket
 import threading
 import time
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from urllib.parse import parse_qs, quote, quote_plus, urlsplit
 
+import anyio
 import pytest
 import requests
 from gradescopeapi.classes.account import Account
@@ -22,7 +25,7 @@ from gradescopeapi.classes.connection import GSConnection
 from requests.adapters import HTTPAdapter
 from requests.structures import CaseInsensitiveDict
 
-from gradescope_mcp import auth
+from gradescope_mcp import auth, server
 
 BASE = "https://www.gradescope.com"
 EMAIL = "prof@example.edu"
@@ -66,6 +69,7 @@ class FakeGradescope:
         self.sent: list[tuple[str, str, str, object]] = []
         self.logins = 0
         self.login_status: int | None = None  # force an HTTP status on POST /login
+        self.login_answers: list = []  # answer(request) for the next login POSTs
         self.login_delay = 0.0
         self._lock = threading.Lock()
         self._landing_csrf: str | None = None
@@ -81,6 +85,8 @@ class FakeGradescope:
             return make_response(request, 200, HOME_PAGE)
         if path == "/login" and request.method == "POST":
             time.sleep(self.login_delay)
+            if self.login_answers:
+                return self.login_answers.pop(0)(request)
             if self.login_status is not None:
                 return make_response(request, self.login_status, "<html>error</html>")
             form = parse_qs(body)
@@ -114,6 +120,26 @@ def _clean_auth_state(monkeypatch):
     monkeypatch.delenv(auth.HTTP_TIMEOUT_ENV, raising=False)
     yield
     auth._local.expired = None
+
+
+class FakeClock:
+    """Stands in for ``auth._clock`` so cooldowns can expire instantly."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch) -> FakeClock:
+    fake = FakeClock()
+    monkeypatch.setattr(auth, "_clock", fake)
+    return fake
 
 
 @pytest.fixture
@@ -187,22 +213,40 @@ def test_missing_credentials_raise_auth_error(monkeypatch, fake_gs) -> None:
     assert fake_gs.sent == []
 
 
-def test_invalid_credentials_are_not_retried_until_env_changes(monkeypatch, fake_gs) -> None:
+def _login_posts(fake: FakeGradescope) -> int:
+    return sum(1 for method, url, *_ in fake.sent if method == "POST" and url.endswith("/login"))
+
+
+def test_invalid_credentials_wait_for_the_cooldown_or_changed_env(
+    monkeypatch, fake_gs, clock
+) -> None:
     monkeypatch.setenv("GRADESCOPE_PASSWORD", "wrong-password")
 
     with pytest.raises(auth.AuthError) as first:
         auth.get_connection()
-    assert str(first.value) == "Gradescope login failed: invalid credentials."
+    assert str(first.value) == (
+        "Gradescope login failed: invalid credentials. Check GRADESCOPE_EMAIL and "
+        "GRADESCOPE_PASSWORD. Not trying to log in again for 10 min."
+    )
+    assert str(first.value).startswith(auth.INVALID_CREDENTIALS_MESSAGE)
     attempts = len(fake_gs.sent)
 
     # Cooldown: same credentials -> same error, Gradescope is not contacted.
+    clock.advance(30)
     for _ in range(3):
         with pytest.raises(auth.AuthError) as again:
             auth.get_connection()
-        assert str(again.value) == "Gradescope login failed: invalid credentials."
+        assert str(again.value).startswith(auth.INVALID_CREDENTIALS_MESSAGE)
+        assert str(again.value).endswith("Not trying to log in again for 9 min 30 s.")
     assert len(fake_gs.sent) == attempts
 
-    # Changed credentials are tried again.
+    # The cooldown ends instead of lasting for the life of the process.
+    clock.advance(auth.INVALID_CREDENTIALS_COOLDOWN)
+    with pytest.raises(auth.AuthError, match="invalid credentials"):
+        auth.get_connection()
+    assert _login_posts(fake_gs) == 2
+
+    # Changed credentials are tried again at once.
     monkeypatch.setenv("GRADESCOPE_PASSWORD", PASSWORD)
     conn = auth.get_connection()
     assert conn.logged_in is True
@@ -211,14 +255,25 @@ def test_invalid_credentials_are_not_retried_until_env_changes(monkeypatch, fake
 
 
 @pytest.mark.parametrize("status", [500, 503, 429])
-def test_server_errors_during_login_are_not_cached(fake_gs, status) -> None:
+def test_server_errors_during_login_wait_one_minute(fake_gs, clock, status) -> None:
     fake_gs.login_status = status
-    with pytest.raises(auth.AuthError, match=f"HTTP {status}"):
+    with pytest.raises(auth.AuthError, match=f"HTTP {status}; try again later") as info:
         auth.get_connection()
-    assert auth._failed_login is None
+    assert "invalid credentials" not in str(info.value)
+    assert str(info.value).endswith("Not trying to log in again for 1 min.")
 
+    # Throttled: later calls do not POST the credentials again...
     fake_gs.login_status = None
+    for _ in range(4):
+        with pytest.raises(auth.AuthError, match=f"HTTP {status}"):
+            auth.get_connection()
+    assert _login_posts(fake_gs) == 1
+
+    # ...until the cooldown is over.
+    clock.advance(auth.THROTTLED_LOGIN_COOLDOWN)
     assert auth.get_connection().logged_in is True
+    assert _login_posts(fake_gs) == 2
+    assert auth._failed_login is None
 
 
 def test_missing_login_form_is_not_cached(monkeypatch, fake_gs) -> None:
@@ -226,13 +281,212 @@ def test_missing_login_form_is_not_cached(monkeypatch, fake_gs) -> None:
 
     def no_form(request, timeout):
         if urlsplit(request.url).path in ("", "/"):
-            return make_response(request, 503, "<html>maintenance</html>")
+            return make_response(request, 200, "<html>a page without the form</html>")
         return original(request, timeout)
 
     monkeypatch.setattr(fake_gs, "handle", no_form)
-    with pytest.raises(auth.AuthError, match="login form was not found"):
+    with pytest.raises(auth.AuthError, match="login form was not found") as info:
         auth.get_connection()
+    assert "Not trying" not in str(info.value)
     assert auth._failed_login is None
+
+
+def test_home_page_maintenance_waits_for_retry_after(monkeypatch, fake_gs, clock) -> None:
+    original = fake_gs.handle
+
+    def maintenance(request, timeout):
+        if urlsplit(request.url).path in ("", "/"):
+            return make_response(
+                request, 503, "<html>maintenance</html>", {"Retry-After": "120"}
+            )
+        return original(request, timeout)
+
+    monkeypatch.setattr(fake_gs, "handle", maintenance)
+    with pytest.raises(auth.AuthError, match=r"login form was not found .*\(HTTP 503\)") as info:
+        auth.get_connection()
+    assert str(info.value).endswith("Not trying to log in again for 2 min.")
+    gets = len(fake_gs.sent)
+    with pytest.raises(auth.AuthError, match="HTTP 503"):
+        auth.get_connection()
+    assert len(fake_gs.sent) == gets  # Gradescope was not contacted
+
+    monkeypatch.setattr(fake_gs, "handle", original)
+    clock.advance(120)
+    assert auth.get_connection().logged_in is True
+
+
+def _answer(status: int, body: str = "<html>Just a moment... / try again</html>", headers=None):
+    return lambda request: make_response(request, status, body, headers)
+
+
+def _list_courses() -> tuple[bool, str]:
+    result = anyio.run(server.mcp.call_tool, "tool_list_courses", {})
+    return result.is_error, result.content[0].text
+
+
+@pytest.mark.parametrize("status", [403, 422, 200])
+def test_transient_login_rejection_is_not_invalid_credentials(fake_gs, clock, status) -> None:
+    """Reviewer repro R2/login_misclass.py: one WAF challenge, CSRF failure or
+    unexpected page used to cache 'invalid credentials' until a restart."""
+    fake_gs.login_answers = [_answer(status)]
+
+    is_error, text = _list_courses()
+    assert is_error is True
+    assert text == (
+        f"Authentication error: Gradescope login failed: login rejected (HTTP {status}). "
+        "Not trying to log in again for 1 min."
+    )
+
+    # Within the cooldown the credentials are not POSTed again...
+    clock.advance(20)
+    is_error, text = _list_courses()
+    assert is_error is True
+    assert text.endswith("login rejected (HTTP %d). Not trying to log in again for 40 s." % status)
+    assert _login_posts(fake_gs) == 1
+
+    # ...and after it the next call logs in.
+    clock.advance(40)
+    is_error, text = _list_courses()
+    assert is_error is False, text
+    assert _login_posts(fake_gs) == 2
+    assert fake_gs.logins == 1
+
+
+def test_throttled_login_is_not_retried_on_every_call(fake_gs, clock) -> None:
+    """Reviewer repro R2/login_429.py: five calls used to POST five times."""
+    fake_gs.login_status = 429
+
+    for _ in range(5):
+        is_error, text = _list_courses()
+        assert is_error is True
+        assert "Gradescope answered HTTP 429; try again later." in text
+    assert _login_posts(fake_gs) == 1
+
+    clock.advance(auth.THROTTLED_LOGIN_COOLDOWN)
+    _list_courses()
+    assert _login_posts(fake_gs) == 2
+
+
+@pytest.mark.parametrize(
+    "retry_after, wait",
+    [("300", "5 min"), ("86400", "15 min"), ("0", "1 s"), ("soon", "1 min")],
+)
+def test_retry_after_sets_the_cooldown(fake_gs, clock, retry_after, wait) -> None:
+    fake_gs.login_answers = [_answer(503, headers={"Retry-After": retry_after})]
+    with pytest.raises(auth.AuthError) as info:
+        auth.get_connection()
+    assert str(info.value) == (
+        "Gradescope login failed: Gradescope answered HTTP 503; try again later. "
+        f"Not trying to log in again for {wait}."
+    )
+
+
+def test_retry_after_http_date(fake_gs, clock) -> None:
+    when = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=185), usegmt=True)
+    fake_gs.login_answers = [_answer(429, headers={"Retry-After": when})]
+    with pytest.raises(auth.AuthError, match=r"for 3 min \d+ s\.$"):
+        auth.get_connection()
+
+
+FLASH_LOGIN_PAGE = LOGIN_PAGE.replace(
+    "<body>", '<body><p class="alert">Invalid email or password.</p>'
+)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        _answer(200, LOGIN_PAGE),  # the login form re-rendered
+        _answer(422, LOGIN_PAGE),
+        _answer(422, '<html><div class="alert">Invalid email/password combination.</div></html>'),
+        lambda request: make_response(request, 302, "", {"Location": BASE + "/login?flash=1"}),
+    ],
+    ids=["200-form", "422-form", "422-flash", "redirect-to-flash"],
+)
+def test_invalid_credentials_are_recognized(monkeypatch, fake_gs, clock, answer) -> None:
+    original = fake_gs.handle
+
+    def handle(request, timeout):
+        if urlsplit(request.url).query == "flash=1":
+            return make_response(request, 200, FLASH_LOGIN_PAGE)
+        return original(request, timeout)
+
+    monkeypatch.setattr(fake_gs, "handle", handle)
+    fake_gs.login_answers = [answer]
+
+    with pytest.raises(auth.AuthError) as info:
+        auth.get_connection()
+    assert str(info.value) == (
+        "Gradescope login failed: invalid credentials. Check GRADESCOPE_EMAIL and "
+        "GRADESCOPE_PASSWORD. Not trying to log in again for 10 min."
+    )
+
+
+@pytest.mark.parametrize(
+    "answer, reason, wait",
+    [
+        (
+            _answer(200, LOGIN_PAGE.replace(
+                "<body>", "<body><p>Too many login attempts. Try again later.</p>"
+            )),
+            "Gradescope reports too many login attempts; try again later.",
+            "5 min",
+        ),
+        (
+            lambda request: make_response(request, 302, "", {"Location": BASE + "/login"}),
+            "Gradescope redirected back to the login page.",
+            "1 min",
+        ),
+        (
+            lambda request: make_response(request, 302, "", {"Location": BASE + "/"}),
+            "Gradescope showed its login form again after the redirect.",
+            "1 min",
+        ),
+        (
+            lambda request: make_response(request, 303, "", {"Location": BASE + "/account"}),
+            "login rejected (HTTP 303 redirect).",
+            "1 min",
+        ),
+    ],
+    ids=["too-many-attempts", "redirect-to-login", "redirect-to-home", "303"],
+)
+def test_other_login_answers_are_rejections(fake_gs, clock, answer, reason, wait) -> None:
+    fake_gs.login_answers = [answer]
+    with pytest.raises(auth.AuthError) as info:
+        auth.get_connection()
+    assert str(info.value) == (
+        f"Gradescope login failed: {reason} Not trying to log in again for {wait}."
+    )
+    assert auth._connection is None
+
+
+def test_logged_in_landing_page_with_a_login_form_is_still_a_login(monkeypatch, fake_gs) -> None:
+    """A page with a logout link belongs to a logged-in session, even if it
+    also carries a login form (e.g. a 'switch account' dialog)."""
+    original = fake_gs.handle
+
+    def landing(request, timeout):
+        if urlsplit(request.url).path == "/account":
+            page = LOGIN_PAGE.replace(
+                "<body>", '<body><a href="/logout">Log Out</a>'
+            ).replace("LOGIN-PAGE-CSRF", "CSRF-LANDING")
+            return make_response(request, 200, page)
+        return original(request, timeout)
+
+    monkeypatch.setattr(fake_gs, "handle", landing)
+    conn = auth.get_connection()
+    assert conn.logged_in is True
+    assert conn.session.headers["X-CSRF-Token"] == "CSRF-LANDING"
+
+
+def test_login_rejection_messages_never_contain_the_credentials(fake_gs, clock) -> None:
+    echo = f"<html><p>Login rejected for {EMAIL} / {PASSWORD}</p></html>"
+    fake_gs.login_answers = [_answer(403, echo)]
+    for _ in range(2):  # the first answer and the cached one
+        with pytest.raises(auth.AuthError) as info:
+            auth.get_connection()
+        for secret in _secret_forms():
+            assert secret not in str(info.value)
 
 
 def test_connect_failure_during_login_does_not_leak_credentials(monkeypatch, caplog) -> None:

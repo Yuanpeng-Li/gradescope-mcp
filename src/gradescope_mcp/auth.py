@@ -12,10 +12,17 @@ what an error may say:
 - **No credentials in errors.** A failed login raises ``AuthError`` naming
   the exception class and a scrubbed reason; the password, the email and any
   ``session[...]=`` query fragments are redacted from messages and logs.
-- **Failed-login cooldown.** Once Gradescope rejects the credentials, later
-  calls raise the same ``AuthError`` without contacting Gradescope until
-  ``GRADESCOPE_EMAIL`` / ``GRADESCOPE_PASSWORD`` change. Network failures and
-  server errors are not cached.
+- **Failed-login cooldown.** When Gradescope answers a login attempt without
+  logging in, later calls with the same credentials raise the same
+  ``AuthError`` without contacting Gradescope until a cooldown ends (or
+  ``GRADESCOPE_EMAIL`` / ``GRADESCOPE_PASSWORD`` change). Only a re-rendered
+  login form or an "invalid email/password" message counts as invalid
+  credentials (10 minutes). HTTP 429 and 5xx answers wait for Gradescope's
+  ``Retry-After`` (capped at 15 minutes; 1 minute without one); a "too many
+  attempts" page waits 5 minutes; any other rejection (a 403 challenge, a 422
+  CSRF failure, a redirect back to the login page) is reported as "login
+  rejected (HTTP <status>)" and waits 1 minute. Network failures are not
+  cached.
 - **Default timeouts.** The session's adapters apply a timeout (connect 10 s,
   read 60 s) to every request that does not pass its own, including the
   requests gradescopeapi helpers make on the same session.
@@ -25,16 +32,21 @@ what an error may say:
   while the process still holds the cookie, and ``GSConnection.logged_in``
   never resets on its own. A response hook installed after login raises
   ``SessionExpiredError`` when Gradescope redirects to ``/login`` (or
-  ``/account/auth``), serves its login page, or answers 401 "You must be
-  logged in", and flags the current thread. ``with_session_recovery``
-  (applied to every MCP tool and resource in ``server.py``) sees the flag,
-  drops the expired connection and re-runs the call once on a fresh login,
-  so a call logs in again at most once.
+  ``/account/auth``), serves its login page, answers 401 "You must be logged
+  in", or serves the logged-out home page (a page with the login form and no
+  logout link, e.g. after a redirect to ``/``), and flags the current thread.
+  ``with_session_recovery`` (applied to every MCP tool and resource in
+  ``server.py``) sees the flag and drops the expired connection. It re-runs
+  the call once on a fresh login, so a call logs in again at most once,
+  unless Gradescope had already accepted a write during the call: then the
+  first result is returned with a notice instead (see
+  ``with_session_recovery``).
 
 Since mcp v2, sync tool functions run on worker threads and can execute
 concurrently, so creating and dropping the singleton is serialized with a
-lock, and the "expired during this call" flag is thread-local. The shared
-``requests.Session`` itself is used concurrently.
+lock, and the per-call state ("expired during this call", "writes accepted
+during this call") is thread-local. The shared ``requests.Session`` itself is
+used concurrently.
 """
 
 import functools
@@ -45,29 +57,47 @@ import math
 import os
 import re
 import threading
-from typing import Callable, TypeVar
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Callable, NamedTuple, TypeVar
 from urllib.parse import quote, quote_plus, urljoin, urlsplit
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from gradescopeapi.classes.account import Account
 from gradescopeapi.classes.connection import GSConnection
 from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass(frozen=True)
+class _LoginFailure:
+    """A login Gradescope answered without logging in, and its cooldown."""
+
+    fingerprint: str  # of the credentials used (never the credentials themselves)
+    reason: str  # scrubbed AuthError text, without the cooldown sentence
+    retry_at: float  # ``_clock()`` value from which logging in is tried again
+
+
 # Singleton connection instance
 _connection: GSConnection | None = None
 # Guards creation and reset of ``_connection`` (and ``_failed_login``) across
 # tool worker threads.
 _connection_lock = threading.Lock()
-# Fingerprint of the credentials Gradescope last rejected (never the
-# credentials themselves); cleared by the next successful login.
-_failed_login: str | None = None
-# Per-thread state: ``expired`` is the connection whose session expired during
-# the current call (set by the response hook); ``recovering`` is True inside
-# the outermost ``with_session_recovery`` wrapper.
+# The last failed login and its cooldown; cleared by the next successful login.
+_failed_login: _LoginFailure | None = None
+# Per-thread state of the current call: ``expired`` is the connection whose
+# session expired (set by the response hook); ``writes`` counts same-site
+# write requests (methods other than GET/HEAD/OPTIONS/TRACE) that Gradescope
+# answered with a 2xx, or with a redirect that did not end in an expiry
+# signal; ``pending_write`` is True while such a redirect is unresolved;
+# ``recovering`` is True inside the outermost ``with_session_recovery``.
 _local = threading.local()
+# Monotonic clock for login cooldowns (a seam for tests).
+_clock = time.monotonic
 
 T = TypeVar("T")
 
@@ -78,8 +108,39 @@ INVALID_CREDENTIALS_MESSAGE = "Gradescope login failed: invalid credentials."
 _RECOVERY_FAILED = "Gradescope session expired and re-login did not restore access."
 SESSION_RECOVERY_FAILED_MESSAGE = f"Authentication error: {_RECOVERY_FAILED}"
 
+# Login cooldowns, in seconds.
+INVALID_CREDENTIALS_COOLDOWN = 600.0
+REJECTED_LOGIN_COOLDOWN = 60.0
+THROTTLED_LOGIN_COOLDOWN = 60.0  # HTTP 429/5xx without a usable Retry-After
+TOO_MANY_ATTEMPTS_COOLDOWN = 300.0
+MAX_LOGIN_COOLDOWN = 900.0
+
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 _LOGIN_PATHS = ("/login", "/account/auth")
+_HTML_TYPES = ("text/html", "application/xhtml+xml")
+_LOGOUT_URL_RE = re.compile(r"/logout(?:[/?#]|$)", re.IGNORECASE)
+# Cheap pre-check before a page is parsed for the login form: an opening
+# ``<form`` tag whose action is ``/login`` (relative or absolute).
+_LOGIN_FORM_TAG_RE = re.compile(
+    rb"<form\b[^>]*\baction\s*=\s*[\"']?(?:https?://[^\"'\s>/]+)?/login(?=[/?#\"'\s>])",
+    re.IGNORECASE,
+)
+# Page text of a login refused because of the credentials.
+_INVALID_CREDENTIALS_RE = re.compile(
+    r"\b(?:invalid|incorrect|wrong)\b[^.!<]{0,40}\b(?:e-?mail|password|credentials)\b"
+    r"|\b(?:e-?mail|password|credentials)\b[^.!<]{0,40}"
+    r"\b(?:invalid|incorrect|wrong|not recognized|(?:did|do)(?: not|n't) match)\b",
+    re.IGNORECASE,
+)
+# Page text of a login refused because of throttling or a lockout.
+_TOO_MANY_ATTEMPTS_RE = re.compile(
+    r"\btoo many\b[^.!<]{0,30}\b(?:attempts|requests|tries|log ?ins|sign[- ]?ins)\b"
+    r"|\brate.?limit"
+    r"|\b(?:account|login)\b[^.!<]{0,30}\b(?:locked|blocked)\b"
+    r"|\btemporarily (?:locked|blocked)\b",
+    re.IGNORECASE,
+)
 # ``session[password]=...`` / ``session%5Bemail%5D=...`` query fragments, as
 # gradescopeapi's query-string login would put them into a URL.
 _CREDENTIAL_QUERY_RE = re.compile(
@@ -100,8 +161,26 @@ class SessionExpiredError(AuthError):
     pass
 
 
-class _InvalidCredentials(Exception):
-    """Gradescope answered the login POST without its success redirect."""
+class _LoginRejected(Exception):
+    """Gradescope answered a login attempt without logging in.
+
+    ``str(exc)`` is the ``AuthError`` text (it never contains the
+    credentials); ``cooldown`` is how many seconds to wait before trying again.
+    """
+
+    def __init__(self, reason: str, cooldown: float) -> None:
+        super().__init__(reason)
+        self.cooldown = cooldown
+
+
+class _InvalidCredentials(_LoginRejected):
+    """Gradescope re-showed the login form or said the credentials are wrong."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            f"{INVALID_CREDENTIALS_MESSAGE} Check GRADESCOPE_EMAIL and GRADESCOPE_PASSWORD.",
+            INVALID_CREDENTIALS_COOLDOWN,
+        )
 
 
 # ------------------------------------------------------------------
@@ -215,18 +294,121 @@ def _is_login_path(path: str) -> bool:
     return any(path == p or path.startswith(p + "/") for p in _LOGIN_PATHS)
 
 
+def _has_login_form(soup: BeautifulSoup, page_url: str, *, require_password: bool = False) -> bool:
+    """Whether the page has a same-site form that posts to the login page.
+
+    The form must carry the password field or (unless ``require_password``)
+    the ``authenticity_token`` that ``_login`` scrapes from the home page.
+    """
+    site = _site(page_url)
+    for form in soup.find_all("form"):
+        action = urljoin(page_url, str(form.get("action") or ""))
+        if _site(action) != site or not _is_login_path(urlsplit(action).path):
+            continue
+        if form.find("input", attrs={"name": "session[password]"}) is not None:
+            return True
+        if not require_password and form.find("input", attrs={"name": "authenticity_token"}):
+            return True
+    return False
+
+
+def _is_logged_out_page(soup: BeautifulSoup, page_url: str) -> bool:
+    """A page with the login form and no logout link (a logged-in page has one)."""
+    if soup.find("a", href=_LOGOUT_URL_RE) or soup.find("form", action=_LOGOUT_URL_RE):
+        return False
+    return _has_login_form(soup, page_url)
+
+
+def _visible_text(soup: BeautifulSoup) -> str:
+    """The page's text outside scripts, styles and comments."""
+    parts = [
+        str(s) for s in soup.find_all(string=True)
+        if not isinstance(s, Comment)
+        and getattr(s.parent, "name", None) not in ("script", "style", "noscript", "template")
+    ]
+    return " ".join(" ".join(parts).split())
+
+
+def _retry_after(response: requests.Response) -> float | None:
+    """Seconds requested by a ``Retry-After`` header (seconds or HTTP date), if any."""
+    raw = str(response.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return float(raw)
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (when - datetime.now(timezone.utc)).total_seconds()
+
+
+def _cooldown(seconds: float) -> float:
+    return min(MAX_LOGIN_COOLDOWN, max(1.0, seconds))
+
+
+def _throttled(response: requests.Response, reason: str) -> _LoginRejected:
+    """A rejection for HTTP 429/5xx, waiting as long as ``Retry-After`` asks."""
+    retry_after = _retry_after(response)
+    return _LoginRejected(
+        reason, _cooldown(THROTTLED_LOGIN_COOLDOWN if retry_after is None else retry_after)
+    )
+
+
+def _login_failure(resp: requests.Response, soup: BeautifulSoup) -> _LoginRejected:
+    """Classify a login POST answer that did not log in.
+
+    Only a re-rendered login form (HTTP 200 or 422, no redirect) or a page
+    saying the email/password is wrong counts as invalid credentials. A WAF
+    challenge, a CSRF failure or an unexpected page is reported as "login
+    rejected (HTTP <status>)", so a transient answer is not mistaken for bad
+    credentials.
+    """
+    status = resp.status_code
+    if status == 429 or status >= 500:
+        return _throttled(
+            resp, f"Gradescope login failed: Gradescope answered HTTP {status}; try again later."
+        )
+    text = _visible_text(soup)
+    if _TOO_MANY_ATTEMPTS_RE.search(text):
+        retry_after = _retry_after(resp)
+        return _LoginRejected(
+            "Gradescope login failed: Gradescope reports too many login attempts; "
+            "try again later.",
+            _cooldown(TOO_MANY_ATTEMPTS_COOLDOWN if retry_after is None else retry_after),
+        )
+    if _INVALID_CREDENTIALS_RE.search(text) or (
+        not resp.history
+        and status in (200, 422)
+        and _has_login_form(soup, resp.url, require_password=True)
+    ):
+        return _InvalidCredentials()
+    if resp.history and _is_login_path(urlsplit(resp.url).path):
+        reason = "Gradescope redirected back to the login page"
+    elif resp.history and _is_logged_out_page(soup, resp.url):
+        reason = "Gradescope showed its login form again after the redirect"
+    elif resp.history:
+        reason = f"login rejected (HTTP {resp.history[0].status_code} redirect)"
+    else:
+        reason = f"login rejected (HTTP {status})"
+    return _LoginRejected(f"Gradescope login failed: {reason}.", REJECTED_LOGIN_COOLDOWN)
+
+
 def _login(conn: GSConnection, email: str, password: str) -> None:
     """Log ``conn`` in, sending the credentials as a form body.
 
     Mirrors gradescopeapi's ``GSConnection.login``: GET the home page for the
     authenticity token and the initial session cookie, POST ``/login``, treat a
-    302 as success, then copy the landing page's CSRF token into the session
-    headers and attach an ``Account``.
+    302 to a page without the login form as success, then copy the landing
+    page's CSRF token into the session headers and attach an ``Account``.
 
     Raises:
-        _InvalidCredentials: Gradescope answered without the success redirect.
-        AuthError: an unexpected page (missing token, server error, or a
-            redirect back to the login page).
+        _LoginRejected: Gradescope answered without logging in
+            (``_InvalidCredentials`` when it says the credentials are wrong),
+            or the home page answered HTTP 429/5xx.
+        AuthError: the home page has no login form.
         requests.RequestException: network failures; the caller scrubs them.
     """
     session = conn.session
@@ -237,10 +419,13 @@ def _login(conn: GSConnection, email: str, password: str) -> None:
         'form[action="/login"] input[name="authenticity_token"]'
     )
     if token_input is None or not token_input.get("value"):
-        raise AuthError(
+        reason = (
             "Gradescope login failed: the login form was not found on the "
             f"Gradescope home page (HTTP {home.status_code})."
         )
+        if home.status_code == 429 or home.status_code >= 500:
+            raise _throttled(home, reason)
+        raise AuthError(reason)
 
     login_data = {
         "utf8": "✓",
@@ -253,26 +438,22 @@ def _login(conn: GSConnection, email: str, password: str) -> None:
     }
     resp = session.post(f"{base_url}/login", data=login_data)
 
-    redirected = bool(resp.history) and resp.history[0].status_code == requests.codes.found
-    if not redirected:
-        if resp.status_code >= 500 or resp.status_code == 429:
-            raise AuthError(
-                f"Gradescope login failed: Gradescope answered HTTP {resp.status_code}; "
-                "try again later."
-            )
-        raise _InvalidCredentials()
-    if _is_login_path(urlsplit(resp.url).path):
-        # Not cached as invalid credentials: upstream would even have counted
-        # this as success, so its meaning is unknown.
-        raise AuthError(
-            "Gradescope login failed: Gradescope redirected back to the login page."
-        )
+    soup = BeautifulSoup(resp.text, "html.parser")
+    logged_in = (
+        bool(resp.history)
+        and resp.history[0].status_code == requests.codes.found
+        and not _is_login_path(urlsplit(resp.url).path)
+        and not _is_logged_out_page(soup, resp.url)
+    )
+    if not logged_in:
+        raise _login_failure(resp, soup)
 
-    csrf = BeautifulSoup(resp.text, "html.parser").select_one('meta[name="csrf-token"]')
+    csrf = soup.select_one('meta[name="csrf-token"]')
     if csrf is None or not csrf.get("content"):
-        raise AuthError(
+        raise _LoginRejected(
             "Gradescope login failed: no CSRF token on the page Gradescope "
-            "showed after login."
+            "showed after login.",
+            REJECTED_LOGIN_COOLDOWN,
         )
 
     session.cookies.update(resp.cookies)
@@ -285,12 +466,52 @@ def _credential_fingerprint(email: str, password: str) -> str:
     return hashlib.sha256(f"{email}\0{password}".encode("utf-8")).hexdigest()
 
 
+def _format_wait(seconds: float) -> str:
+    seconds = max(1, math.ceil(seconds))
+    minutes, secs = divmod(seconds, 60)
+    if not minutes:
+        return f"{secs} s"
+    return f"{minutes} min" + (f" {secs} s" if secs else "")
+
+
+def _with_cooldown(reason: str, seconds: float) -> str:
+    return f"{reason} Not trying to log in again for {_format_wait(seconds)}."
+
+
 # ------------------------------------------------------------------
 # Session-expiry detection
 # ------------------------------------------------------------------
 
 
-def _expiry_reason(response: requests.Response, site: str) -> str | None:
+def _shows_logged_out_page(response: requests.Response, stream: bool = False) -> bool:
+    """Whether a page is Gradescope's logged-out page: the login form, no logout link.
+
+    Gradescope may send an expired session to its home page instead of
+    ``/login``; requests follows that redirect (turning a POST into a GET),
+    and the caller would get a 200 with the anonymous home page. Only HTML is
+    inspected (a missing Content-Type counts as HTML unless the body is
+    streamed), and a page is parsed only if it has a ``<form`` tag posting to
+    ``/login``. A page that also links to ``/logout`` belongs to a logged-in
+    session and does not count.
+    """
+    content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0]
+    content_type = content_type.strip().lower()
+    if content_type not in _HTML_TYPES and (content_type or stream):
+        return False
+    try:
+        content = response.content
+    except Exception:
+        return False
+    if not content or not _LOGIN_FORM_TAG_RE.search(content):
+        return False
+    try:
+        text = content.decode(response.encoding or "utf-8", errors="replace")
+    except LookupError:
+        text = content.decode("utf-8", errors="replace")
+    return _is_logged_out_page(BeautifulSoup(text, "html.parser"), response.url)
+
+
+def _expiry_reason(response: requests.Response, site: str, stream: bool = False) -> str | None:
     """Return why ``response`` shows an expired session, or None if it doesn't."""
     if _site(response.url) != site:
         return None
@@ -310,7 +531,31 @@ def _expiry_reason(response: requests.Response, site: str) -> str | None:
         # error on a live session, not an expiry.
         if "must be logged in" in body.lower():
             return "HTTP 401: you must be logged in"
+    if 200 <= response.status_code < 300 and _shows_logged_out_page(response, stream):
+        return "Gradescope served its logged-out page with the login form"
     return None
+
+
+def _note_write(response: requests.Response, site: str) -> None:
+    """Count a write Gradescope accepted during the current call (see ``_local``).
+
+    A same-site write answered with a 2xx counts. One answered with a
+    redirect stays pending until the next response on this thread (normally
+    the redirect target): an expiry signal there means the session had
+    already expired, so the write was not processed; anything else (or the
+    end of the call) counts it.
+    """
+    method = str(getattr(response.request, "method", None) or "GET").upper()
+    is_write = method not in _SAFE_METHODS and _site(response.url) == site
+    if response.status_code in _REDIRECT_CODES:
+        if is_write:
+            _local.pending_write = True
+        return
+    if getattr(_local, "pending_write", False) or (
+        is_write and 200 <= response.status_code < 300
+    ):
+        _local.writes = getattr(_local, "writes", 0) + 1
+    _local.pending_write = False
 
 
 def _install_expiry_hook(conn: GSConnection) -> None:
@@ -322,14 +567,19 @@ def _install_expiry_hook(conn: GSConnection) -> None:
 
     The hook runs on every response, including each redirect hop, so a request
     answered with a redirect to the login page raises before requests follows
-    it (and before it could turn a POST into a GET of the login page).
+    it (and before it could turn a POST into a GET of the login page). A
+    redirect to another page that turns out to be the logged-out home page
+    raises on that page. Responses that are not expiry signals are counted
+    as accepted writes where they apply (``_note_write``).
     """
     site = _site(conn.gradescope_base_url)
 
     def _check_session(response, *args, **kwargs):
-        reason = _expiry_reason(response, site)
+        reason = _expiry_reason(response, site, stream=bool(kwargs.get("stream")))
         if reason is None:
+            _note_write(response, site)
             return response
+        _local.pending_write = False
         _local.expired = conn
         try:
             response.content  # Read the (small) body so the socket can be reused.
@@ -366,9 +616,11 @@ def get_connection() -> GSConnection:
     connection so that its retry logs in again.
 
     Raises:
-        AuthError: missing or rejected credentials (rejections are cached
-            until the credentials change), or a network/server failure during
-            login. Messages never contain the credentials.
+        AuthError: missing or rejected credentials, or a network/server
+            failure during login. A login Gradescope answered without logging
+            in starts a cooldown (see the module docstring): until it ends,
+            calls with the same credentials get the same error without
+            contacting Gradescope. Messages never contain the credentials.
     """
     global _connection, _failed_login
 
@@ -391,19 +643,21 @@ def get_connection() -> GSConnection:
             )
 
         fingerprint = _credential_fingerprint(email, password)
-        if _failed_login == fingerprint:
-            raise AuthError(INVALID_CREDENTIALS_MESSAGE)
+        failure = _failed_login
+        if failure is not None and failure.fingerprint == fingerprint:
+            remaining = failure.retry_at - _clock()
+            if remaining > 0:
+                raise AuthError(_with_cooldown(failure.reason, remaining))
 
         conn = _new_connection()
         try:
             _login(conn, email, password)
-        except _InvalidCredentials:
-            _failed_login = fingerprint
-            logger.warning(
-                "Gradescope rejected the configured credentials; not retrying "
-                "until GRADESCOPE_EMAIL or GRADESCOPE_PASSWORD changes."
-            )
-            raise AuthError(INVALID_CREDENTIALS_MESSAGE) from None
+        except _LoginRejected as e:
+            reason = _scrub(str(e), email, password)
+            _failed_login = _LoginFailure(fingerprint, reason, _clock() + e.cooldown)
+            message = _with_cooldown(reason, e.cooldown)
+            logger.warning("%s", message)
+            raise AuthError(message) from None
         except AuthError as e:
             message = _scrub(str(e), email, password)
             logger.warning("%s", message)
@@ -464,54 +718,117 @@ def reset_connection(expired: GSConnection | None = None) -> None:
 # ------------------------------------------------------------------
 
 
-def _call_tracking_expiry(fn, args, kwargs):
-    """Call ``fn``; return ``(expired, result, exception)``.
+class _Attempt(NamedTuple):
+    """One run of a wrapped call."""
 
-    ``expired`` is the connection whose session expired during the call (or
-    ``_EXPIRED_UNKNOWN``), or None. Exceptions unrelated to an expiry
-    propagate.
-    """
+    expired: Any  # the connection whose session expired, _EXPIRED_UNKNOWN, or None
+    result: Any
+    exc: BaseException | None
+    writes: int  # writes Gradescope accepted during the run (see ``_local``)
+
+
+def _writes_this_call() -> int:
+    """Accepted writes of the current call; an unresolved write redirect counts."""
+    return getattr(_local, "writes", 0) + (1 if getattr(_local, "pending_write", False) else 0)
+
+
+def _reset_call_state() -> None:
     _local.expired = None
+    _local.writes = 0
+    _local.pending_write = False
+
+
+def _call_tracking_expiry(fn, args, kwargs) -> _Attempt:
+    """Call ``fn`` and record whether the session expired and what it wrote.
+
+    Exceptions unrelated to an expiry propagate.
+    """
+    _reset_call_state()
     try:
         result = fn(*args, **kwargs)
     except SessionExpiredError as exc:
         expired = getattr(_local, "expired", None)
-        return (_EXPIRED_UNKNOWN if expired is None else expired), None, exc
+        return _Attempt(
+            _EXPIRED_UNKNOWN if expired is None else expired, None, exc, _writes_this_call()
+        )
     except Exception as exc:
         expired = getattr(_local, "expired", None)
         if expired is None:
             raise
-        return expired, None, exc
-    return getattr(_local, "expired", None), result, None
+        return _Attempt(expired, None, exc, _writes_this_call())
+    return _Attempt(getattr(_local, "expired", None), result, None, _writes_this_call())
+
+
+def _writes_then_expiry_notice(writes: int) -> str:
+    return (
+        "⚠️ The Gradescope session expired during this call after Gradescope had "
+        f"accepted {writes} write request(s), so the call was not re-run "
+        "automatically (re-running could repeat those writes or report them as "
+        "not done). Anything above that failed or could not be read back "
+        "because of the expiry is unconfirmed: check the current state with "
+        "the read tools before retrying it. The next call logs in again."
+    )
+
+
+def _report_writes_then_expiry(attempt: _Attempt) -> Any:
+    """Return a run that wrote before the session expired, with a notice."""
+    if attempt.exc is not None:
+        raise SessionExpiredError(
+            "Gradescope session expired during the call after Gradescope had "
+            f"accepted {attempt.writes} write request(s); the call was not re-run. "
+            "Check the current state with the read tools before retrying it."
+        ) from attempt.exc
+    if isinstance(attempt.result, str):
+        return f"{attempt.result.rstrip()}\n\n{_writes_then_expiry_notice(attempt.writes)}"
+    return attempt.result
+
+
+def _report_failed_recovery(first: _Attempt, retry: _Attempt) -> str:
+    """The recovery-failed error, followed by the output a run did produce."""
+    for attempt, label in ((first, "the first attempt"), (retry, "the retry")):
+        if attempt.exc is None and isinstance(attempt.result, str):
+            return (
+                f"{SESSION_RECOVERY_FAILED_MESSAGE}\n\n"
+                f"Output of {label} (the session had expired, so it may be "
+                f"incomplete or wrong):\n{attempt.result}"
+            )
+    raise SessionExpiredError(_RECOVERY_FAILED) from (retry.exc or first.exc)
 
 
 def with_session_recovery(fn: Callable[..., T]) -> Callable[..., T]:
     """Re-run ``fn`` once on a fresh login if Gradescope's session expired during it.
 
-    Each call clears a thread-local flag, runs ``fn``, and checks whether the
-    session's response hook set the flag. Tools usually catch the hook's
-    ``SessionExpiredError`` and turn it into an error string (or a plausible
-    empty result), so the flag, not the return value, is the signal. If it
-    was set, the expired connection is dropped (``reset_connection``) and
-    ``fn`` runs once more, logging in again on its first request. If the
-    session expires again, a string-returning call gets
-    ``SESSION_RECOVERY_FAILED_MESSAGE`` (``"Authentication error: Gradescope
-    session expired and re-login did not restore access."``) instead of its
-    misleading output; a call that raised gets ``SessionExpiredError`` with
-    that text. Other exceptions and login failures pass through unchanged.
+    Each call clears the thread-local call state, runs ``fn``, and checks
+    whether the session's response hook flagged an expiry. Tools usually
+    catch the hook's ``SessionExpiredError`` and turn it into an error string
+    (or a plausible empty result), so the flag, not the return value, is the
+    signal. If it was set, the expired connection is dropped
+    (``reset_connection``), and then:
 
-    Re-running the whole call is safe: the hook raises on the response to the
-    rejected request itself (a redirect to the login page or a 401 "must be
-    logged in"), before requests follows any redirect, so Gradescope did not
-    process that request — a write that was redirected to ``/login`` did not
-    happen. Later requests of the same call on that session are rejected the
-    same way. Requests that succeeded (before the expiry, or on a connection
-    another thread had already re-logged in) are repeated by the second run;
-    in this server those are reads, or state-setting writes (a grade's rubric
-    items, adjustment and comment) that produce the same result when re-sent.
-    The one unguarded case is a write whose own response redirects to another
-    page and the session expires before that hop; the window is a single
-    redirect and is accepted.
+    - **No write was accepted** during the call: ``fn`` runs once more,
+      logging in again on its first request. This is safe because the hook
+      raises on the response to the rejected request itself, before requests
+      follows a redirect to the login page, so Gradescope did not process
+      that request (a write redirected to ``/login`` or to the logged-out
+      home page did not happen), and the requests that did succeed were reads.
+    - **Gradescope had accepted a write** (a same-site non-GET request
+      answered with a 2xx, or with a redirect that did not end in an expiry
+      signal): ``fn`` is not re-run. A re-run could repeat the write, or
+      contradict it: a re-run of a delete finds the item gone, and a re-run
+      of a group grade finds the members graded, and both would then report
+      that nothing was changed. The first result is returned with a notice
+      that the session expired after N accepted write(s) and that anything
+      the call could not confirm (e.g. a read-back) must be checked with the
+      read tools. A call that raised gets ``SessionExpiredError`` saying so.
+
+    If the session expires again during the re-run, a re-run that had a
+    write accepted is reported the same way. Otherwise a string-returning
+    call gets ``SESSION_RECOVERY_FAILED_MESSAGE`` (``"Authentication error:
+    Gradescope session expired and re-login did not restore access."``)
+    followed by the first attempt's output, labelled as possibly incomplete
+    (that output can be a misleading empty result, so it never stands on its
+    own); a call that raised gets ``SessionExpiredError`` with that text.
+    Other exceptions and login failures pass through unchanged.
 
     The hook does not mark the connection logged out, so a tool that keeps
     going after an expiry (e.g. a batch that records per-row errors) does
@@ -532,26 +849,34 @@ def with_session_recovery(fn: Callable[..., T]) -> Callable[..., T]:
             return fn(*args, **kwargs)
         _local.recovering = True
         try:
-            expired, result, exc = _call_tracking_expiry(fn, args, kwargs)
-            if expired is None:
-                return result
+            first = _call_tracking_expiry(fn, args, kwargs)
+            if first.expired is None:
+                return first.result
+            reset_connection(None if first.expired is _EXPIRED_UNKNOWN else first.expired)
+            if first.writes:
+                logger.warning(
+                    "Gradescope session expired during %s after %d accepted write(s); "
+                    "not re-running it.",
+                    fn.__name__, first.writes,
+                )
+                return _report_writes_then_expiry(first)
 
             logger.warning(
                 "Gradescope session expired during %s; logging in again and retrying once.",
                 fn.__name__,
             )
-            reset_connection(None if expired is _EXPIRED_UNKNOWN else expired)
-
-            expired, result, exc = _call_tracking_expiry(fn, args, kwargs)
-            if expired is None:
-                return result
+            retry = _call_tracking_expiry(fn, args, kwargs)
+            if retry.expired is None:
+                return retry.result
 
             logger.warning("Gradescope session expired again during %s after re-login.", fn.__name__)
-            if exc is None and isinstance(result, str):
-                return SESSION_RECOVERY_FAILED_MESSAGE
-            raise SessionExpiredError(_RECOVERY_FAILED) from exc
+            if retry.expired is not _EXPIRED_UNKNOWN:
+                reset_connection(retry.expired)
+            if retry.writes:
+                return _report_writes_then_expiry(retry)
+            return _report_failed_recovery(first, retry)
         finally:
             _local.recovering = False
-            _local.expired = None
+            _reset_call_state()
 
     return wrapper

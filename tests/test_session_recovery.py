@@ -2,9 +2,11 @@
 
 Gradescope's server-side session eventually expires while the process still
 holds the cookie. ``auth`` installs a response hook that turns the expiry
-signals (redirect to /login, the login page itself, 401 "must be logged in")
-into ``SessionExpiredError``, and ``with_session_recovery`` — applied to every
-MCP tool and resource — re-runs the call once on a fresh login.
+signals (redirect to /login, the login page itself, 401 "must be logged in",
+the logged-out home page with the login form) into ``SessionExpiredError``,
+and ``with_session_recovery`` — applied to every MCP tool and resource —
+re-runs the call once on a fresh login, unless Gradescope had already
+accepted a write during the call.
 
 The fake Gradescope below sits behind ``HTTPAdapter.send`` and models each
 login as a separate session (identified by the CSRF token the login page
@@ -14,19 +16,22 @@ hands out), so expiring "the session" leaves later logins valid.
 from __future__ import annotations
 
 import functools
+import html
 import inspect
 import json
 import threading
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import anyio
 import pytest
 import requests
 from mcp.server.mcpserver import MCPServer
-from requests.adapters import HTTPAdapter
+from requests.adapters import BaseAdapter, HTTPAdapter
 from requests.structures import CaseInsensitiveDict
 
 from gradescope_mcp import auth, server
+from gradescope_mcp.tools import answer_groups, grading_ops
 
 BASE = "https://www.gradescope.com"
 EMAIL = "prof@example.edu"
@@ -48,6 +53,7 @@ def _account_page(csrf: str) -> str:
     """Account page with one instructor course, parseable by gradescopeapi."""
     return (
         f'<html><head><meta name="csrf-token" content="{csrf}"></head><body>'
+        '<nav><a href="/logout">Log Out</a></nav>'
         '<button class="js-createNewCourse">Create</button>'
         '<div id="account-show">'
         '<h2 class="pageHeading">Instructor Courses</h2>'
@@ -76,34 +82,49 @@ NOT_AUTHORIZED = json.dumps({"error": "You are not authorized to access this pag
 
 
 class FakeGradescope:
-    """Offline Gradescope with per-login sessions that can be expired."""
+    """Offline Gradescope with per-login sessions that can be expired.
+
+    ``expiry_mode`` is how a rejected session is answered: ``"redirect"``
+    (302 to /login), ``"401"`` (401 "must be logged in") or ``"root"`` (302
+    to /, the logged-out home page with the login form).
+    """
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
         self.logins = 0
         self.valid: set[str] = set()
-        self.expiry_mode = "redirect"  # or "401"
+        self.expiry_mode = "redirect"
         self.sessions_die_immediately = False
         self.routes: dict[str, object] = {}
+        self.home_content_type: str | None = "text/html; charset=utf-8"
         self._landing: str | None = None
         self._lock = threading.Lock()
 
     def expire_all(self) -> None:
         self.valid.clear()
 
+    def writes(self) -> list[tuple[str, str]]:
+        """Requests other than GET/HEAD, without the login POSTs."""
+        return [(m, p) for m, p in self.sent if m not in ("GET", "HEAD") and p != "/login"]
+
     def _expired(self, request):
         if self.expiry_mode == "401":
             return make_response(
                 request, 401, MUST_LOG_IN, {"Content-Type": "application/json"}
             )
-        return make_response(request, 302, "", {"Location": BASE + "/login"})
+        target = "/" if self.expiry_mode == "root" else "/login"
+        return make_response(request, 302, "", {"Location": BASE + target})
 
     def handle(self, request):
         with self._lock:
             self.sent.append((request.method, urlsplit(request.url).path or "/"))
         path = urlsplit(request.url).path or "/"
         if path == "/":
-            return make_response(request, 200, HOME_PAGE)
+            if request.headers.get("X-CSRF-Token") in self.valid:
+                # A logged-in session is sent on to its account page.
+                return make_response(request, 302, "", {"Location": BASE + "/account"})
+            headers = {"Content-Type": self.home_content_type} if self.home_content_type else {}
+            return make_response(request, 200, HOME_PAGE, headers)
         if path == "/login" and request.method == "POST":
             body = request.body.decode() if isinstance(request.body, bytes) else request.body
             form = parse_qs(body or "")
@@ -140,13 +161,13 @@ class FakeGradescope:
 def _clean_auth_state(monkeypatch):
     monkeypatch.setattr(auth, "_connection", None)
     monkeypatch.setattr(auth, "_failed_login", None)
-    auth._local.expired = None
+    auth._reset_call_state()
     auth._local.recovering = False
     monkeypatch.setenv("GRADESCOPE_EMAIL", EMAIL)
     monkeypatch.setenv("GRADESCOPE_PASSWORD", PASSWORD)
     monkeypatch.delenv(auth.HTTP_TIMEOUT_ENV, raising=False)
     yield
-    auth._local.expired = None
+    auth._reset_call_state()
     auth._local.recovering = False
 
 
@@ -252,7 +273,7 @@ def test_login_flow_is_not_treated_as_expiry(fake_gs, monkeypatch) -> None:
     with pytest.raises(auth.AuthError) as info:
         auth.get_connection()
     assert not isinstance(info.value, auth.SessionExpiredError)
-    assert str(info.value) == "Gradescope login failed: invalid credentials."
+    assert str(info.value).startswith("Gradescope login failed: invalid credentials.")
 
     monkeypatch.setenv("GRADESCOPE_PASSWORD", PASSWORD)
     first = auth.get_connection()
@@ -311,10 +332,14 @@ def test_recovery_returns_clear_message_when_expiry_repeats(fake_gs, mode) -> No
 
     result = tool()
 
-    assert result == (
-        "Authentication error: Gradescope session expired and re-login did not restore access."
+    # The error comes first (so the result is an error), followed by the
+    # first attempt's own output instead of discarding it.
+    assert result.startswith(
+        "Authentication error: Gradescope session expired and re-login did not restore access.\n\n"
+        "Output of the first attempt (the session had expired, so it may be "
+        "incomplete or wrong):\nAuthentication error: Gradescope session expired ("
     )
-    assert result == auth.SESSION_RECOVERY_FAILED_MESSAGE
+    assert result.startswith(auth.SESSION_RECOVERY_FAILED_MESSAGE)
     assert len(calls) == 2  # exactly one retry
     assert fake_gs.logins == 2
 
@@ -378,7 +403,7 @@ def test_recovery_passes_login_failures_through(fake_gs, monkeypatch) -> None:
         calls.append(1)
         return _fetch("/courses/1")
 
-    assert tool() == "Authentication error: Gradescope login failed: invalid credentials."
+    assert tool().startswith("Authentication error: Gradescope login failed: invalid credentials.")
     assert len(calls) == 1
 
 
@@ -413,7 +438,7 @@ def test_a_call_logs_in_again_at_most_once(fake_gs) -> None:
     def batch() -> str:
         return "\n".join(_fetch(f"/rows/{i}") for i in range(5))
 
-    assert batch() == auth.SESSION_RECOVERY_FAILED_MESSAGE
+    assert batch().startswith(auth.SESSION_RECOVERY_FAILED_MESSAGE)
     assert fake_gs.logins == 2  # first attempt + the single retry
 
 
@@ -430,7 +455,7 @@ def test_nested_wrappers_retry_only_once(fake_gs) -> None:
     def outer() -> str:
         return inner()
 
-    assert outer() == auth.SESSION_RECOVERY_FAILED_MESSAGE
+    assert outer().startswith(auth.SESSION_RECOVERY_FAILED_MESSAGE)
     assert len(inner_calls) == 2
 
 
@@ -578,7 +603,8 @@ def test_mcp_tool_call_reports_failed_recovery(fake_gs) -> None:
 
     result = anyio.run(server.mcp.call_tool, "tool_list_courses", {})
 
-    assert result.content[0].text == auth.SESSION_RECOVERY_FAILED_MESSAGE
+    assert result.is_error is True
+    assert result.content[0].text.startswith(auth.SESSION_RECOVERY_FAILED_MESSAGE)
     assert fake_gs.logins == 2
 
 
@@ -646,3 +672,570 @@ def test_prompts_are_registered_without_recovery() -> None:
     assert len(prompts) == 7
     for prompt in prompts:
         assert not hasattr(getattr(server, prompt.name), "__wrapped__"), prompt.name
+
+
+def _call_tool(name: str, args: dict) -> tuple[bool, str]:
+    result = anyio.run(server.mcp.call_tool, name, args)
+    return result.is_error, "\n".join(c.text for c in result.content)
+
+
+# ------------------------------------------------------------------
+# An expired session sent to the logged-out home page
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("content_type", ["text/html; charset=utf-8", None])
+def test_hook_flags_a_redirect_to_the_logged_out_home_page(fake_gs, content_type) -> None:
+    fake_gs.expiry_mode = "root"
+    fake_gs.home_content_type = content_type
+    conn = auth.get_connection()
+    fake_gs.expire_all()
+    fake_gs.sent.clear()
+
+    with pytest.raises(auth.SessionExpiredError, match="logged-out page"):
+        conn.session.get(BASE + "/courses/1/assignments")
+
+    assert fake_gs.sent == [("GET", "/courses/1/assignments"), ("GET", "/")]
+    assert auth._local.expired is conn
+
+
+def test_write_redirected_to_the_home_page_is_an_expiry_not_a_write(fake_gs) -> None:
+    """requests turns the redirected POST into GET /; the hook stops there,
+    and the POST is not counted as an accepted write."""
+    fake_gs.expiry_mode = "root"
+    conn = auth.get_connection()
+    fake_gs.expire_all()
+    fake_gs.sent.clear()
+
+    with pytest.raises(auth.SessionExpiredError):
+        conn.session.post(BASE + "/courses/1/assignments/2", data={"title": "HW3"})
+
+    assert fake_gs.sent == [("POST", "/courses/1/assignments/2"), ("GET", "/")]
+    assert auth._writes_this_call() == 0
+
+
+def test_logged_in_pages_with_a_login_form_or_non_html_are_not_expiry(fake_gs) -> None:
+    conn = auth.get_connection()
+    with_logout = HOME_PAGE.replace("<html>", '<html><a href="/logout">Log Out</a>')
+    fake_gs.routes["/courses/1/sso"] = lambda req: make_response(
+        req, 200, with_logout, {"Content-Type": "text/html"}
+    )
+    fake_gs.routes["/courses/1/data.json"] = lambda req: make_response(
+        req, 200, json.dumps({"html": HOME_PAGE}), {"Content-Type": "application/json"}
+    )
+    escaped = f'<div data-react-props="{html.escape(HOME_PAGE, quote=True)}"></div>'
+    fake_gs.routes["/courses/1/grade"] = lambda req: make_response(
+        req, 200, escaped, {"Content-Type": "text/html"}
+    )
+    fake_gs.routes["/courses/1/stream"] = lambda req: make_response(req, 200, HOME_PAGE)
+
+    assert conn.session.get(BASE + "/courses/1/sso").status_code == 200
+    assert conn.session.get(BASE + "/courses/1/data.json").status_code == 200
+    assert conn.session.get(BASE + "/courses/1/grade").status_code == 200
+    # A streamed body without a Content-Type is not read by the hook.
+    assert conn.session.get(BASE + "/courses/1/stream", stream=True).status_code == 200
+    # A logged-in session sent to "/" lands on its account page.
+    assert conn.session.get(BASE + "/").url == BASE + "/account"
+    assert auth._local.expired is None
+
+
+@pytest.mark.parametrize(
+    "name, args",
+    [
+        ("tool_rename_assignment", {"new_title": "HW3"}),
+        ("tool_update_autograder_image", {"image_name": "gradescope/autograder-base:latest"}),
+        ("tool_upload_submission", {}),
+    ],
+)
+def test_writes_through_upstream_helpers_do_not_report_success_after_root_expiry(
+    fake_gs, tmp_path, name, args
+) -> None:
+    """Reviewer repros v23_root.py / upload_success.py: every session is sent
+    to "/". The tools used to report '✅ renamed', '✅ image set' and
+    '✅ Submission uploaded ... URL: https://www.gradescope.com/'."""
+    fake_gs.expiry_mode = "root"
+    fake_gs.sessions_die_immediately = True
+    if name == "tool_upload_submission":
+        upload = tmp_path / "hw.pdf"
+        upload.write_bytes(b"%PDF-1.4 answer")
+        args = {"file_paths": [str(upload)]}
+    args = {"course_id": "1", "assignment_id": "2", "confirm_write": True, **args}
+
+    is_error, text = _call_tool(name, args)
+
+    assert is_error is True
+    assert text.startswith(auth.SESSION_RECOVERY_FAILED_MESSAGE)
+    assert "✅" not in text
+    assert fake_gs.writes() == []  # each helper stopped at its first (GET) request
+    assert fake_gs.logins == 2  # the one re-login
+
+
+@pytest.mark.parametrize(
+    "name, args",
+    [
+        ("tool_get_assignments", {"course_id": "1"}),
+        ("tool_list_question_submissions", {"course_id": "1", "question_id": "2"}),
+    ],
+)
+def test_reads_report_the_root_expiry_instead_of_an_empty_result(fake_gs, name, args) -> None:
+    fake_gs.expiry_mode = "root"
+    fake_gs.sessions_die_immediately = True
+
+    is_error, text = _call_tool(name, args)
+
+    assert is_error is True
+    assert text.startswith(auth.SESSION_RECOVERY_FAILED_MESSAGE)
+    assert fake_gs.logins == 2
+
+
+def test_root_expiry_is_recovered_by_one_re_login(fake_gs) -> None:
+    fake_gs.expiry_mode = "root"
+    first_is_error, first = _call_tool("tool_list_courses", {})
+    assert first_is_error is False and "CS 101" in first
+
+    fake_gs.expire_all()
+    is_error, text = _call_tool("tool_list_courses", {})
+
+    assert is_error is False
+    assert "CS 101" in text and "expired" not in text
+    assert fake_gs.logins == 2
+
+
+# ------------------------------------------------------------------
+# A call during which Gradescope accepted a write is not re-run
+# ------------------------------------------------------------------
+
+
+def _expire_after_first(fake: FakeGradescope, answer):
+    """A route that answers, and lets the session die right after its first answer."""
+    state = {"done": False}
+
+    def route(request):
+        response = answer(request)
+        if not state["done"]:
+            state["done"] = True
+            fake.expire_all()
+        return response
+
+    return route
+
+
+def _save_then_read_back(runs: list):
+    @auth.with_session_recovery
+    def tool() -> str:
+        runs.append(1)
+        session = auth.get_connection().session
+        try:
+            session.post(BASE + "/courses/1/save", data={"x": "1"})
+            session.get(BASE + "/courses/1/readback")
+        except auth.AuthError as e:
+            return f"Authentication error: {e}"
+        return "done"
+
+    return tool
+
+
+@pytest.mark.parametrize("status", [200, 201, 204])
+def test_accepted_write_stops_the_re_run(fake_gs, status) -> None:
+    fake_gs.routes["/courses/1/save"] = _expire_after_first(
+        fake_gs, lambda req: make_response(req, status, "")
+    )
+    runs: list = []
+
+    result = _save_then_read_back(runs)()
+
+    assert runs == [1]  # not re-run
+    assert result == (
+        "Authentication error: Gradescope session expired (redirected to the login page).\n\n"
+        + auth._writes_then_expiry_notice(1)
+    )
+    assert "accepted 1 write request(s)" in result
+    assert fake_gs.writes() == [("POST", "/courses/1/save")]
+    # The expired connection was dropped: the next call logs in first.
+    assert auth._connection is None
+    assert fake_gs.logins == 1
+
+
+def test_redirected_write_that_lands_on_a_page_counts(fake_gs) -> None:
+    fake_gs.routes["/courses/1/save"] = lambda req: make_response(
+        req, 302, "", {"Location": BASE + "/courses/1/saved"}
+    )
+    fake_gs.routes["/courses/1/saved"] = _expire_after_first(
+        fake_gs, lambda req: make_response(req, 200, "<html>saved</html>")
+    )
+    runs: list = []
+
+    result = _save_then_read_back(runs)()
+
+    assert runs == [1]
+    assert "accepted 1 write request(s)" in result
+
+
+def test_rejected_write_is_re_run(fake_gs) -> None:
+    fake_gs.routes["/courses/1/save"] = _expire_after_first(
+        fake_gs, lambda req: make_response(req, 422, "invalid")
+    )
+    runs: list = []
+
+    assert _save_then_read_back(runs)() == "done"
+    assert len(runs) == 2
+
+
+@pytest.mark.parametrize("mode", ["redirect", "root", "401"])
+def test_write_answered_by_the_expired_session_is_re_run(fake_gs, mode) -> None:
+    """The expired session turned the POST away (a redirect to /login, to the
+    logged-out home page, or a 401): it was not processed, so the call is re-run."""
+    fake_gs.expiry_mode = mode
+    fake_gs.routes["/courses/1/save"] = lambda req: make_response(req, 200, "{}")
+    auth.get_connection()
+    fake_gs.expire_all()
+    runs: list = []
+
+    assert _save_then_read_back(runs)() == "done"
+    assert len(runs) == 2
+    assert fake_gs.logins == 2
+
+
+def test_tool_that_raised_after_a_write_reports_it(fake_gs) -> None:
+    fake_gs.routes["/courses/1/save"] = _expire_after_first(
+        fake_gs, lambda req: make_response(req, 200, "{}")
+    )
+    runs = []
+
+    @auth.with_session_recovery
+    def tool() -> str:
+        runs.append(1)
+        session = auth.get_connection().session
+        session.post(BASE + "/courses/1/save", data={"x": "1"})
+        return session.get(BASE + "/courses/1/readback").text  # raises
+
+    with pytest.raises(auth.SessionExpiredError, match="accepted 1 write request"):
+        tool()
+    assert runs == [1]
+
+
+def test_retry_that_writes_and_expires_again_keeps_its_report(fake_gs) -> None:
+    """No write in the first run; the re-run saves, then expires again."""
+    fake_gs.routes["/courses/1/save"] = lambda req: (
+        fake_gs.expire_all() or make_response(req, 200, "{}")
+    )
+    runs = []
+
+    @auth.with_session_recovery
+    def tool() -> str:
+        runs.append(1)
+        session = auth.get_connection().session
+        try:
+            session.get(BASE + "/courses/1/form")
+            session.post(BASE + "/courses/1/save", data={"x": "1"})
+            session.get(BASE + "/courses/1/readback")
+        except auth.AuthError as e:
+            return f"saved: {len(fake_gs.writes())}; then {e}"
+        return "all done"
+
+    auth.get_connection()
+    fake_gs.expire_all()
+
+    result = tool()
+
+    assert len(runs) == 2
+    assert result.startswith("saved: 1; then Gradescope session expired")
+    assert result.endswith(auth._writes_then_expiry_notice(1))
+
+
+def test_double_expiry_without_writes_keeps_the_first_output(fake_gs) -> None:
+    """The first attempt's output follows the error instead of being
+    discarded, and a plausible-looking empty result is still an error."""
+    fake_gs.sessions_die_immediately = True
+    outputs = iter(["No assignments found in run 1.", "run 2 output"])
+
+    @auth.with_session_recovery
+    def tool() -> str:
+        try:
+            auth.get_connection().session.get(BASE + "/courses/1/assignments")
+        except auth.AuthError:
+            pass
+        return next(outputs)
+
+    result = tool()
+
+    assert result == (
+        f"{auth.SESSION_RECOVERY_FAILED_MESSAGE}\n\n"
+        "Output of the first attempt (the session had expired, so it may be "
+        "incomplete or wrong):\nNo assignments found in run 1."
+    )
+    assert server.is_error_text(result)
+
+
+# --- reviewer repro R1/expiry_rerun.py: the tools themselves ----------------
+
+
+class _RubricServer:
+    """Grading pages with a rubric and an answer group; each session expires
+    right after its first write."""
+
+    def __init__(self) -> None:
+        self.rubric = [
+            {"id": 777, "description": "Missing units", "weight": 2.0},
+            {"id": 778, "description": "Ok", "weight": 0},
+        ]
+        self.valid: set[str] = set()
+        self.writes: list[tuple[str, str]] = []
+        self.groups = {
+            "groups": [{"id": 3, "title": "g"}],
+            "submissions": [
+                {"id": 101, "confirmed_group_id": 3, "graded": False},
+                {"id": 102, "confirmed_group_id": 3, "graded": False},
+            ],
+        }
+        self.connections = 0
+
+    def page(self) -> str:
+        props = {
+            "question": {"weight": 10, "scoring_type": "negative"},
+            "submission": {"id": 5, "score": None, "graded": False},
+            "evaluation": {},
+            "rubric_items": self.rubric,
+            "rubric_item_evaluations": [],
+            "urls": {"save_grade": "/courses/1/questions/2/submissions/5/save_grade"},
+        }
+        return (
+            '<html><head><meta name="csrf-token" content="tok"></head><body>'
+            '<a href="/courses/1/questions/2/submissions/5/grade">x</a>'
+            '<div data-react-class="SubmissionGrader" data-react-props="'
+            f'{html.escape(json.dumps(props), quote=True)}"></div></body></html>'
+        )
+
+
+class _RubricAdapter(BaseAdapter):
+    def __init__(self, state: _RubricServer, sid: str) -> None:
+        super().__init__()
+        self.state, self.sid = state, sid
+
+    def send(self, request, **kwargs):
+        path = request.url.replace(BASE, "")
+        if self.sid not in self.state.valid:
+            return make_response(request, 302, "", {"Location": BASE + "/login"})
+        if request.method == "GET" and path.endswith("/answer_groups"):
+            return make_response(
+                request, 200, json.dumps(self.state.groups), {"Content-Type": "application/json"}
+            )
+        if request.method == "GET":
+            return make_response(request, 200, self.state.page(), {"Content-Type": "text/html"})
+        if request.method == "DELETE":
+            item_id = int(path.rsplit("/", 1)[1])
+            self.state.rubric = [x for x in self.state.rubric if x["id"] != item_id]
+            self.state.writes.append(("DELETE", path))
+            self.state.valid.discard(self.sid)
+            return make_response(request, 204, "")
+        if request.method == "POST" and path.endswith("/save_many_grades"):
+            for member in self.state.groups["submissions"]:
+                member["graded"] = True
+            self.state.writes.append(("POST", path))
+            self.state.valid.discard(self.sid)
+            return make_response(
+                request, 200, '{"ok":true}', {"Content-Type": "application/json"}
+            )
+        return make_response(request, 404, "not found")
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def rubric_server(monkeypatch) -> _RubricServer:
+    state = _RubricServer()
+    current: list = [None]
+
+    def get_conn():
+        if current[0] is None:
+            state.connections += 1
+            sid = f"s{state.connections}"
+            state.valid.add(sid)
+            session = requests.Session()
+            session.mount("https://", _RubricAdapter(state, sid))
+            conn = SimpleNamespace(gradescope_base_url=BASE, session=session, logged_in=True)
+            auth._install_expiry_hook(conn)
+            current[0] = conn
+        return current[0]
+
+    monkeypatch.setattr(auth, "reset_connection", lambda expired=None: current.__setitem__(0, None))
+    monkeypatch.setattr(grading_ops, "get_connection", get_conn)
+    monkeypatch.setattr(answer_groups, "get_connection", get_conn)
+    return state
+
+
+def test_delete_rubric_item_is_not_reported_as_unchanged_after_expiry(rubric_server) -> None:
+    """The DELETE succeeded and the read-back expired. The re-run used to
+    answer "rubric item `777` is not in question `2`'s rubric. Nothing was
+    changed." with isError."""
+    is_error, text = _call_tool(
+        "tool_delete_rubric_item",
+        {"course_id": "1", "question_id": "2", "rubric_item_id": "777", "confirm_write": True},
+    )
+
+    assert is_error is False
+    assert "Nothing was changed" not in text and "is not in question" not in text
+    assert "Rubric item `777` deleted" in text
+    assert "accepted 1 write request(s)" in text
+    assert rubric_server.writes == [("DELETE", "/courses/1/questions/2/rubric_items/777")]
+    assert [x["id"] for x in rubric_server.rubric] == [778]
+    assert rubric_server.connections == 1  # not re-run on a second session
+
+
+def test_grade_answer_group_is_not_reported_as_unsent_after_expiry(rubric_server) -> None:
+    """save_many_grades succeeded and the read-back expired. The re-run used
+    to answer "already has 2 graded member(s) ... Nothing was sent"."""
+    is_error, text = _call_tool(
+        "tool_grade_answer_group",
+        {
+            "course_id": "1", "question_id": "2", "group_id": "3",
+            "rubric_item_ids": ["778"], "confirm_write": True, "expected_member_count": 2,
+        },
+    )
+
+    assert is_error is False
+    assert "Nothing was sent" not in text and "already has" not in text
+    assert "Batch grade saved" in text
+    assert "accepted 1 write request(s)" in text
+    assert rubric_server.writes == [
+        ("POST", "/courses/1/questions/2/submissions/5/save_many_grades")
+    ]
+    assert [m["graded"] for m in rubric_server.groups["submissions"]] == [True, True]
+    assert rubric_server.connections == 1
+
+
+# --- reviewer repro R2/double_expiry.py: saved grades stay visible ----------
+
+_GRADING_RUBRIC = [
+    {"id": 7, "description": "Correct", "weight": 0},
+    {"id": 8, "description": "Wrong", "weight": 5},
+]
+
+
+class _GradingServer:
+    """Each login's session survives a fixed number of authenticated requests."""
+
+    def __init__(self, lifetimes: list[int]) -> None:
+        self.lifetimes = lifetimes
+        self.logins = 0
+        self.landing: str | None = None
+        self.budget: dict[str, int] = {}
+        self.saved: dict[str, dict] = {}
+        self.session_token: str | None = None
+
+    def grader(self, sid: str) -> str:
+        saved = self.saved.get(sid)
+        applied = [
+            int(k) for k, v in (saved or {}).get("rubric_items", {}).items()
+            if v.get("score") == "true"
+        ]
+        props = {
+            "question": {"id": 2, "title": "1", "weight": 5, "scoring_type": "negative"},
+            "submission": {
+                "id": int(sid), "owner_names": "S", "score": None,
+                "graded": bool(saved), "answers": {},
+            },
+            "evaluation": (saved or {}).get(
+                "question_submission_evaluation", {"points": None, "comments": None}
+            ),
+            "rubric_items": _GRADING_RUBRIC,
+            "rubric_item_evaluations": [{"rubric_item_id": r, "present": True} for r in applied],
+            "urls": {"save_grade": f"/courses/1/questions/2/submissions/{sid}/save_grade"},
+            "navigation_urls": {},
+        }
+        return (
+            '<html><head><meta name="csrf-token" content="C"></head><body>'
+            '<div data-react-class="SubmissionGrader" data-react-props="'
+            + html.escape(json.dumps(props), quote=True)
+            + '"></div></body></html>'
+        )
+
+    def handle(self, request):
+        path = urlsplit(request.url).path or "/"
+        if path == "/":
+            return make_response(request, 200, HOME_PAGE)
+        if path == "/login" and request.method == "POST":
+            self.logins += 1
+            token = f"T{self.logins}"
+            self.landing = token
+            self.budget[token] = self.lifetimes[min(self.logins - 1, len(self.lifetimes) - 1)]
+            return make_response(request, 302, "", {"Location": BASE + "/account"})
+        if path == "/account" and self.landing:
+            token, self.landing = self.landing, None
+            return make_response(
+                request, 200, f'<html><head><meta name="csrf-token" content="{token}"></head></html>'
+            )
+        # Writes carry the grading page's token ("C"); identify the session
+        # by its session-wide header instead.
+        token = request.headers.get("X-CSRF-Token")
+        token = self.session_token if token == "C" else token
+        if self.budget.get(token, 0) <= 0:
+            return make_response(request, 302, "", {"Location": BASE + "/login"})
+        self.budget[token] -= 1
+        if path.endswith("/grade"):
+            return make_response(
+                request, 200, self.grader(path.split("/")[-2]), {"Content-Type": "text/html"}
+            )
+        if path.endswith("/save_grade") and request.method == "POST":
+            self.saved[path.split("/")[-2]] = json.loads(request.body)
+            return make_response(request, 200, "{}", {"Content-Type": "application/json"})
+        return make_response(request, 404, "not found")
+
+
+@pytest.fixture
+def grading_server(monkeypatch):
+    def install(lifetimes: list[int]) -> _GradingServer:
+        state = _GradingServer(lifetimes)
+        original = requests.Session.send
+
+        def session_send(session, request, **kwargs):
+            state.session_token = session.headers.get("X-CSRF-Token")
+            return original(session, request, **kwargs)
+
+        def adapter_send(adapter, request, stream=False, timeout=None, verify=True,
+                         cert=None, proxies=None):
+            return state.handle(request)
+
+        monkeypatch.setattr(requests.Session, "send", session_send)
+        monkeypatch.setattr(HTTPAdapter, "send", adapter_send)
+        return state
+
+    return install
+
+
+def test_batch_that_saved_rows_before_the_expiry_reports_them(grading_server) -> None:
+    """Rows 5 and 6 are saved, then the session dies (and so would the
+    re-login's). The result used to be a bare 'Authentication error: ...
+    re-login did not restore access.'"""
+    state = grading_server([7, 1])
+    grades = [{"submission_id": s, "rubric_item_ids": ["8"]} for s in ("5", "6", "9")]
+
+    _, text = _call_tool(
+        "tool_apply_grade_batch",
+        {"course_id": "1", "question_id": "2", "grades": grades, "confirm_write": True},
+    )
+
+    assert sorted(state.saved) == ["5", "6"]
+    assert not text.startswith(auth.SESSION_RECOVERY_FAILED_MESSAGE)
+    assert "### Saved" in text and "`5`" in text and "`6`" in text
+    assert "accepted 2 write request(s)" in text
+    assert state.logins == 1  # not re-run, so rows 5 and 6 were not re-sent
+
+
+def test_single_grade_saved_before_the_expiry_is_reported(grading_server) -> None:
+    state = grading_server([2, 0])
+
+    _, text = _call_tool(
+        "tool_apply_grade",
+        {
+            "course_id": "1", "question_id": "2", "submission_id": "5",
+            "rubric_item_ids": ["8"], "confirm_write": True,
+        },
+    )
+
+    assert sorted(state.saved) == ["5"]
+    assert not text.startswith(auth.SESSION_RECOVERY_FAILED_MESSAGE)
+    assert "Grade saved" in text
+    assert "accepted 1 write request(s)" in text
+    assert state.logins == 1
