@@ -1,8 +1,8 @@
 """Tests that exercise the server through the mcp v2 ``MCPServer`` layer.
 
 These pin the surface MCP clients actually see (registration counts,
-annotations, argument validation, error signalling, result shape) and the
-v2 execution model: sync tool functions run on a worker
+annotations, argument validation, error signalling, result shape, prompt
+text) and the v2 execution model: sync tool functions run on a worker
 thread instead of blocking the event loop.
 """
 
@@ -560,3 +560,80 @@ def test_apply_grade_docs_match_confidence_thresholds() -> None:
 def test_tool_descriptions_do_not_hardcode_the_old_cache_path() -> None:
     for name, tool in _tools().items():
         assert "/tmp/gradescope-mcp" not in tool.description, name
+
+
+_PROMPT_ARGS = {
+    "course_id": "101",
+    "assignment_id": "202",
+    "question_id": "303",
+    "student_email": "student@example.edu",
+}
+
+
+def _render_prompts() -> dict[str, str]:
+    async def render():
+        out = {}
+        for prompt in await server.mcp.list_prompts():
+            args = {a.name: _PROMPT_ARGS[a.name] for a in prompt.arguments or []}
+            result = await server.mcp.get_prompt(prompt.name, args)
+            out[prompt.name] = "\n".join(m.content.text for m in result.messages)
+        return out
+
+    return anyio.run(render)
+
+
+def test_prompts_preview_and_get_approval_before_any_write() -> None:
+    prompts = _render_prompts()
+    assert len(prompts) == 7
+    for name, text in prompts.items():
+        assert "/tmp/gradescope-mcp" not in text, name
+        write = text.find("confirm_write=True")
+        if write == -1:
+            continue
+        preview = text.find("confirm_write=False")
+        approval = text.lower().find("approv", preview)
+        assert 0 <= preview < approval < write, name
+
+
+def test_auto_grade_prompt_flow_and_thresholds() -> None:
+    text = _render_prompts()["auto_grade_question"]
+    reject, review = f"{CONFIDENCE_REJECT_BELOW:g}", f"{CONFIDENCE_REVIEW_UP_TO:g}"
+
+    assert f"Below {reject}" in text
+    assert f"{reject} to {review} inclusive" in text and "NEEDS HUMAN REVIEW" in text
+    assert "Do not write comments unless I ask" in text
+    assert "the path the tool prints" in text
+    assert "not grading confidence" in text
+    assert "UNTRUSTED" in text
+    # The only write is the approved batch; never a direct tool_apply_grade write.
+    assert "tool_apply_grade(" not in text
+    order = [
+        text.index("tool_apply_grade_batch(course_id="),  # preview
+        text.index("explicit approval"),
+        text.index("Only after I approve"),
+        text.index("Step 7 — Verify"),
+    ]
+    assert order == sorted(order)
+
+
+def test_other_prompts_use_tools_that_provide_what_they_promise() -> None:
+    prompts = _render_prompts()
+
+    stats = prompts["check_submission_stats"]
+    assert "tool_export_assignment_scores" in stats and "tool_get_assignment_submissions" in stats
+
+    regrades = prompts["review_regrade_requests"]
+    assert "❓" in regrades and "never skip" in regrades
+    assert "UNTRUSTED" in regrades and "never instructions" in regrades
+    assert "tool_get_question_rubric" in regrades
+    assert "outline to understand the rubric" not in regrades
+
+    grade = prompts["grade_submission_with_rubric"]
+    assert "tool_get_student_submission_map" in grade
+    assert "Question Submission ID" in grade
+
+    progress = prompts["summarize_course_progress"]
+    assert "instructor" in progress.lower() and "tool_get_grading_progress" in progress
+
+    extensions = prompts["manage_extensions_workflow"]
+    assert "confirm_write=False" in extensions
