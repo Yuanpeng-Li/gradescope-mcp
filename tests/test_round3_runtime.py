@@ -331,3 +331,335 @@ def test_agent_md_states_both_second_expiry_results() -> None:
     assert "If the re-run expires too, a re-run that had a write accepted is reported the same way" in agent
     assert "not an error result (`isError` false)" in agent
     assert "A re-run that wrote nothing returns `SESSION_RECOVERY_FAILED_MESSAGE`" in agent
+
+
+# ---------------------------------------------------------------------------
+# [9] The per-page deadline bounds the whole download, not each 64 KiB chunk
+# ---------------------------------------------------------------------------
+
+
+JPEG = b"\xff\xd8\xff\xe0"
+
+
+@pytest.fixture
+def local_http(monkeypatch):
+    """Start local 127.0.0.1 HTTP servers whose responses are scripted.
+
+    ``local_http(handler)`` returns the base URL; ``handler(conn, stop)``
+    writes the whole response to the client socket.
+    """
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    stop = threading.Event()
+    listeners: list[socket.socket] = []
+
+    def start(handler) -> str:
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        listener.settimeout(0.1)
+        listeners.append(listener)
+
+        def handle(conn):
+            with conn:
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    data = conn.recv(65536)
+                    if not data:
+                        return
+                    request += data
+                try:
+                    handler(conn, stop)
+                except OSError:
+                    pass  # the client gave up and closed the connection
+
+        def serve():
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+        threading.Thread(target=serve, daemon=True).start()
+        return f"http://127.0.0.1:{listener.getsockname()[1]}"
+
+    yield start
+    stop.set()
+    for listener in listeners:
+        listener.close()
+
+
+def _client() -> requests.Session:
+    """A session with the transport the real connection mounts (10 s / 60 s)."""
+    session = requests.Session()
+    session.trust_env = False
+    adapter = auth.TimeoutHTTPAdapter()
+    session.mount("http://", adapter)
+    return session
+
+
+def _head(*extra: str) -> bytes:
+    lines = ["HTTP/1.1 200 OK", "Content-Type: image/jpeg", "Connection: close", *extra]
+    return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+
+def _drip(conn, stop, byte: bytes) -> None:
+    """One byte every 50 ms for up to 30 s: each socket read returns well
+    within the 60 s read timeout, so only the page deadline can stop it."""
+    end = time.monotonic() + 30
+    while not stop.is_set() and time.monotonic() < end:
+        conn.sendall(byte)
+        stop.wait(0.05)
+
+
+def _trickle(conn, stop):  # reviewer repro Q4/drip.py
+    conn.sendall(_head() + JPEG)
+    _drip(conn, stop, b"0")
+
+
+def _trickle_with_length(conn, stop):
+    conn.sendall(_head("Content-Length: 100000") + JPEG)
+    _drip(conn, stop, b"0")
+
+
+def _stall(conn, stop):
+    """Part of the body, then nothing: one read blocks for the read timeout."""
+    conn.sendall(_head("Content-Length: 100000") + JPEG)
+    stop.wait(30)
+
+
+def _chunk_size_trickle(conn, stop):
+    """A trickle into a chunk-size line: ``read1`` blocks in ``readline``."""
+    conn.sendall(_head("Transfer-Encoding: chunked") + b"4\r\n" + JPEG + b"\r\n")
+    _drip(conn, stop, b"0")
+
+
+def _gzip_header_trickle(conn, stop):
+    """A trickle into a gzip comment: the decoder yields nothing, so urllib3's
+    ``read1`` keeps reading without returning to the caller."""
+    header = b"\x1f\x8b\x08\x10" + b"\x00" * 4 + b"\x00\xff"  # FCOMMENT set
+    conn.sendall(_head("Content-Encoding: gzip") + header)
+    _drip(conn, stop, b"a")
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [_trickle, _trickle_with_length, _stall, _chunk_size_trickle, _gzip_header_trickle],
+    ids=["trickle", "trickle-with-length", "stall", "chunk-size-trickle", "gzip-header-trickle"],
+)
+def test_slow_page_is_stopped_at_the_deadline(monkeypatch, local_http, handler) -> None:
+    """Before the fix the deadline was checked only after a full 64 KiB chunk,
+    so these ran until the server closed the connection (30 s here; for ever
+    in the worst case) instead of stopping after the 0.5 s budget."""
+    monkeypatch.setattr(gw, "_PAGE_DEADLINE_SECONDS", 0.5)
+    url = local_http(handler) + "/p1.jpg"
+
+    started = time.monotonic()
+    with pytest.raises(gw._PageFetchError, match=r"^download took longer than 0\.5 s \(\d+ bytes received\); stopped$"):
+        gw._download_page_image(_client(), url)
+
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs the openssl CLI")
+def test_stalled_https_page_is_interrupted_at_the_deadline(monkeypatch, tmp_path) -> None:
+    """Gradescope and S3 serve pages over TLS: the watchdog's socket
+    shutdown must also wake a read blocked inside the TLS layer."""
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    made = subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key),
+         "-out", str(cert), "-days", "1", "-subj", "/CN=127.0.0.1",
+         "-addext", "subjectAltName=IP:127.0.0.1"],
+        capture_output=True, timeout=60,
+    )
+    if made.returncode != 0:
+        pytest.skip("openssl could not create a test certificate")
+    monkeypatch.setattr(gw, "_PAGE_DEADLINE_SECONDS", 0.5)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    stop = threading.Event()
+
+    def serve():
+        try:
+            raw, _ = listener.accept()
+            with context.wrap_socket(raw, server_side=True) as conn:
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    request += conn.recv(65536)
+                conn.sendall(_head("Content-Length: 100000") + JPEG)
+                stop.wait(30)
+        except OSError:
+            pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    session = requests.Session()
+    session.trust_env = False
+    session.verify = str(cert)
+    session.mount("https://", auth.TimeoutHTTPAdapter())
+    started = time.monotonic()
+    try:
+        with pytest.raises(gw._PageFetchError, match=r"took longer than 0\.5 s \(4 bytes received\)"):
+            gw._download_page_image(session, f"https://127.0.0.1:{listener.getsockname()[1]}/p1.jpg")
+    finally:
+        stop.set()
+        listener.close()
+    assert time.monotonic() - started < 5
+
+
+BODY = JPEG + os.urandom(300_000)
+
+
+def _full(conn, _stop):
+    conn.sendall(_head(f"Content-Length: {len(BODY)}") + BODY)
+
+
+def _until_close(conn, _stop):
+    conn.sendall(_head() + BODY)
+
+
+def _chunked(conn, _stop):
+    conn.sendall(_head("Transfer-Encoding: chunked"))
+    step = 70_001
+    for start in range(0, len(BODY), step):
+        part = BODY[start:start + step]
+        conn.sendall(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+    conn.sendall(b"0\r\n\r\n")
+
+
+def _gzipped(conn, _stop):
+    payload = gzip.compress(BODY)
+    conn.sendall(_head("Content-Encoding: gzip", f"Content-Length: {len(payload)}") + payload)
+
+
+@pytest.mark.parametrize(
+    "handler", [_full, _until_close, _chunked, _gzipped],
+    ids=["content-length", "until-close", "chunked", "gzip"],
+)
+def test_page_bodies_are_still_read_in_full(local_http, handler) -> None:
+    data, extension = gw._download_page_image(_client(), local_http(handler) + "/p1.jpg")
+    assert data == BODY and extension == "jpg"
+
+
+def test_finished_pages_leave_the_connection_reusable(monkeypatch) -> None:
+    """Reading the body with ``read1`` still releases a keep-alive
+    connection to the pool, so pages on one host share a connection."""
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    listener.settimeout(5)
+    connections: list[socket.socket] = []
+
+    def handle(conn):
+        pending = b""
+        with conn:
+            while True:
+                while b"\r\n\r\n" not in pending:
+                    data = conn.recv(65536)
+                    if not data:
+                        return
+                    pending += data
+                pending = pending.split(b"\r\n\r\n", 1)[1]
+                head = "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n"
+                conn.sendall(head.format(len(BODY)).encode() + BODY)
+
+    def serve():
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            connections.append(conn)
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        session = _client()
+        url = f"http://127.0.0.1:{listener.getsockname()[1]}/p.jpg"
+        for _ in range(3):
+            assert gw._download_page_image(session, url) == (BODY, "jpg")
+        assert len(connections) == 1
+    finally:
+        listener.close()
+
+
+def test_oversized_body_over_a_socket_is_still_cut_off(monkeypatch, local_http) -> None:
+    monkeypatch.setattr(gw, "_MAX_PAGE_BYTES", 256 * 1024)
+
+    def huge(conn, _stop):
+        conn.sendall(_head() + JPEG + b"\x00" * (8 * 1024 * 1024))
+
+    with pytest.raises(gw._PageFetchError, match="too large"):
+        gw._download_page_image(_client(), local_http(huge) + "/p1.jpg")
+
+
+def test_deadline_counts_the_time_until_the_headers_arrive(monkeypatch) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(gw, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    class SlowHeaders:
+        def get(self, url, stream=False, **_kwargs):
+            clock[0] += gw._PAGE_DEADLINE_SECONDS + 1  # headers took too long
+            resp = Response()
+            resp.status_code = 200
+            resp.raw = io.BytesIO(JPEG + b"\x00" * 10)
+            resp.headers = CaseInsensitiveDict({"Content-Type": "image/jpeg"})
+            return resp
+
+    with pytest.raises(gw._PageFetchError, match="took longer than 120 s"):
+        gw._download_page_image(SlowHeaders(), "https://s3.example/p1.jpg")
+
+
+def test_watchdog_interrupts_once_and_never_after_stop() -> None:
+    fired = threading.Event()
+    resp = SimpleNamespace(raw=SimpleNamespace(shutdown=fired.set))
+
+    with gw._ReadWatchdog(resp, time.monotonic() + 0.05) as watchdog:
+        assert fired.wait(5)
+    assert watchdog.stop() is True
+
+    late = threading.Event()
+    resp = SimpleNamespace(raw=SimpleNamespace(shutdown=late.set))
+    with gw._ReadWatchdog(resp, time.monotonic() + 0.05) as watchdog:
+        pass  # the read finished before the deadline
+    assert not late.wait(0.3)
+    assert watchdog.stop() is False
+
+
+def test_cache_tool_drops_a_stalled_page_on_time_and_keeps_the_rest(monkeypatch, local_http) -> None:
+    monkeypatch.setattr(gw, "_PAGE_DEADLINE_SECONDS", 0.5)
+    stalled, good = local_http(_stall), local_http(_full)
+    props = {
+        "question": {"parameters": {"crop_rect_list": []}},
+        "submission": {},
+        "pages": [
+            {"number": 1, "url": f"{stalled}/p1.jpg"},
+            {"number": 2, "url": f"{good}/p2.jpg"},
+        ],
+    }
+    conn = SimpleNamespace(session=_client(), gradescope_base_url="https://www.gradescope.com")
+    monkeypatch.setattr(gw, "_resolve_assignment_questions", lambda *_a: ("7", {}, None))
+    monkeypatch.setattr(gw, "_get_grading_context", lambda *_a: {"props": props})
+    monkeypatch.setattr(gw, "get_connection", lambda: conn)
+
+    started = time.monotonic()
+    result = anyio.run(
+        server.mcp.call_tool,
+        "tool_cache_relevant_pages",
+        {"course_id": "1", "assignment_id": "7", "question_id": "11", "submission_id": "21"},
+    )
+    text = "\n".join(c.text for c in result.content)
+
+    assert time.monotonic() - started < 5
+    assert text.startswith("Cached 1 of 2 relevant page(s)")
+    assert re.search(r"page 1: download took longer than 0\.5 s \(\d+ bytes received\); stopped", text)
+    assert "page_2.jpg" in text

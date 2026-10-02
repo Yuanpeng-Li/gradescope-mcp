@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import contextlib
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
 import requests
+from urllib3.response import HTTPResponse as Urllib3Response
 
 from gradescope_mcp.cache import (
     CacheError,
@@ -51,8 +53,9 @@ _MAX_PAGE_BYTES = 25 * 1024 * 1024
 # Page bodies are read in chunks of this size, so an oversized body is
 # abandoned after at most _MAX_PAGE_BYTES + one chunk.
 _PAGE_CHUNK_BYTES = 64 * 1024
-# Wall-clock budget for one page body. The transport timeout bounds each read,
-# not the whole download, so a slow trickle could otherwise run for hours.
+# Wall-clock budget for one page download, from the request to the end of the
+# body. The transport timeout bounds each socket read, not the whole download,
+# so a slow trickle could otherwise run for hours; see _read_page_body.
 _PAGE_DEADLINE_SECONDS = 120.0
 
 _READINESS_MEANING = (
@@ -1127,31 +1130,112 @@ def _image_extension(data: bytes, content_type: str) -> str | None:
     return None
 
 
-def _read_page_body(resp: Any) -> bytes:
-    """Read a streamed response body, stopping as soon as it exceeds the cap.
+class _ReadWatchdog:
+    """Interrupt a streamed response's blocked read once its deadline passes.
+
+    A timer thread calls urllib3's ``HTTPResponse.shutdown()``, which shuts
+    the socket down for reading from another thread so a blocked ``recv``
+    returns at once. Used as a context manager; ``stop()`` disarms it and
+    reports whether it fired, after which it can no longer fire.
+    """
+
+    def __init__(self, resp: Any, deadline: float):
+        self._resp = resp
+        self._lock = threading.Lock()
+        self._stopped = False
+        self._fired = False
+        self._timer = threading.Timer(max(0.0, deadline - time.monotonic()), self._fire)
+        self._timer.daemon = True
+
+    def __enter__(self) -> _ReadWatchdog:
+        self._timer.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.stop()
+
+    def _fire(self) -> None:
+        with self._lock:
+            if self._stopped:
+                return
+            self._fired = True
+            # Fakes and non-urllib3 bodies have no shutdown(); the read loop's
+            # own deadline check still applies to them.
+            with contextlib.suppress(Exception):
+                self._resp.raw.shutdown()
+
+    def stop(self) -> bool:
+        with self._lock:
+            self._stopped = True
+        self._timer.cancel()
+        return self._fired
+
+
+def _iter_page_chunks(resp: Any):
+    """Yield body chunks of at most ``_PAGE_CHUNK_BYTES`` as they arrive.
+
+    A urllib3 body is read with ``read1``, which returns as soon as any bytes
+    arrive instead of blocking until a whole chunk is in (``iter_content``
+    does the latter, so a 1-byte trickle never reached the deadline check).
+    """
+    raw = getattr(resp, "raw", None)
+    if not isinstance(raw, Urllib3Response):
+        yield from resp.iter_content(chunk_size=_PAGE_CHUNK_BYTES)
+        return
+    while True:
+        chunk = raw.read1(_PAGE_CHUNK_BYTES, decode_content=True)
+        if not chunk:
+            return
+        yield chunk
+
+
+def _read_page_body(resp: Any, deadline: float | None = None) -> bytes:
+    """Read a streamed response body within the size cap and the deadline.
 
     At most ``_MAX_PAGE_BYTES`` plus one chunk is ever held in memory, whether
-    or not the server declared a Content-Length, and the read is abandoned
-    once it runs past ``_PAGE_DEADLINE_SECONDS``.
+    or not the server declared a Content-Length. ``deadline`` (a
+    ``time.monotonic()`` value; default ``_PAGE_DEADLINE_SECONDS`` from now)
+    bounds the whole read, not each chunk: the deadline is checked after
+    every read, and reads return as soon as any bytes arrive, so a slow
+    trickle is stopped on time. A read that is still blocked at the deadline
+    (a stalled socket, or a trickle into a chunk header or compressed data
+    that yields nothing yet) is interrupted by a watchdog.
     """
-    deadline = time.monotonic() + _PAGE_DEADLINE_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + _PAGE_DEADLINE_SECONDS
     chunks: list[bytes] = []
     received = 0
-    for chunk in resp.iter_content(chunk_size=_PAGE_CHUNK_BYTES):
-        if not chunk:
-            continue
-        received += len(chunk)
-        if received > _MAX_PAGE_BYTES:
-            raise _PageFetchError(
-                f"too large (over the limit of {_MAX_PAGE_BYTES} bytes; "
-                "download stopped)"
-            )
-        chunks.append(chunk)
-        if time.monotonic() > deadline:
-            raise _PageFetchError(
-                f"download took longer than {_PAGE_DEADLINE_SECONDS:g} s "
-                f"({received} bytes received); stopped"
-            )
+
+    def too_slow() -> _PageFetchError:
+        return _PageFetchError(
+            f"download took longer than {_PAGE_DEADLINE_SECONDS:g} s "
+            f"({received} bytes received); stopped"
+        )
+
+    with _ReadWatchdog(resp, deadline) as watchdog:
+        try:
+            for chunk in _iter_page_chunks(resp):
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if received > _MAX_PAGE_BYTES:
+                    raise _PageFetchError(
+                        f"too large (over the limit of {_MAX_PAGE_BYTES} bytes; "
+                        "download stopped)"
+                    )
+                chunks.append(chunk)
+                if time.monotonic() > deadline:
+                    raise too_slow()
+        except _PageFetchError:
+            raise
+        except Exception:
+            # The watchdog's shutdown surfaces as a read error ...
+            if watchdog.stop():
+                raise too_slow() from None
+            raise
+        if watchdog.stop():
+            # ... or as a premature end of the body: never return it as a page.
+            raise too_slow()
     return b"".join(chunks)
 
 
@@ -1160,8 +1244,10 @@ def _download_page_image(session: Any, url: str) -> tuple[bytes, str]:
 
     The body is streamed: a declared Content-Length over the cap is refused
     before reading, and an undeclared or understated one is cut off as soon
-    as the cap is exceeded.
+    as the cap is exceeded. The whole download, from the request on, must
+    finish within ``_PAGE_DEADLINE_SECONDS``.
     """
+    deadline = time.monotonic() + _PAGE_DEADLINE_SECONDS
     resp = session.get(url, stream=True)
     try:
         if resp.status_code != 200:
@@ -1171,7 +1257,7 @@ def _download_page_image(session: Any, url: str) -> tuple[bytes, str]:
             raise _PageFetchError(
                 f"too large ({declared} bytes; limit {_MAX_PAGE_BYTES} bytes)"
             )
-        data = _read_page_body(resp)
+        data = _read_page_body(resp, deadline)
         content_type = (
             str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         )
