@@ -9,7 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from mcp.server.mcpserver import MCPServer
 
-from gradescope_mcp.auth import get_connection, AuthError
+from gradescope_mcp.auth import get_connection, AuthError, with_session_recovery
 from gradescope_mcp.tools.courses import list_courses, get_course_roster
 from gradescope_mcp.tools.assignments import (
     get_assignments,
@@ -73,12 +73,37 @@ except PackageNotFoundError:
 # inline on the event loop (see auth.py for the thread-safety this requires).
 mcp = MCPServer("Gradescope MCP Server", version=_SERVER_VERSION)
 
+
+def gs_tool():
+    """Register a tool like ``mcp.tool()``, with Gradescope session recovery.
+
+    The function is wrapped in ``with_session_recovery``, which logs in again
+    and re-runs it once if Gradescope's session expired during the call. The
+    wrapper keeps the function's name, docstring and signature, so the
+    registered tool and its schema are unchanged.
+    """
+
+    def decorator(fn):
+        return mcp.tool()(with_session_recovery(fn))
+
+    return decorator
+
+
+def gs_resource(uri: str):
+    """Register a resource like ``mcp.resource(uri)``, with session recovery."""
+
+    def decorator(fn):
+        return mcp.resource(uri)(with_session_recovery(fn))
+
+    return decorator
+
+
 # ============================================================
 # Tools
 # ============================================================
 
 
-@mcp.tool()
+@gs_tool()
 def tool_list_courses() -> str:
     """List all Gradescope courses for the authenticated user.
 
@@ -88,7 +113,7 @@ def tool_list_courses() -> str:
     return list_courses()
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_assignments(course_id: str) -> str:
     """Get all assignments for a specific Gradescope course.
 
@@ -100,7 +125,7 @@ def tool_get_assignments(course_id: str) -> str:
     return get_assignments(course_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_assignment_details(course_id: str, assignment_id: str) -> str:
     """Get detailed information about a specific assignment.
 
@@ -113,7 +138,7 @@ def tool_get_assignment_details(course_id: str, assignment_id: str) -> str:
     return get_assignment_details(course_id, assignment_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_course_roster(course_id: str) -> str:
     """Get the full roster (students, TAs, instructors) for a course.
 
@@ -126,7 +151,7 @@ def tool_get_course_roster(course_id: str) -> str:
     return get_course_roster(course_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_upload_submission(
     course_id: str,
     assignment_id: str,
@@ -148,7 +173,7 @@ def tool_upload_submission(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_extensions(course_id: str, assignment_id: str) -> str:
     """Get all student extensions for a specific assignment.
 
@@ -162,7 +187,7 @@ def tool_get_extensions(course_id: str, assignment_id: str) -> str:
     return get_extensions(course_id, assignment_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_set_extension(
     course_id: str,
     assignment_id: str,
@@ -200,7 +225,7 @@ def tool_set_extension(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_modify_assignment_dates(
     course_id: str,
     assignment_id: str,
@@ -232,7 +257,7 @@ def tool_modify_assignment_dates(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_rename_assignment(
     course_id: str,
     assignment_id: str,
@@ -252,7 +277,7 @@ def tool_rename_assignment(
     return rename_assignment(course_id, assignment_id, new_title, confirm_write)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_update_autograder_image(
     course_id: str,
     assignment_id: str,
@@ -278,7 +303,7 @@ def tool_update_autograder_image(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_assignment_submissions(
     course_id: str, assignment_id: str
 ) -> str:
@@ -294,7 +319,7 @@ def tool_get_assignment_submissions(
     return get_assignment_submissions(course_id, assignment_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_student_submission(
     course_id: str, assignment_id: str, student_email: str
 ) -> str:
@@ -310,7 +335,7 @@ def tool_get_student_submission(
     return get_student_submission(course_id, assignment_id, student_email)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_assignment_graders(
     course_id: str, question_id: str
 ) -> str:
@@ -323,7 +348,7 @@ def tool_get_assignment_graders(
     return get_assignment_graders(course_id, question_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_assignment_outline(course_id: str, assignment_id: str) -> str:
     """Get the question/rubric outline for an assignment.
 
@@ -338,7 +363,7 @@ def tool_get_assignment_outline(course_id: str, assignment_id: str) -> str:
     return get_assignment_outline(course_id, assignment_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_export_assignment_scores(
     course_id: str,
     assignment_id: str,
@@ -359,7 +384,7 @@ def tool_export_assignment_scores(
     return export_assignment_scores(course_id, assignment_id, output_format)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_student_assignment_link(
     course_id: str,
     assignment_id: str,
@@ -380,7 +405,7 @@ def tool_get_student_assignment_link(
     return get_student_assignment_link(course_id, assignment_id, student_name)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_grading_progress(course_id: str, assignment_id: str) -> str:
     """Get the grading progress dashboard for an assignment.
 
@@ -394,7 +419,7 @@ def tool_get_grading_progress(course_id: str, assignment_id: str) -> str:
     return get_grading_progress(course_id, assignment_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_regrade_requests(course_id: str, assignment_id: str) -> str:
     """List all regrade requests for an assignment.
 
@@ -409,7 +434,7 @@ def tool_get_regrade_requests(course_id: str, assignment_id: str) -> str:
     return get_regrade_requests(course_id, assignment_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_regrade_detail(
     course_id: str, question_id: str, submission_id: str
 ) -> str:
@@ -428,7 +453,7 @@ def tool_get_regrade_detail(
     return get_regrade_detail(course_id, question_id, submission_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_assignment_statistics(course_id: str, assignment_id: str) -> str:
     """Get comprehensive statistics for an assignment.
 
@@ -443,7 +468,7 @@ def tool_get_assignment_statistics(course_id: str, assignment_id: str) -> str:
     return get_assignment_statistics(course_id, assignment_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_submission_grading_context(
     course_id: str, question_id: str, submission_id: str
 ) -> str:
@@ -461,7 +486,7 @@ def tool_get_submission_grading_context(
     return get_submission_grading_context(course_id, question_id, submission_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_apply_grade(
     course_id: str,
     question_id: str,
@@ -506,7 +531,7 @@ def tool_apply_grade(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_apply_grade_batch(
     course_id: str,
     question_id: str,
@@ -545,7 +570,7 @@ def tool_apply_grade_batch(
     return apply_grade_batch(course_id, question_id, grades, confirm_write)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_question_rubric(
     course_id: str,
     question_id: str,
@@ -562,7 +587,7 @@ def tool_get_question_rubric(
     return get_question_rubric(course_id, question_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_create_rubric_item(
     course_id: str,
     question_id: str,
@@ -591,7 +616,7 @@ def tool_create_rubric_item(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_list_question_submissions(
     course_id: str, question_id: str, filter: str = "all",
 ) -> str:
@@ -609,7 +634,7 @@ def tool_list_question_submissions(
     return list_question_submissions(course_id, question_id, filter)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_student_submission_map(
     course_id: str,
     assignment_id: str,
@@ -634,7 +659,7 @@ def tool_get_student_submission_map(
     return get_student_submission_map(course_id, assignment_id, student_name)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_next_ungraded(
     course_id: str, question_id: str, submission_id: str = "",
     output_format: str = "markdown",
@@ -655,7 +680,7 @@ def tool_get_next_ungraded(
     return get_next_ungraded(course_id, question_id, submission_id, output_format)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_update_rubric_item(
     course_id: str,
     question_id: str,
@@ -681,7 +706,7 @@ def tool_update_rubric_item(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_delete_rubric_item(
     course_id: str,
     question_id: str,
@@ -703,7 +728,7 @@ def tool_delete_rubric_item(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_answer_groups(
     course_id: str,
     question_id: str,
@@ -722,7 +747,7 @@ def tool_get_answer_groups(
     return get_answer_groups(course_id, question_id, output_format)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_get_answer_group_detail(
     course_id: str,
     question_id: str,
@@ -742,7 +767,7 @@ def tool_get_answer_group_detail(
     return get_answer_group_detail(course_id, question_id, group_id, output_format)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_grade_answer_group(
     course_id: str,
     question_id: str,
@@ -771,7 +796,7 @@ def tool_grade_answer_group(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_prepare_grading_artifact(
     course_id: str,
     assignment_id: str | None = None,
@@ -795,7 +820,7 @@ def tool_prepare_grading_artifact(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_assess_submission_readiness(
     course_id: str,
     assignment_id: str | None = None,
@@ -819,7 +844,7 @@ def tool_assess_submission_readiness(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_cache_relevant_pages(
     course_id: str,
     assignment_id: str | None = None,
@@ -851,7 +876,7 @@ def tool_cache_relevant_pages(
     )
 
 
-@mcp.tool()
+@gs_tool()
 def tool_prepare_answer_key(course_id: str, assignment_id: str) -> str:
     """Prepare a complete answer key for an entire assignment.
 
@@ -867,7 +892,7 @@ def tool_prepare_answer_key(course_id: str, assignment_id: str) -> str:
     return prepare_answer_key(course_id, assignment_id)
 
 
-@mcp.tool()
+@gs_tool()
 def tool_smart_read_submission(
     course_id: str,
     assignment_id: str | None = None,
@@ -900,19 +925,19 @@ def tool_smart_read_submission(
 # ============================================================
 
 
-@mcp.resource("gradescope://courses")
+@gs_resource("gradescope://courses")
 def resource_courses() -> str:
     """Current list of all Gradescope courses for the authenticated user."""
     return list_courses()
 
 
-@mcp.resource("gradescope://courses/{course_id}/assignments")
+@gs_resource("gradescope://courses/{course_id}/assignments")
 def resource_assignments(course_id: str) -> str:
     """List of assignments for a specific course."""
     return get_assignments(course_id)
 
 
-@mcp.resource("gradescope://courses/{course_id}/roster")
+@gs_resource("gradescope://courses/{course_id}/roster")
 def resource_roster(course_id: str) -> str:
     """Course roster for a specific course."""
     return get_course_roster(course_id)
@@ -921,6 +946,8 @@ def resource_roster(course_id: str) -> str:
 # ============================================================
 # Prompts
 # ============================================================
+# Prompts only build text and make no Gradescope requests, so they are
+# registered without session recovery.
 
 
 @mcp.prompt()
