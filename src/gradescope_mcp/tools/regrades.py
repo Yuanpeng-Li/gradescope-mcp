@@ -3,22 +3,143 @@
 These tools allow instructors/TAs to view, review, and manage regrade requests
 submitted by students. Data is parsed from the Gradescope regrade request pages
 and the SubmissionGrader React component.
+
+Regrade messages are student-authored and are returned inside labelled
+untrusted blocks.
 """
 
-import json
 import re
 
 from bs4 import BeautifulSoup
 
 from gradescope_mcp.auth import get_connection, AuthError
+from gradescope_mcp.tools.common import (
+    escape_md_cell,
+    format_untrusted,
+    is_placeholder_page,
+    normalize_url,
+)
+from gradescope_mcp.tools.grading_ops import _get_grading_context
 
 
-# Placeholder strings Gradescope uses to mean "no value yet" — these must NOT
-# count as completed even though they're non-empty.
-_REGRADE_PLACEHOLDERS = frozenset({"", "-", "—", "–", "pending", "n/a", "none", "tbd"})
+# Completion-cell values that positively mean "not completed yet". Empty and
+# placeholder cells also count as pending.
+_REGRADE_PENDING_TOKENS = frozenset({
+    "", "-", "—", "–", "pending", "n/a", "na", "none", "tbd", "no", "n",
+    "false", "open", "not completed", "incomplete", "in progress",
+    "unresolved", "awaiting response", "✗", "✘", "×",
+})
 
-# Likely header labels for the column that records when a regrade was decided.
-_REGRADE_COMPLETED_HEADERS = ("completed", "completed at", "decided", "decided at", "resolved")
+# Completion-cell values that positively mean "completed".
+_REGRADE_DONE_TOKENS = frozenset({
+    "yes", "y", "true", "completed", "complete", "done", "closed", "resolved",
+    "✓", "✔", "✔️", "✅",
+})
+
+_PENDING_WORDS_RE = re.compile(
+    r"\b(?:not|pending|open|awaiting|incomplete|unresolved|in progress)\b"
+)
+
+# A date or time stamp is the usual positive evidence of completion.
+_MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+_DATE_RE = re.compile(
+    r"\d{4}-\d{1,2}-\d{1,2}"
+    r"|\b\d{1,2}/\d{1,2}/\d{2,4}\b"
+    rf"|\b{_MONTHS}\s+\d{{1,2}}\b"
+    rf"|\b\d{{1,2}}\s+{_MONTHS}"
+    r"|\b\d{1,2}:\d{2}\b"
+    r"|\bago\b"
+)
+
+# Header candidates per column, matched on normalized header text: exact
+# matches first, then substrings. Columns are resolved in this order so a
+# header can only be claimed once ("Question Name" is the question column,
+# not the student column).
+_COLUMN_CANDIDATES = (
+    ("grader", ("grader", "graded by", "assigned grader", "assigned to")),
+    ("question", ("question",)),
+    ("completed", ("completed", "complete", "decided", "resolved", "closed", "status")),
+    ("student", ("student", "user", "name")),
+)
+
+
+def _normalize_header(text: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower()).split())
+
+
+def _resolve_columns(headers: list[str]) -> dict[str, int | None]:
+    normalized = [_normalize_header(h) for h in headers]
+    used: set[int] = set()
+    columns: dict[str, int | None] = {}
+    for role, candidates in _COLUMN_CANDIDATES:
+        found = None
+        for match_exact in (True, False):
+            for cand in candidates:
+                for idx, h in enumerate(normalized):
+                    if idx in used or not h:
+                        continue
+                    if (h == cand) if match_exact else (cand in h):
+                        found = idx
+                        break
+                if found is not None:
+                    break
+            if found is not None:
+                break
+        columns[role] = found
+        if found is not None:
+            used.add(found)
+    return columns
+
+
+def _classify_completion(cell) -> bool | None:
+    """True = completed, False = pending, None = cannot tell.
+
+    Only positive evidence counts as completed: a date/time stamp, a
+    recognised token, or an icon's aria-label/title/alt. A cell whose only
+    content is a link is never read as the completion value.
+    """
+    if cell is None:
+        return None
+    text = " ".join(cell.get_text(" ", strip=True).split())
+    anchors = cell.find_all("a")
+    if anchors and text == " ".join(
+        " ".join(a.get_text(" ", strip=True).split()) for a in anchors
+    ).strip():
+        text = ""
+        link_only = True
+    else:
+        link_only = False
+
+    labels = []
+    for el in [cell, *cell.find_all(True)]:
+        for attr in ("aria-label", "title", "alt", "data-original-title"):
+            value = el.get(attr)
+            if isinstance(value, str) and value.strip():
+                labels.append(" ".join(value.split()))
+
+    candidates = [c.lower() for c in [text, *labels] if c]
+    for c in candidates:
+        if c in _REGRADE_DONE_TOKENS:
+            return True
+        if c in _REGRADE_PENDING_TOKENS:
+            return False
+    for c in candidates:
+        if _PENDING_WORDS_RE.search(c):
+            return False
+    for c in candidates:
+        if _DATE_RE.search(c):
+            return True
+    if not candidates and not link_only:
+        # An empty completion cell means the request has not been decided.
+        return False
+    return None
+
+
+def _looks_like_regrade_page(soup: BeautifulSoup) -> bool:
+    """Whether the visible page text mentions regrades at all."""
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    return "regrade" in soup.get_text(" ").lower()
 
 
 def get_regrade_requests(course_id: str, assignment_id: str) -> str:
@@ -26,6 +147,10 @@ def get_regrade_requests(course_id: str, assignment_id: str) -> str:
 
     Returns a table of pending and completed regrade requests with student name,
     question, grader, and status. Requires instructor/TA access.
+
+    A request is marked completed only on positive evidence (a date/time,
+    a recognised status word or icon label); anything else is shown as
+    unknown (❓) rather than guessed.
 
     Args:
         course_id: The Gradescope course ID.
@@ -52,10 +177,16 @@ def get_regrade_requests(course_id: str, assignment_id: str) -> str:
     soup = BeautifulSoup(resp.text, "html.parser")
     table = soup.find("table")
     if not table:
-        return f"No regrade requests found for assignment `{assignment_id}`. (Regrade requests may not be enabled.)"
+        if _looks_like_regrade_page(soup):
+            return f"No regrade requests found for assignment `{assignment_id}`. (Regrade requests may not be enabled.)"
+        return (
+            f"Error: unexpected page for assignment `{assignment_id}` regrade "
+            "requests: no regrade table and no regrade-related content. The "
+            "session may have expired or the page layout changed."
+        )
 
     # Header-aware column resolution. Gradescope drops the Sections column for
-    # courses without sections, which used to shift every cell index left.
+    # courses without sections, so positions cannot be assumed.
     headers = []
     thead = table.find("thead")
     if thead is not None:
@@ -67,19 +198,12 @@ def get_regrade_requests(course_id: str, assignment_id: str) -> str:
         if first_row is not None:
             ths = first_row.find_all("th")
             if ths:
-                headers = [th.get_text(strip=True) for th in ths]
+                headers = [th.get_text(strip=True) for th in first_row.find_all(["th", "td"])]
 
-    def _col(*names: str) -> int | None:
-        wanted = {n.lower() for n in names}
-        for idx, h in enumerate(headers):
-            if (h or "").strip().lower() in wanted:
-                return idx
-        return None
-
-    student_idx = _col("student", "name", "user")
-    question_idx = _col("question")
-    grader_idx = _col("grader", "graded by", "last graded by")
-    completed_idx = _col(*_REGRADE_COMPLETED_HEADERS)
+    columns = _resolve_columns(headers)
+    unresolved = [
+        role for role in ("student", "question", "completed") if columns[role] is None
+    ]
 
     body = table.find("tbody") or table
     data_rows = [tr for tr in body.find_all("tr") if tr.find("td")]
@@ -87,33 +211,42 @@ def get_regrade_requests(course_id: str, assignment_id: str) -> str:
         return f"No regrade requests for assignment `{assignment_id}`."
 
     lines = [f"## Regrade Requests — Assignment {assignment_id}\n"]
+    if unresolved:
+        lines.append(
+            f"⚠️ **Unrecognized regrade table layout** (headers: {headers or '(none)'}): "
+            f"could not find the {', '.join(unresolved)} column(s). Those cells "
+            "show '?' and unresolved completion status shows ❓. Check the "
+            "regrade page in Gradescope before relying on this list.\n"
+        )
     lines.append("| # | Status | Student | Question | Grader | Review Link |")
     lines.append("|---|--------|---------|----------|--------|-------------|")
 
     pending_count = 0
     completed_count = 0
+    unknown_count = 0
 
     for i, row in enumerate(data_rows, 1):
-        cells = row.find_all("td")
-        cell_text = [c.get_text(strip=True) for c in cells]
+        # Index th and td together, like the header row, so a row-header <th>
+        # cannot shift every column.
+        cells = row.find_all(["td", "th"])
 
-        def _at(idx: int | None, fallback: int) -> str:
-            if idx is not None and idx < len(cell_text):
-                return cell_text[idx]
-            if fallback < len(cell_text):
-                return cell_text[fallback]
-            return ""
+        def _cell(role: str):
+            idx = columns[role]
+            return cells[idx] if idx is not None and idx < len(cells) else None
 
-        student = _at(student_idx, 0)
-        question = _at(question_idx, 2)
-        grader = _at(grader_idx, 3)
-        completed_cell = _at(completed_idx, 4)
+        def _text(role: str) -> str:
+            cell = _cell(role)
+            if cell is None:
+                return "?"
+            return escape_md_cell(" ".join(cell.get_text(" ", strip=True).split()))
 
-        # A regrade is "completed" only when the cell holds a real value
-        # (typically a date/time stamp). "—", "Pending", "" and similar
-        # placeholders previously triggered the success badge — they don't now.
-        normalized = completed_cell.strip().lower()
-        is_completed = bool(normalized) and normalized not in _REGRADE_PLACEHOLDERS
+        student = _text("student")
+        question = _text("question")
+        grader = _text("grader") if columns["grader"] is not None else ""
+        is_completed = (
+            _classify_completion(_cell("completed"))
+            if columns["completed"] is not None else None
+        )
 
         review_link = ""
         for a in row.find_all("a"):
@@ -127,18 +260,22 @@ def get_regrade_requests(course_id: str, assignment_id: str) -> str:
         qid = qid_match.group(1) if qid_match else ""
         sid = sid_match.group(1) if sid_match else ""
 
-        status = "✅" if is_completed else "⏳"
-        if is_completed:
+        if is_completed is True:
+            status = "✅"
             completed_count += 1
-        else:
+        elif is_completed is False:
+            status = "⏳"
             pending_count += 1
+        else:
+            status = "❓"
+            unknown_count += 1
 
         # Surface the source cell when the IDs cannot be parsed so the user
         # can investigate instead of getting a silently empty Review Link.
         if qid:
             id_info = f"qid={qid}, sid={sid}"
         elif review_link:
-            id_info = f"⚠ link parse failed: {review_link}"
+            id_info = f"⚠ link parse failed: {escape_md_cell(review_link)}"
         else:
             id_info = "⚠ no /grade link in row"
 
@@ -147,7 +284,11 @@ def get_regrade_requests(course_id: str, assignment_id: str) -> str:
         )
 
     lines.append("")
-    lines.append(f"**Pending:** {pending_count} | **Completed:** {completed_count} | **Total:** {pending_count + completed_count}")
+    summary = f"**Pending:** {pending_count} | **Completed:** {completed_count}"
+    if unknown_count:
+        summary += f" | **Unknown:** {unknown_count}"
+    summary += f" | **Total:** {pending_count + completed_count + unknown_count}"
+    lines.append(summary)
     lines.append("")
     lines.append(
         "_Use `get_regrade_detail(course_id, question_id, submission_id)` to see "
@@ -157,12 +298,31 @@ def get_regrade_requests(course_id: str, assignment_id: str) -> str:
     return "\n".join(lines)
 
 
+def _quote(text) -> str:
+    """Blockquote every line (not just the first) of staff-authored text."""
+    return "\n".join(f"> {line}" for line in str(text).splitlines() or [""])
+
+
+def _append_request(lines: list[str], req: dict) -> None:
+    lines.append(f"**Date:** {req.get('created_at', 'N/A')}")
+    lines.append("\n**Student says:**")
+    lines.append(
+        format_untrusted(
+            req.get("student_comment") or "(no message)", "REGRADE REQUEST MESSAGE"
+        )
+    )
+    lines.append("")
+    if req.get("staff_comment"):
+        lines.append(f"**Staff response:**\n{_quote(req.get('staff_comment'))}\n")
+
+
 def get_regrade_detail(course_id: str, question_id: str, submission_id: str) -> str:
     """Get detailed information about a specific regrade request.
 
-    Shows the student's regrade message, the current rubric, applied rubric items,
-    the grader's response (if any), and links to the student's submission.
-    Requires instructor/TA access.
+    Shows the current question score, point adjustment, grader comment and
+    scoring direction, the rubric with applied items, the student's regrade
+    message (as an untrusted block), the staff response (if any), and links
+    to the relevant submission pages. Requires instructor/TA access.
 
     Args:
         course_id: The Gradescope course ID.
@@ -173,98 +333,114 @@ def get_regrade_detail(course_id: str, question_id: str, submission_id: str) -> 
         return "Error: course_id, question_id, and submission_id are required."
 
     try:
-        conn = get_connection()
-        url = (
-            f"{conn.gradescope_base_url}/courses/{course_id}"
-            f"/questions/{question_id}/submissions/{submission_id}/grade"
-        )
-        resp = conn.session.get(url)
+        ctx = _get_grading_context(course_id, question_id, submission_id)
     except AuthError as e:
         return f"Authentication error: {e}"
+    except ValueError as e:
+        return f"Error: {e}"
     except Exception as e:
         return f"Error fetching regrade detail: {e}"
 
-    if resp.status_code != 200:
-        return f"Error: Cannot access grading page (status {resp.status_code})."
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    grader = soup.find(attrs={"data-react-class": "SubmissionGrader"})
-    if not grader:
-        return "Error: SubmissionGrader component not found."
-
-    try:
-        props = json.loads(grader.get("data-react-props", "{}"))
-    except json.JSONDecodeError:
-        return "Error: Could not parse grading data."
+    props = ctx["props"]
+    question = props.get("question") or {}
+    submission = props.get("submission") or {}
+    evaluation = props.get("evaluation") or {}
 
     # Extract question info
-    question = props.get("question", {})
     q_title = question.get("title", "Unknown")
     q_weight = question.get("weight", "?")
 
     lines = [f"## Regrade Detail — Question {q_title} (max {q_weight} pts)\n"]
 
     # Assignment info
-    assignment = props.get("assignment", {})
+    assignment = props.get("assignment") or {}
     if assignment.get("title"):
         lines.append(f"**Assignment:** {assignment.get('title')}")
+    lines.append(
+        f"**Question ID:** `{question_id}` | **Question Submission ID:** `{submission_id}`"
+    )
 
-    # Submission info
-    sub = props.get("assignment_submission", {})
-    if sub.get("score") is not None:
-        lines.append(f"**Total assignment score:** {sub.get('score')}")
+    # Current grade on this question
+    score = submission.get("score")
+    lines.append(
+        f"**Current question score:** {score if score is not None else 'Ungraded'} / {q_weight}"
+    )
+    scoring_type = question.get("scoring_type", "negative")
+    lines.append(
+        f"**Scoring:** {scoring_type} (floor={question.get('floor')}, "
+        f"ceiling={question.get('ceiling')})"
+    )
+    if scoring_type == "positive":
+        lines.append("  ↳ _Rubric items **add** points (e.g. `5.0` = +5 earned)._")
+    else:
+        lines.append(
+            "  ↳ _Starts at full marks; rubric items **deduct** points "
+            "(e.g. `2.0` = −2)._"
+        )
+    points = evaluation.get("points")
+    lines.append(f"**Point adjustment:** {points if points is not None else 'None'}")
+    if evaluation.get("comments"):
+        lines.append(f"**Grader comment:**\n{_quote(evaluation.get('comments'))}")
 
     lines.append("")
 
     # Current rubric
-    rubric_items = props.get("rubric_items", [])
-    evaluations = props.get("rubric_item_evaluations", [])
-    applied_ids = {e["rubric_item_id"] for e in evaluations if e.get("present")}
+    rubric_items = [ri for ri in (props.get("rubric_items") or []) if isinstance(ri, dict)]
+    evaluations = props.get("rubric_item_evaluations") or []
+    applied_ids = {
+        str(e.get("rubric_item_id"))
+        for e in evaluations if isinstance(e, dict) and e.get("present")
+    }
 
     if rubric_items:
         lines.append("### Rubric Items")
-        lines.append("| Applied | Description | Points |")
-        lines.append("|---------|-------------|--------|")
+        lines.append("| Applied | ID | Description | Points |")
+        lines.append("|---------|----|-------------|--------|")
         for ri in rubric_items:
-            applied = "✅" if ri["id"] in applied_ids else "—"
-            lines.append(f"| {applied} | {ri['description']} | {ri['weight']} |")
+            applied = "✅" if str(ri.get("id")) in applied_ids else "—"
+            lines.append(
+                f"| {applied} | `{escape_md_cell(ri.get('id'))}` "
+                f"| {escape_md_cell(ri.get('description', ''))} "
+                f"| {escape_md_cell(ri.get('weight', '?'))} |"
+            )
         lines.append("")
 
     # Open regrade request
     open_req = props.get("open_request")
-    if open_req:
+    if isinstance(open_req, dict) and open_req:
         lines.append("### ⏳ Open Regrade Request")
-        lines.append(f"**Date:** {open_req.get('created_at', 'N/A')}")
-        lines.append(f"\n**Student says:**\n> {open_req.get('student_comment', '(no message)')}\n")
-        if open_req.get("staff_comment"):
-            lines.append(f"**Staff response:**\n> {open_req.get('staff_comment')}\n")
+        _append_request(lines, open_req)
 
     # Closed regrade requests
-    closed = props.get("closed_requests", [])
+    closed = [r for r in (props.get("closed_requests") or []) if isinstance(r, dict)]
     if closed:
         lines.append("### Closed Regrade Request(s)")
         for req in closed:
-            lines.append(f"**Date:** {req.get('created_at', 'N/A')}")
-            lines.append(f"\n**Student says:**\n> {req.get('student_comment', '(no message)')}\n")
-            if req.get("staff_comment"):
-                lines.append(f"**Staff response:**\n> {req.get('staff_comment')}\n")
+            _append_request(lines, req)
 
     if not open_req and not closed:
         lines.append("_No regrade requests found for this submission._")
 
-    # Submission PDF/page link
-    pdf_url = props.get("pdf_url")
-    if pdf_url:
-        lines.append(f"\n**Submission page:** [View]({pdf_url})")
-
-    # Page images for scanned exams
-    files = props.get("files", [])
-    if files:
-        lines.append(f"\n### Submission Pages ({len(files)} files)")
-        for f in files[:5]:
-            if isinstance(f, dict) and f.get("url"):
-                lines.append(f"- [Page]({f['url']})")
-            elif isinstance(f, str):
-                lines.append(f"- [Page]({f})")
+    # Scanned pages: link the pages holding the answer region first.
+    pages = [
+        p for p in (props.get("pages") or [])
+        if isinstance(p, dict) and p.get("url") and not is_placeholder_page(p)
+    ]
+    if pages:
+        crop = (question.get("parameters") or {}).get("crop_rect_list") or []
+        crop_pages = sorted(
+            {str(c.get("page_number")) for c in crop
+             if isinstance(c, dict) and c.get("page_number") is not None},
+            key=lambda n: (len(n), n),
+        )
+        relevant = [p for p in pages if str(p.get("number")) in crop_pages]
+        shown = relevant or pages[:5]
+        lines.append(f"\n### Submission Pages ({len(pages)})")
+        if crop_pages:
+            lines.append(f"**Relevant pages (answer region):** {', '.join(crop_pages)}")
+        for p in shown:
+            lines.append(f"- Page {p.get('number') or '?'}: [View]({normalize_url(p['url'])})")
+        if len(pages) > len(shown):
+            lines.append(f"- _...and {len(pages) - len(shown)} more pages_")
 
     return "\n".join(lines)

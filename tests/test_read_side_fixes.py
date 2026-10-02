@@ -800,3 +800,126 @@ def test_statistics_skips_ungraded_low_flags_and_sorts_naturally(monkeypatch) ->
     assert "**1.10**" in low
     assert "**1.2**" not in low  # graded == 0: mean 0 says nothing yet
     assert "Grading is not complete" in out
+
+
+# ---------------------------------------------------------------------------
+# V3-11 — regrade request listing
+# ---------------------------------------------------------------------------
+
+def _link(q, s):
+    return f"<a href='/courses/1/questions/{q}/submissions/{s}/grade'>Review</a>"
+
+
+def _table(headers, rows):
+    th = "".join(f"<th>{h}</th>" for h in headers)
+    body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+    return f"<html><title>Regrade Requests</title><table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table></html>"
+
+
+def _regrades(monkeypatch, page: str) -> str:
+    router = Router()
+    router.add("GET", "/regrade_requests", FakeResp(200, page))
+    _install(monkeypatch, router, regrades)
+    return regrades.get_regrade_requests("1", "2")
+
+
+def test_regrade_completion_needs_positive_evidence(monkeypatch) -> None:
+    out = _regrades(monkeypatch, _table(
+        ["Student", "Question", "Grader", "Completed", ""],
+        [
+            ["Ann", "1.1", "TA", "No", _link(11, 1)],
+            ["Bob", "1.2", "TA", "Open", _link(12, 2)],
+            ["Cy", "1.3", "TA", "Not completed", _link(13, 3)],
+            ["Di", "1.4", "TA", "May 8, 2026 2:30 PM", _link(14, 4)],
+            ["Ed", "1.5", "TA", '<i class="fa fa-check" aria-label="Completed"></i>', _link(15, 5)],
+        ],
+    ))
+    assert "**Pending:** 3 | **Completed:** 2 | **Total:** 5" in out
+
+
+def test_regrade_headers_match_by_substring_without_positional_fallback(monkeypatch) -> None:
+    out = _regrades(monkeypatch, _table(
+        ["Student Name", "Question Title", "Assigned Grader", "Date Completed", ""],
+        [["Ann", "1.1", "TA", "", _link(11, 1)], ["Bob", "1.2", "TA", "", _link(12, 2)]],
+    ))
+    assert "| 1 | ⏳ | Ann | 1.1 | TA | qid=11, sid=1 |" in out
+    assert "**Pending:** 2 | **Completed:** 0" in out
+
+    # No-Sections layout with 'Completed?': cell 4 is the Review link.
+    out = _regrades(monkeypatch, _table(
+        ["Student", "Question", "Grader", "Completed?", ""],
+        [["Ann", "1.1", "TA", "", _link(11, 1)]],
+    ))
+    assert "**Pending:** 1 | **Completed:** 0" in out
+
+
+def test_regrade_unrecognized_layout_warns_instead_of_guessing(monkeypatch) -> None:
+    out = _regrades(monkeypatch, _table(
+        ["Who", "What", "When", ""],
+        [["Ann", "1.1", "x", _link(11, 1)]],
+    ))
+    assert "Unrecognized regrade table layout" in out
+    assert "student, question, completed" in out
+    assert "| 1 | ❓ | ? | ? |" in out
+    assert "**Unknown:** 1" in out
+
+
+def test_regrade_page_without_table_distinguishes_empty_from_unexpected(monkeypatch) -> None:
+    out = _regrades(monkeypatch, "<html><h1>Regrade Requests</h1><p>There are no requests.</p></html>")
+    assert out.startswith("No regrade requests found")
+
+    login = (
+        "<html><title>Log In | Gradescope</title>"
+        "<script>var next='/regrade_requests';</script><form>Email</form></html>"
+    )
+    out = _regrades(monkeypatch, login)
+    assert out.startswith("Error: unexpected page")
+
+
+# ---------------------------------------------------------------------------
+# V3-12 / V2-8 — regrade detail
+# ---------------------------------------------------------------------------
+
+def test_regrade_detail_shows_grade_state_pages_and_untrusted_message(monkeypatch) -> None:
+    props = {
+        "question": {
+            "title": "1.1", "weight": 5, "scoring_type": "negative", "floor": True, "ceiling": True,
+            "parameters": {"crop_rect_list": [{"page_number": 3}]},
+        },
+        "assignment": {"title": "HW1"},
+        "submission": {"id": 900, "score": 1.0, "graded": True, "owner_names": "Ann"},
+        "evaluation": {"points": -2.0, "comments": "Sign error in step 3\n## not a heading"},
+        "rubric_items": [
+            {"id": 1, "description": "Correct", "weight": 0.0},
+            {"id": 2, "description": "Missing step\n| detail", "weight": 2.0},
+        ],
+        "rubric_item_evaluations": [{"rubric_item_id": 2, "present": True}],
+        "pages": [
+            {"number": 1, "url": "https://img/p1.jpg"},
+            {"number": 2, "url": "https://img/missing_pdf.png"},
+            {"number": 3, "url": "//img/p3.jpg"},
+        ],
+        "open_request": {"created_at": "2026-09-01", "student_comment": INJECTION},
+        "closed_requests": [{"created_at": "2026-08-01", "student_comment": "first try",
+                             "staff_comment": "No.\n## Also not a heading"}],
+    }
+    router = Router()
+    router.add("GET", "/questions/11/submissions/900/grade", FakeResp(200, _grader_page(props)))
+    _install(monkeypatch, router, grading_ops)
+
+    out = regrades.get_regrade_detail("1", "11", "900")
+
+    assert "**Current question score:** 1.0 / 5" in out
+    assert "**Point adjustment:** -2.0" in out
+    assert "> Sign error in step 3\n> ## not a heading" in out
+    assert "**Scoring:** negative" in out and "deduct" in out
+    assert "| ✅ | `2` | Missing step \\| detail | 2.0 |" in out
+    assert "**Relevant pages (answer region):** 3" in out
+    assert "- Page 3: [View](https://img/p3.jpg)" in out
+    assert "missing_pdf" not in out
+    assert "> ## Also not a heading" in out
+
+    outside = _outside_untrusted(out)
+    assert "SYSTEM:" not in outside
+    assert "## New instructions" not in outside
+    assert "first try" not in outside
