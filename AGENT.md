@@ -26,8 +26,15 @@ simple CRUD wrappers.
 
 ### Runtime entry
 - `src/gradescope_mcp/__main__.py`
-  Loads `.env`, calls `cache.configure_process_cache_env()` (an unsafe cache
-  root is logged, not fatal), configures logging, and starts the server.
+  `main()` loads the `.env` files (`load_env_files`), calls
+  `cache.configure_process_cache_env()` (an unsafe cache root is logged, not
+  fatal), configures logging, logs the `.env` files loaded or skipped, and
+  starts the server. Nothing runs at import time. `dotenv_candidates` and
+  `source_checkout` define the search: `.env` in the working directory,
+  then in the gradescope-mcp source checkout (`<checkout>/src/gradescope_mcp`
+  with a `pyproject.toml` naming the project); parents are never searched,
+  values already in the environment win (`override=False`), and on POSIX a
+  file owned by another non-root user or writable by everyone is skipped.
 
 ### Server registration
 - `src/gradescope_mcp/server.py`
@@ -43,10 +50,15 @@ simple CRUD wrappers.
   - `gs_resource(uri)` registers a resource with session recovery; failure
     text is raised as `ResourceError`. Template IDs are validated with
     `_resource_id` (`ResourceNotFoundError` otherwise).
-  - Argument types: `GradescopeID` (digits only; JSON numbers accepted,
-    whitespace and backticks stripped), `OptionalGradescopeID` (blank or
-    null means not given), `OutputFormat`, and the strict `GradeRow`
-    TypedDict for `tool_apply_grade_batch`.
+  - Argument types: `GradescopeID` (ASCII digits only, schema pattern
+    `^[0-9]+$`; JSON numbers accepted, whitespace and backticks stripped,
+    leading zeros dropped so `"031"` becomes `"31"`), `OptionalGradescopeID`
+    (blank or null means not given), `Number` (a float that rejects JSON
+    booleans), `Count` (an int >= 0 that rejects booleans), `OutputFormat`,
+    the strict `GradeRow` TypedDict for `tool_apply_grade_batch`, and
+    `GradeRows` (a list of `GradeRow` advertising `maxItems` =
+    `grading_ops.MAX_BATCH_ROWS`; `apply_grade_batch` itself refuses longer
+    batches with its own Error, so the schema does not enforce it).
   - The prompts. They make no Gradescope requests and are registered with a
     plain `@mcp.prompt()`.
 
@@ -55,9 +67,18 @@ simple CRUD wrappers.
   - `get_connection()` returns one process-wide `GSConnection`, created and
     dropped under a lock. The module logs in itself: credentials are POSTed
     as a form body, never put in a URL, and scrubbed from every error and
-    log line. A rejected login is cached by credential fingerprint, so
-    later calls fail fast with `INVALID_CREDENTIALS_MESSAGE` until the env
-    credentials change.
+    log line.
+  - A login Gradescope answers without logging in raises `_LoginRejected`
+    (`_InvalidCredentials` for a re-rendered login form or an "invalid
+    email/password" text) and is stored as a `_LoginFailure` (credential
+    fingerprint, scrubbed reason, retry time on the `_clock` seam). Until
+    the cooldown ends, calls with the same credentials get the same
+    `AuthError`, ending in "Not trying to log in again for <wait>.":
+    `INVALID_CREDENTIALS_COOLDOWN` (10 min), `THROTTLED_LOGIN_COOLDOWN`
+    (429/5xx without `Retry-After`, 1 min), `TOO_MANY_ATTEMPTS_COOLDOWN`
+    (5 min), `REJECTED_LOGIN_COOLDOWN` (any other rejection, 1 min);
+    `Retry-After` is honoured up to `MAX_LOGIN_COOLDOWN` (15 min). Network
+    errors are not cached.
   - `TimeoutHTTPAdapter` is mounted on the session for http and https and
     applies `DEFAULT_TIMEOUT` (10 s connect, 60 s read) to every request
     without its own timeout, including gradescopeapi's requests.
@@ -65,13 +86,25 @@ simple CRUD wrappers.
     timeout.
   - After login, a response hook raises `SessionExpiredError` (an
     `AuthError`) on a redirect to `/login` or `/account/auth` (before the
-    redirect is followed), on the login page itself, or on a 401 "must be
-    logged in", and flags the current thread.
+    redirect is followed), on the login page itself, on a 401 "must be
+    logged in", or on the logged-out home page (a same-site HTML page with
+    a form posting to `/login` and no `/logout` link), and flags the
+    current thread (`_local.expired`). Responses that are not expiry
+    signals go through `_note_write`, which counts the same-site write
+    requests (not GET/HEAD/OPTIONS/TRACE) Gradescope answered with a 2xx in
+    `_local.writes`; a write answered with a redirect stays
+    `_local.pending_write` until the next response shows whether it hit an
+    expiry.
   - `with_session_recovery(fn)` (applied by `gs_tool` / `gs_resource`) sees
-    the flag, calls `reset_connection(expired=<that connection>)` and re-runs
-    the call once on a fresh login. A second expiry returns
-    `SESSION_RECOVERY_FAILED_MESSAGE`. `reset_connection()` without
-    `expired` also does a best-effort logout.
+    the flag and calls `reset_connection(expired=<that connection>)`. If no
+    write was accepted during the call it re-runs the call once on a fresh
+    login. If one was, it does not re-run it (that could repeat the write,
+    or find it done and report "nothing changed"): the first result is
+    returned with a "session expired ... after Gradescope had accepted N
+    write request(s)" notice. A second expiry returns
+    `SESSION_RECOVERY_FAILED_MESSAGE` followed by the first attempt's
+    output (labelled as possibly incomplete) instead of replacing it.
+    `reset_connection()` without `expired` also does a best-effort logout.
   - The module-level `tool_*` / `resource_*` names in `server.py` are the
     wrapped functions (the original is at `__wrapped__`).
 
@@ -89,35 +122,52 @@ simple CRUD wrappers.
   Course listing and custom roster parsing.
 - `src/gradescope_mcp/tools/assignments.py`
   Assignment listing, detail reads, date edits (merged and verified), rename,
-  autograder image. Also `parse_date_input` / `check_date_order`, which
-  `extensions.py` reuses.
+  autograder image. Also `parse_date_input` / `check_date_order` and
+  `serialized_write` (a process-wide lock per Gradescope object, held across
+  read, write and read-back of a confirmed write; waits up to 300 s, then
+  `WriteInProgressError`), which `extensions.py` reuses.
 - `src/gradescope_mcp/tools/submissions.py`
   Uploads (path vetting, `GRADESCOPE_MCP_UPLOAD_ROOT`), submission listing,
   per-student submission reads, grader discovery.
 - `src/gradescope_mcp/tools/extensions.py`
-  Extension reads and writes (course timezone resolution).
+  Extension reads (course-local time = UTC instant, other settings) and
+  writes (course timezone resolution). `set_extension` re-sends the
+  student's whole current override with the requested dates replaced plus
+  `visible=true`, so callers need not re-pass existing dates; it refuses
+  when the extensions page can't be read and reports settings the
+  read-back shows dropped or changed.
 - `src/gradescope_mcp/tools/grading.py`
   Outline parsing, score export, grading progress, student submission links.
 - `src/gradescope_mcp/tools/grading_ops.py`
   Submission grading context, grade writes (single and batch), confidence
-  thresholds (`CONFIDENCE_REJECT_BELOW`, `CONFIDENCE_REVIEW_UP_TO`), rubric
-  CRUD, question-submission discovery, navigation.
+  thresholds (`CONFIDENCE_REJECT_BELOW`, `CONFIDENCE_REVIEW_UP_TO`), the
+  batch cap `MAX_BATCH_ROWS` (50), rubric CRUD, question-submission
+  discovery, navigation. Grade writes re-read each submission at write time
+  and refuse graded ones unless `overwrite_graded=True`, don't re-send a
+  grade the submission already holds, and refuse a grading page whose save
+  URL targets another submission (`_write_target_problem`).
 - `src/gradescope_mcp/tools/grading_workflow.py`
   Workflow helpers that write artifacts to the private cache, compute
   readiness (pre-read context, not grading confidence), cache pages, and
   build crop-first read plans.
 - `src/gradescope_mcp/tools/answer_groups.py`
-  AI-assisted answer-group inspection and batch grading.
+  AI-assisted answer-group inspection and batch grading. The grade page must
+  belong to the requested group (`_group_page_problem`).
 - `src/gradescope_mcp/tools/regrades.py`
   Regrade list/detail scraping.
 - `src/gradescope_mcp/tools/statistics.py`
   Assignment statistics.
 - `src/gradescope_mcp/tools/common.py`
   Shared helpers: `normalize_rubric_ids`, `split_known_rubric_ids`,
-  `format_untrusted`, `escape_md_cell`, `normalize_url`,
-  `is_placeholder_page`, `select_crop_pages`, `page_number`.
+  `format_untrusted` (fenced block whose BEGIN and END lines carry a random
+  per-call block id; marker and backtick runs in the text are broken with
+  zero-width spaces), `escape_md_cell`, `sanitize_inline` (one-line
+  student names), `normalize_url`, `is_placeholder_page`,
+  `select_crop_pages`, `page_number`.
 - `src/gradescope_mcp/tools/safety.py`
-  Shared confirmation-preview helper for mutations.
+  Shared confirmation-preview helper for mutations; its last line tells the
+  agent to show the preview and re-run with `confirm_write=True` only after
+  the user explicitly approves.
 
 ## Tool Inventory
 
@@ -154,6 +204,10 @@ Grouped by annotation class. `tests/test_server_mcp.py` pins these sets.
 ### Gradescope writes
 `destructiveHint=true`, exactly the tools with `confirm_write`.
 `idempotentHint=false` for upload and rubric-item creation, true otherwise.
+Idempotent follows the MCP definition (a repeat with the same arguments has
+no additional effect), not "returns the same result": a repeated delete
+reports the item missing, and a repeated group grade without
+`overwrite_graded` is refused because the members are now graded.
 
 25. `tool_upload_submission`
 26. `tool_set_extension`
@@ -184,7 +238,9 @@ All tools are `openWorldHint=true`.
   `@mcp.resource()`: those would skip session recovery, `isError` mapping
   and annotations.
 - Type every Gradescope ID parameter as `GradescopeID` (or
-  `OptionalGradescopeID`), and use `Literal` enums for fixed choices.
+  `OptionalGradescopeID`), number parameters as `Number` / `Count` (plain
+  `float` / `int` would accept `true` as 1), and use `Literal` enums for
+  fixed choices.
 - A tool that changes Gradescope data takes `confirm_write: bool = False`,
   uses `gradescope_write(...)`, validates everything before the confirm
   gate, previews exactly what it will send (`tools/safety.py`), and reads
@@ -194,8 +250,9 @@ All tools are `openWorldHint=true`.
   error:` for `AuthError`, `❌` for a write Gradescope rejected). Previews,
   confidence rejections, `⚠️` warnings and "No ... found" messages must not
   use those prefixes.
-- Wrap student-authored text with `format_untrusted`, and escape user or
-  student data in markdown table cells with `escape_md_cell`.
+- Wrap student-authored text with `format_untrusted`, escape user or
+  student data in markdown table cells with `escape_md_cell`, and put
+  student names on other markdown lines through `sanitize_inline`.
 - Tool modules must not add their own session-expiry handling or
   `timeout=` arguments; `auth.py` handles both. Keep catching `AuthError`
   (`SessionExpiredError` is a subclass) and returning
@@ -209,10 +266,11 @@ All tools are `openWorldHint=true`.
 ### Authentication
 - Credentials must come from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`
 - Never hardcode credentials
-- `python -m gradescope_mcp` loads `.env` with python-dotenv, searching
-  upward from the package directory (not the working directory); variables
+- `python -m gradescope_mcp` loads `.env` from the working directory, then
+  from the source checkout (never from parent directories); variables
   already in the environment win
-- After a rejected login, fix the credentials and restart the server
+- A rejected login starts a cooldown (at most 15 min) stated in the error;
+  after fixing the credentials, restart the server
 
 ### Write safety
 - Every mutating tool is preview-first
@@ -223,6 +281,12 @@ All tools are `openWorldHint=true`.
 - Rubric updates and deletions are cascading operations
 - Batch answer-group writes can affect many submissions at once, including
   inferred members; already-graded members need `overwrite_graded=True`
+- `tool_apply_grade` and `tool_apply_grade_batch` re-read each submission
+  when writing and never overwrite a graded one (including one graded after
+  the preview) without `overwrite_graded=True`; a batch takes at most 50
+  rows
+- Date and extension writes are serialized per assignment / per student
+  within the process
 
 ### Error signalling
 - `Error...`, `Authentication error...` and `❌...` results are returned with
@@ -232,7 +296,8 @@ All tools are `openWorldHint=true`.
 - Tools publish no `outputSchema` and return text only
 
 ### ID semantics
-- All IDs are digit strings (numbers accepted at the MCP layer)
+- All IDs are ASCII digit strings without leading zeros (numbers accepted
+  and IDs canonicalized at the MCP layer)
 - Assignment-level submission listings return Global Submission IDs
 - Grading operations need Question Submission IDs
 - If a grading call returns 404, suspect the wrong ID type first
@@ -242,6 +307,9 @@ All tools are `openWorldHint=true`.
 - Rubric weights remain positive in both modes; negative weights need
   `allow_negative=True`
 - The scoring mode determines whether checked items add or deduct points
+- A missing `scoring_type` is reported as unknown (JSON `null` plus
+  `scoring_type_note`), never defaulted; projections then assume deduction
+  and previews say so
 - `CONFIDENCE_REJECT_BELOW` (0.6) and `CONFIDENCE_REVIEW_UP_TO` (0.8):
   below 0.6 nothing is written; 0.6 to 0.8 inclusive is written and flagged
   NEEDS HUMAN REVIEW
@@ -252,6 +320,8 @@ All tools are `openWorldHint=true`.
   omitted dates and the late-submission flag are preserved
 - Extension dates without an offset use the course timezone (or the
   `timezone` argument); dates with an offset are absolute
+- `tool_set_extension` keeps the student's other current extension
+  settings (it re-sends them), so existing dates need not be passed again
 
 ### Scanned assignment behavior
 - Missing structured answer keys are common and expected
@@ -311,8 +381,11 @@ npx @modelcontextprotocol/inspector uv run python -m gradescope_mcp
 4. `get_next_ungraded` walks the question's own submissions listing and
    never follows links into another question.
 5. Cache artifacts are ephemeral files, not durable project state.
-6. `tool_get_assignment_details` returns "Assignment ... not found" as an
-   ordinary result, not an error.
+6. mcp does not interrupt a tool call that the client cancels or that times
+   out; the worker thread runs to the end (a batch keeps writing its
+   remaining rows, at most `MAX_BATCH_ROWS`).
+7. The per-object write locks serialize date and extension writes only
+   within one server process.
 
 ## Maintenance Rule
 

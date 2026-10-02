@@ -15,8 +15,14 @@ import re
 import anyio
 import pytest
 
-from gradescope_mcp import server
-from gradescope_mcp.tools.grading_ops import CONFIDENCE_REJECT_BELOW, CONFIDENCE_REVIEW_UP_TO
+from gradescope_mcp import auth, server
+from gradescope_mcp.tools import assignments, grading_workflow
+from gradescope_mcp.tools.common import format_untrusted
+from gradescope_mcp.tools.grading_ops import (
+    CONFIDENCE_REJECT_BELOW,
+    CONFIDENCE_REVIEW_UP_TO,
+    MAX_BATCH_ROWS,
+)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 README = ROOT / "README.md"
@@ -72,6 +78,20 @@ def _section(text: str, heading: str) -> str:
     match = re.search(rf"^## {re.escape(heading)}\s*$(.*?)(?=^## |\Z)", text, re.M | re.S)
     assert match, f"missing section '## {heading}'"
     return match.group(1)
+
+
+def _subsection(text: str, heading: str) -> str:
+    """Return the body of a ``### heading`` subsection (up to the next heading)."""
+    match = re.search(
+        rf"^### {re.escape(heading)}\s*$(.*?)(?=^##+ |\Z)", text, re.M | re.S
+    )
+    assert match, f"missing subsection '### {heading}'"
+    return match.group(1)
+
+
+def _flat(text: str) -> str:
+    """Collapse whitespace so wrapped prose matches a one-line phrase."""
+    return " ".join(text.split())
 
 
 # ------------------------------------------------------------------
@@ -221,3 +241,106 @@ def test_skill_frontmatter_names_the_skill_directory() -> None:
     assert match, "SKILL.md has no YAML frontmatter"
     assert re.search(r"^name:\s*gradescope-assisted-grading\s*$", match.group(1), re.M)
     assert re.search(r"^description:\s*\S", match.group(1), re.M)
+
+
+# ------------------------------------------------------------------
+# Interface rules and limits stated in the docs
+# ------------------------------------------------------------------
+
+
+def _number_parameters(schema: dict) -> set[str]:
+    """Names of number/integer properties in a tool schema, including batch rows."""
+    names: set[str] = set()
+    tables = [schema.get("properties", {})]
+    tables += [d.get("properties", {}) for d in schema.get("$defs", {}).values()]
+    for properties in tables:
+        for name, prop in properties.items():
+            options = prop.get("anyOf", [prop])
+            if any(option.get("type") in ("number", "integer") for option in options):
+                names.add(name)
+    return names
+
+
+def test_documented_id_pattern_matches_the_schema(registry) -> None:
+    schema = registry["tools"]["tool_get_assignments"].input_schema
+    pattern = schema["properties"]["course_id"]["pattern"]
+    ids = _subsection(_text(README), "IDs")
+    assert f"`{pattern}`" in ids
+    assert "leading zeros" in ids
+
+
+def test_readme_lists_every_number_argument(registry) -> None:
+    # Every number parameter rejects true/false (server.Number / server.Count);
+    # the README section must name each one.
+    names: set[str] = set()
+    for tool in registry["tools"].values():
+        names |= _number_parameters(tool.input_schema)
+    assert names, "no number parameters found in the tool schemas"
+    numbers = _subsection(_text(README), "Numbers")
+    missing = sorted(name for name in names if f"`{name}`" not in numbers)
+    assert not missing, f"README '### Numbers' does not mention {missing}"
+    assert "`true` and `false` are rejected" in _flat(numbers)
+
+
+@pytest.mark.parametrize(
+    "path, phrase",
+    [
+        (README, f"at most {MAX_BATCH_ROWS} rows per call"),
+        (SKILL, f"at most {MAX_BATCH_ROWS} rows per call"),
+        (README, f"more than {assignments._WRITE_LOCK_TIMEOUT:g} s"),
+        (README, f"exceeds {grading_workflow._MAX_PAGE_BYTES // (1024 * 1024)} MB"),
+        (README, f"more than {grading_workflow._PAGE_DEADLINE_SECONDS:g} s"),
+    ],
+    ids=["readme-batch", "skill-batch", "write-lock", "page-bytes", "page-time"],
+)
+def test_documented_limits_match_the_code(path, phrase) -> None:
+    assert phrase in _flat(_text(path)), f"{path.name} does not say '{phrase}'"
+
+
+def _minutes(seconds: float) -> str:
+    minutes = seconds / 60
+    assert minutes == int(minutes), seconds
+    return f"{int(minutes)} minute" + ("" if minutes == 1 else "s")
+
+
+def test_login_cooldowns_in_readme_match_the_code() -> None:
+    text = _flat(_section(_text(README), "Authentication"))
+    for name, seconds, context in [
+        ("invalid credentials", auth.INVALID_CREDENTIALS_COOLDOWN, "is wrong): "),
+        ("throttled", auth.THROTTLED_LOGIN_COOLDOWN, "or "),
+        ("too many attempts", auth.TOO_MANY_ATTEMPTS_COOLDOWN, "page: "),
+        ("other rejection", auth.REJECTED_LOGIN_COOLDOWN, "...): "),
+        ("cap", auth.MAX_LOGIN_COOLDOWN, "capped at "),
+    ]:
+        assert f"{context}{_minutes(seconds)}" in text, (name, _minutes(seconds))
+
+
+def test_untrusted_block_markers_are_documented_as_rendered() -> None:
+    lines = format_untrusted("answer", "LABEL").splitlines()
+    begin, end = lines[0], lines[-1]
+    block_id = re.search(r"block id ([0-9a-f]+)", begin).group(1)
+
+    def template(line: str) -> str:
+        return line.replace("LABEL", "{label}").replace(block_id, "{id}")
+
+    readme = _flat(_text(README))
+    assert template(begin).split(";", 1)[0] in readme  # "<<<BEGIN ... (block id {id}"
+    assert template(end) in readme  # "<<<END UNTRUSTED {label}>>> (block id {id})"
+    assert "block id" in _text(SKILL)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "subagents cannot call",  # a client-harness claim the server can't back
+        "non-zero weight",  # weight-0 leaf questions are kept in the answer key
+        "only the dates passed are sent",  # set_extension re-sends the whole extension
+        "until the server is restarted",  # login failures now have a cooldown
+        "until the credentials change",
+        "walks up",  # .env is no longer searched in parent directories
+        "^\\d+$",  # IDs are ASCII digits, ^[0-9]+$
+    ],
+)
+def test_docs_do_not_repeat_superseded_claims(phrase) -> None:
+    for path in (README, AGENT, SKILL, ENV_EXAMPLE):
+        assert phrase.lower() not in _flat(_text(path)).lower(), (path.name, phrase)

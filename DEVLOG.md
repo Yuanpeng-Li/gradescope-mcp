@@ -6,6 +6,173 @@
 
 ---
 
+## Session 12 — 2026-10-02: Round-2 Review Fixes
+
+### Why
+
+A second adversarial review of the Session 11 state (round-2 findings
+R2-0..R2-34) found incomplete fixes and new problems. Confirmed writes could
+still overwrite a grade entered after the preview, or land on another
+submission's page. Untrusted blocks could be forged. A session-recovery
+re-run could misreport writes that had already been saved. Login failures
+were cached until a restart, or never cached at all. The MCP schema took
+booleans as numbers and non-ASCII digits as IDs. Fixed in `c551665`..`a35f730`
+plus this documentation update. Where correct behavior depends on Gradescope
+behavior that can't be observed offline, the code again takes the
+conservative option.
+
+### Grade writes (`grading_ops.py`, `answer_groups.py`)
+
+- Overwrite protection (R2-0): `tool_apply_grade` and
+  `tool_apply_grade_batch` take `overwrite_graded` (default false). Each
+  submission is re-read right before its write. One that is graded by then,
+  including one graded by another grader after the preview, is refused
+  (`apply_grade`) or listed under "Not written: already graded at write
+  time" (batch). With the opt-in, the result names every grade it overwrote.
+  A graded submission that already holds exactly the requested grade is
+  reported and not re-sent.
+- Write-target checks (R2-7): the grade goes to the save URL of the page
+  Gradescope serves. `apply_grade` and both batch phases refuse a save URL
+  for another course, question or submission. `tool_grade_answer_group`
+  refuses a redirect to another group's page, a page of another
+  `answer_group`, and a save URL outside the question or through another
+  group's confirmed member.
+- Batch cap (R2-12): at most 50 rows (`MAX_BATCH_ROWS`) per call, refused
+  before any request. mcp does not stop a running tool when the client
+  cancels, so the cap also bounds what a timed-out batch can still write.
+- Unknown scoring type (R2-18): a missing `scoring_type` is reported as
+  unknown by the rubric, the grading context (JSON `scoring_type: null` plus
+  `scoring_type_note`) and the regrade detail, instead of defaulting to
+  `negative`. Previews warn that their projection assumes deduction.
+- The preview footer now reads "Show this preview to the user; only after
+  they explicitly approve, re-run with `confirm_write=True` ..." (R2-21).
+
+### Untrusted text (`common.py`)
+
+- Unforgeable blocks (R2-6, R2-17, R2-23): BEGIN and END markers carry a
+  random per-call block id. `<<<` / `>>>` runs and runs of three or more
+  backticks in the text are broken up with zero-width spaces, so a student
+  can neither close the fence nor forge an END line.
+- Student display names and roster emails are kept on one line
+  (`common.sanitize_inline`) in the grading context, the `apply_grade`
+  preview, smart-read and the submission headings (R2-10).
+
+### Sessions and login (`auth.py`, `__main__.py`)
+
+- The logged-out home page (login form, no logout link, e.g. after a
+  redirect to `/`) is an expiry signal (R2-1). Before, writes that landed
+  there reported success and reads returned empty results.
+- Session recovery after committed writes (R2-5): the response hook counts
+  the writes Gradescope accepted during the call. After an accepted write
+  the call is not re-run, since a re-run could repeat it or report a
+  finished delete or group grade as "nothing changed". The result gets a
+  notice to verify with the read tools instead. A second expiry returns the
+  recovery error followed by the first attempt's output, no longer replacing
+  it (R2-9).
+- Login cooldowns (R2-8): invalid credentials wait 10 minutes; HTTP
+  429/5xx honour `Retry-After` (1 minute without one, at most 15); a "too
+  many attempts" page waits 5 minutes; other rejections ("login rejected
+  (HTTP <status>)") wait 1 minute. Before, any rejection was cached as
+  invalid credentials until a restart, and 429/5xx were retried on every
+  call. Every message states the remaining wait.
+- `.env` loading (R2-24): from the working directory, then from the source
+  checkout, never from parent directories. A file owned by another user or
+  writable by everyone is skipped, and the files loaded or skipped are
+  logged. Start-up side effects moved from import time into `main()`.
+
+### Dates, extensions, uploads (`assignments.py`, `extensions.py`, `submissions.py`)
+
+- Extension settings preservation (R2-3): `tool_set_extension` sends the
+  student's whole current extension with the requested dates replaced, so
+  other dates and time limits survive. The read-back reports any setting
+  Gradescope dropped or changed. Preview and write refuse when the
+  extensions page can't be read.
+- Timezones (R2-2, R2-29): `tool_get_extensions` showed UTC-stored values
+  labelled as course-local time, and an agent re-sending them moved the
+  deadline. It now shows `local time = UTC instant` plus other settings.
+  Assignment listings keep the UTC offset of aware dates.
+- Per-assignment write locks (R2-4): confirmed date writes per assignment
+  and extension writes per student run one at a time in the process (a
+  300 s wait, then an Error), so two approved calls can no longer revert
+  each other.
+- Both date previews return the authentication error instead of a
+  misleading preview when the login fails (R2-13). Requested values that
+  were already set are labelled as such, not "(unchanged)" (R2-26).
+- `tool_get_assignment_details` reports an unknown assignment as an Error
+  (R2-28).
+- Upload confirmation (R2-11): success only when Gradescope opens the new
+  submission's page; anything else is "❌ Upload not confirmed" with the
+  final page.
+- `tool_get_assignment_submissions` no longer reads scores from a guessed
+  column; graded status it can't read is shown as unknown (R2-15).
+
+### Read side and workflow (`regrades.py`, `grading_workflow.py`)
+
+- A regrade completion cell with an unlabelled icon is ❓ unknown, and a
+  check-mark icon is ✅ (R2-14). Regrade detail uses the shared crop-page
+  and rubric rules (R2-27).
+- Assignment auto-resolution skips unreadable (401, non-JSON) assignments
+  and stops after 3 non-JSON pages in a row or an auth error (R2-16).
+- Crop page numbers are normalized (`"5"`, `5.0` and `5` are one page;
+  R2-30). Page downloads are streamed with a hard 25 MB cap and a 120 s
+  budget per page (R2-31). The artifact's and smart-read's confidence bands
+  come from the `grading_ops` constants (R2-22).
+
+### Interface (`server.py`)
+
+- Stricter ID and number validation (R2-19, R2-20, R2-25, R2-33). IDs are
+  ASCII digits only (`^[0-9]+$`) and lose leading zeros, so `"031"` and
+  `"31"` are one batch row. Number arguments reject `true` / `false`;
+  before, `point_adjustment: true` wrote +1 and `confidence: true` skipped
+  the review flag.
+- `grades` advertises `maxItems: 50`. Tool descriptions and prompts follow
+  the fixes above: `overwrite_graded` only after explicit approval, block
+  ids, unknown scoring, the extension merge, unknown graded status. The
+  claim that subagents cannot call write tools in the Claude Code harness
+  was removed (R2-34); the server only says subagents should propose rows.
+- Annotations are unchanged: `idempotentHint` follows MCP's "no additional
+  effect" definition, so repeated deletes and group grades stay idempotent
+  although the repeat reports differently.
+
+### Documentation (this commit)
+
+- README, AGENT, the skill and `.env.example` describe all of the above.
+  The skill no longer tells the agent to drop weight-0 leaf questions
+  (R2-32), sends it to the user when the scoring type is unknown, and adds
+  the `overwrite_graded` approval step to single, batch and regrade writes.
+- `tests/test_docs_consistency.py` now also checks the documented ID
+  pattern, number arguments, batch cap, write-lock wait, page-download
+  limits, login cooldowns and untrusted-block markers against the code, and
+  that superseded claims do not return.
+
+### Corrections to earlier entries
+
+- Session 11 says a rejected login is cached until the credentials change,
+  that IDs are digit strings, and that the batch preview flags graded rows
+  that would be OVERWRITTEN. These are superseded by the cooldowns, the
+  ASCII-only IDs and the `overwrite_graded` opt-in above.
+
+### Behavior changes for MCP clients
+
+- Writing over a graded submission with `tool_apply_grade` or
+  `tool_apply_grade_batch` needs `overwrite_graded=True`.
+- Schema errors for `true` / `false` in number arguments and non-ASCII
+  digits in IDs; leading zeros are dropped; batches over 50 rows return an
+  Error.
+- New `isError` results: an unknown assignment in
+  `tool_get_assignment_details`, and `❌ Upload not confirmed`.
+- Untrusted blocks differ between calls (random block id).
+- Login errors end with "Not trying to log in again for <wait>."; a write
+  result may end with a notice that the session expired after accepted
+  writes.
+
+### Current state
+
+- **38 tools** + **3 resources** + **7 prompts**
+- **717 automated tests** (`uv run pytest -q`), all passing
+
+---
+
 ## Session 11 — 2026-10-02: Hardening Pass (Write Safety, Sessions, Interface, Docs)
 
 ### Why
