@@ -1,10 +1,13 @@
 """Assignment-related MCP tools."""
 
 import datetime
+import re
 
 import requests
+from bs4 import BeautifulSoup
 from gradescopeapi.classes.assignments import (
-    update_assignment_date,
+    AssignmentUpdateError,
+    InvalidTitleName,
     update_assignment_title,
     update_autograder_image_name,
 )
@@ -18,6 +21,114 @@ def _format_datetime(dt: datetime.datetime | None) -> str:
     if dt is None:
         return "N/A"
     return dt.strftime("%Y-%m-%d %H:%M")
+
+
+# ---------------------------------------------------------------------------
+# Date arguments (shared with extensions.py)
+# ---------------------------------------------------------------------------
+
+# A time of day is mandatory: Python would read a bare "2026-10-02" as 00:00,
+# the very start of that day, which is almost never what "due Oct 2" means.
+_DATE_INPUT_RE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[T ](?P<hour>\d{2}):(?P<minute>\d{2})"
+    r"(?::(?P<second>\d{2})(?:\.(?P<frac>\d+))?)?"
+    r"(?P<offset>Z|[+-]\d{2}(?::?\d{2})?)?$"
+)
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Format Gradescope's assignment form uses for its date fields.
+_FORM_DATE_FORMAT = "%Y-%m-%dT%H:%M"
+
+
+def _parse_utc_offset(text: str) -> datetime.timezone:
+    if text == "Z":
+        return datetime.timezone.utc
+    sign = -1 if text[0] == "-" else 1
+    digits = text[1:].replace(":", "")
+    hours = int(digits[:2])
+    minutes = int(digits[2:4] or 0)
+    if hours > 23 or minutes > 59:
+        raise ValueError(text)
+    return datetime.timezone(sign * datetime.timedelta(hours=hours, minutes=minutes))
+
+
+def parse_date_input(
+    value: str | None, field: str, *, allow_offset: bool
+) -> datetime.datetime | None:
+    """Parse an optional date argument supplied by an MCP client.
+
+    ``None`` and blank strings mean "not provided". Otherwise the value must
+    be ``YYYY-MM-DDTHH:MM`` (``:00`` seconds allowed); a UTC offset (``Z``,
+    ``+02:00``) is accepted only when ``allow_offset`` is true and yields an
+    aware datetime. Date-only values are rejected rather than read as 00:00.
+
+    Raises:
+        ValueError: with a message starting "Invalid date".
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    hint = "Use ISO format: YYYY-MM-DDTHH:MM"
+    if _DATE_ONLY_RE.match(text):
+        raise ValueError(
+            f"Invalid date format for {field}: '{value}' has no time of day. "
+            f"{hint}, e.g. '{text}T23:59' for the end of that day (a bare "
+            "date would mean 00:00, the very start of it)."
+        )
+    match = _DATE_INPUT_RE.match(text)
+    if not match:
+        raise ValueError(f"Invalid date format for {field}: '{value}'. {hint}")
+    if int(match["second"] or 0) or int(match["frac"] or 0):
+        raise ValueError(
+            f"Invalid date for {field}: '{value}'. Gradescope stores whole "
+            "minutes; drop the seconds."
+        )
+    try:
+        parsed = datetime.datetime.strptime(
+            f"{match['date']}T{match['hour']}:{match['minute']}", _FORM_DATE_FORMAT
+        )
+    except ValueError:
+        raise ValueError(
+            f"Invalid date for {field}: '{value}' is not a real calendar date and time."
+        ) from None
+
+    offset = match["offset"]
+    if offset:
+        if not allow_offset:
+            raise ValueError(
+                f"Invalid date for {field}: '{value}' includes a UTC offset. "
+                "Assignment dates are wall-clock times in the course's "
+                "timezone; give YYYY-MM-DDTHH:MM without an offset (convert "
+                "to the course's local time first)."
+            )
+        try:
+            parsed = parsed.replace(tzinfo=_parse_utc_offset(offset))
+        except ValueError:
+            raise ValueError(
+                f"Invalid date for {field}: '{value}' has an invalid UTC offset."
+            ) from None
+    return parsed
+
+
+def check_date_order(
+    dates: list[tuple[str, datetime.datetime | None]],
+) -> str | None:
+    """Return an error message unless the provided dates are in order.
+
+    ``dates`` lists (name, value) pairs in their required order; ``None``
+    values are skipped. All values must be either naive or aware.
+    """
+    present = [(name, value) for name, value in dates if value is not None]
+    for (first, a), (second, b) in zip(present, present[1:]):
+        if a > b:
+            return (
+                f"{first} ({a.isoformat(timespec='minutes')}) is after "
+                f"{second} ({b.isoformat(timespec='minutes')}). Dates must be "
+                "in order: release_date <= due_date <= late_due_date."
+            )
+    return None
 
 
 def get_assignments(course_id: str) -> str:
@@ -106,6 +217,234 @@ def get_assignment_details(course_id: str, assignment_id: str) -> str:
     return "\n".join(lines)
 
 
+# (key, tool argument, form field) for the dates on the assignment settings
+# form at /courses/{cid}/assignments/{aid}/edit.
+_DATE_FORM_FIELDS = (
+    ("release", "release_date", "assignment[release_date_string]"),
+    ("due", "due_date", "assignment[due_date_string]"),
+    ("late", "late_due_date", "assignment[hard_due_date_string]"),
+)
+_ALLOW_LATE_FIELD = "assignment[allow_late_submissions]"
+# Markup Gradescope (Rails) uses when it re-renders a form with errors.
+_FORM_ERROR_SELECTORS = (
+    ".form--requiredFieldStar.error",
+    ".field_with_errors",
+    "#error_explanation",
+)
+_COURSE_LOCAL_NOTE = (
+    "Times are course-local wall-clock times: Gradescope interprets them in "
+    "the course's timezone."
+)
+
+
+class _DateFormError(Exception):
+    """The assignment's current date settings could not be read safely."""
+
+
+def _assignment_urls(conn, course_id: str, assignment_id: str) -> tuple[str, str]:
+    """Return (settings form URL, form POST URL) for an assignment."""
+    base = f"{conn.gradescope_base_url}/courses/{course_id}/assignments/{assignment_id}"
+    return f"{base}/edit", base
+
+
+def _read_date_form(conn, course_id: str, assignment_id: str) -> dict:
+    """Read the current dates and late-submission flag from the settings form.
+
+    Returns ``token`` (the form's authenticity token); ``release``, ``due``
+    and ``late`` as ``YYYY-MM-DDTHH:MM`` strings (``""`` when blank, ``None``
+    when unreadable); ``allow_late`` (``None`` when the checkbox is missing);
+    and ``problems``, which says why a field is ``None``.
+    """
+    edit_url, _ = _assignment_urls(conn, course_id, assignment_id)
+    resp = conn.session.get(edit_url)
+    if resp.status_code != 200:
+        raise _DateFormError(
+            f"the assignment settings page returned HTTP {resp.status_code}"
+        )
+    soup = BeautifulSoup(resp.text, "html.parser")
+    token = soup.select_one('input[name="authenticity_token"]')
+    if token is None or not token.get("value"):
+        raise _DateFormError(
+            "the assignment settings page has no edit form (unexpected page; "
+            "check the IDs and that you have instructor access)"
+        )
+
+    state: dict = {"token": token["value"], "problems": {}}
+    for key, label, name in _DATE_FORM_FIELDS:
+        field = soup.find("input", attrs={"name": name})
+        if field is None:
+            state[key] = None
+            state["problems"][key] = f"the settings page has no {label} field"
+            continue
+        raw = (field.get("value") or "").strip()
+        if not raw:
+            state[key] = ""
+            continue
+        try:
+            parsed = parse_date_input(raw, label, allow_offset=False)
+        except ValueError:
+            state[key] = None
+            state["problems"][key] = (
+                f"the current {label} on the settings page has an "
+                f"unrecognized format ({raw!r})"
+            )
+            continue
+        state[key] = parsed.strftime(_FORM_DATE_FORMAT)
+
+    state["allow_late"] = None
+    for box in soup.find_all("input", attrs={"name": _ALLOW_LATE_FIELD}):
+        if (box.get("type") or "").lower() == "checkbox":
+            state["allow_late"] = box.has_attr("checked")
+            break
+    return state
+
+
+def _plan_date_update(current: dict, requested: dict) -> dict:
+    """Merge the requested dates into the current settings.
+
+    Gradescope's form update sets all date fields and the late-submission
+    flag together, so every omitted value is carried over from ``current``.
+    Late submissions are switched on only when a late due date is requested.
+    """
+
+    def keep(key: str, label: str) -> str:
+        if current[key] is None:
+            reason = current["problems"].get(key, f"the current {label} is unreadable")
+            raise _DateFormError(
+                f"{reason}, so it can't be kept unchanged; pass {label} explicitly"
+            )
+        return current[key]
+
+    plan: dict = {}
+    for key, label, _ in _DATE_FORM_FIELDS[:2]:
+        value = requested[key]
+        plan[key] = value.strftime(_FORM_DATE_FORMAT) if value is not None else keep(key, label)
+
+    if requested["late"] is not None:
+        plan["allow_late"] = True
+        plan["late"] = requested["late"].strftime(_FORM_DATE_FORMAT)
+    elif current["allow_late"] is None:
+        raise _DateFormError(
+            "the settings page has no allow_late_submissions checkbox, so it "
+            "is unknown whether late submissions are on; pass late_due_date "
+            "explicitly"
+        )
+    else:
+        plan["allow_late"] = current["allow_late"]
+        if plan["allow_late"]:
+            plan["late"] = keep("late", "late_due_date")
+        else:
+            # Ignored by Gradescope while late submissions are off; sent back
+            # as-is so the hidden value isn't changed either.
+            plan["late"] = current["late"] or ""
+    return plan
+
+
+def _plan_order_error(plan: dict) -> str | None:
+    def parsed(key: str) -> datetime.datetime | None:
+        return datetime.datetime.strptime(plan[key], _FORM_DATE_FORMAT) if plan[key] else None
+
+    dates = [("release_date", parsed("release")), ("due_date", parsed("due"))]
+    if plan["allow_late"]:
+        dates.append(("late_due_date", parsed("late")))
+    return check_date_order(dates)
+
+
+def _show_setting(value) -> str:
+    if value is None:
+        return "(unreadable)"
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    return value or "(none)"
+
+
+def _describe_plan(plan: dict, before: dict | None, verb: str) -> list[str]:
+    """One line per form setting: the value sent and how it compares to ``before``."""
+
+    def line(name: str, key: str) -> str:
+        text = f"{name}={_show_setting(plan[key])}"
+        if before is None:
+            return text
+        if before[key] is None:
+            return f"{text} (current value unreadable)"
+        if before[key] == plan[key]:
+            return f"{text} (unchanged)"
+        return f"{text} ({verb} {_show_setting(before[key])})"
+
+    late = line("late_due_date", "late")
+    if not plan["allow_late"]:
+        late += "; no effect while late submissions are off"
+    return [
+        line("release_date", "release"),
+        line("due_date", "due"),
+        line("allow_late_submissions", "allow_late"),
+        late,
+    ]
+
+
+def _submit_date_form(
+    conn, course_id: str, assignment_id: str, token: str, plan: dict
+) -> requests.Response:
+    """PATCH the settings form with every date field set explicitly.
+
+    Same multipart request as gradescopeapi's ``update_assignment_date``,
+    except that omitted dates are not blanked and the late-submission flag
+    comes from the plan instead of "was a late due date given".
+    """
+    edit_url, post_url = _assignment_urls(conn, course_id, assignment_id)
+    fields = [
+        ("utf8", "✓"),
+        ("_method", "patch"),
+        ("authenticity_token", token),
+        ("assignment[release_date_string]", plan["release"]),
+        ("assignment[due_date_string]", plan["due"]),
+        (_ALLOW_LATE_FIELD, "1" if plan["allow_late"] else "0"),
+        ("assignment[hard_due_date_string]", plan["late"]),
+        ("commit", "Save"),
+    ]
+    return conn.session.post(
+        post_url,
+        files=[(name, (None, value)) for name, value in fields],
+        headers={"Referer": edit_url},
+    )
+
+
+def _form_error_text(html: str | None) -> str | None:
+    """Return validation messages from a re-rendered form, if any."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    messages: list[str] = []
+    for selector in _FORM_ERROR_SELECTORS:
+        for element in soup.select(selector):
+            # The required-field star sits inside the field's label.
+            holder = element.parent if "requiredFieldStar" in selector and element.parent else element
+            text = " ".join(holder.get_text(" ", strip=True).split())[:200]
+            if text and text not in messages:
+                messages.append(text)
+    return "; ".join(messages) or None
+
+
+def _verify_dates(plan: dict, after: dict) -> tuple[list[str], list[str]]:
+    """Compare the plan with re-read settings: (mismatches, unverifiable names)."""
+    checks = [
+        ("release_date", "release"),
+        ("due_date", "due"),
+        ("allow_late_submissions", "allow_late"),
+    ]
+    if plan["allow_late"]:
+        checks.append(("late_due_date", "late"))
+    mismatches: list[str] = []
+    unknown: list[str] = []
+    for name, key in checks:
+        if after[key] is None:
+            unknown.append(name)
+        elif after[key] != plan[key]:
+            mismatches.append(
+                f"{name}: sent {_show_setting(plan[key])}, Gradescope shows "
+                f"{_show_setting(after[key])}"
+            )
+    return mismatches, unknown
+
+
 def modify_assignment_dates(
     course_id: str,
     assignment_id: str,
@@ -116,74 +455,150 @@ def modify_assignment_dates(
 ) -> str:
     """Modify the dates of an assignment.
 
+    Dates are course-local wall-clock times (``YYYY-MM-DDTHH:MM``, no UTC
+    offset): Gradescope interprets them in the course's timezone. Its form
+    update replaces all dates and the allow-late-submissions flag at once,
+    so the current settings are read first and every omitted value is sent
+    back unchanged. Supplying ``late_due_date`` turns late submissions on.
+    The preview lists every value that will be sent next to the current one;
+    after writing, the settings are read back and compared.
+
     Args:
         course_id: The Gradescope course ID.
         assignment_id: The assignment ID.
-        release_date: New release date in ISO format (YYYY-MM-DDTHH:MM), or None to keep unchanged.
-        due_date: New due date in ISO format (YYYY-MM-DDTHH:MM), or None to keep unchanged.
-        late_due_date: New late due date in ISO format (YYYY-MM-DDTHH:MM), or None to keep unchanged.
+        release_date: New release date (YYYY-MM-DDTHH:MM), or None/"" to keep unchanged.
+        due_date: New due date (YYYY-MM-DDTHH:MM), or None/"" to keep unchanged.
+        late_due_date: New late due date (YYYY-MM-DDTHH:MM), or None/"" to keep unchanged.
         confirm_write: Must be True to perform the update.
     """
     if not course_id or not assignment_id:
         return "Error: both course_id and assignment_id are required."
 
-    if not any([release_date, due_date, late_due_date]):
-        return "Error: at least one date must be provided."
-
-    def parse_date(date_str: str | None) -> datetime.datetime | None:
-        if date_str is None:
-            return None
-        try:
-            return datetime.datetime.fromisoformat(date_str)
-        except ValueError:
-            raise ValueError(f"Invalid date format: '{date_str}'. Use ISO format: YYYY-MM-DDTHH:MM")
-
     try:
-        rd = parse_date(release_date)
-        dd = parse_date(due_date)
-        ldd = parse_date(late_due_date)
+        requested = {
+            "release": parse_date_input(release_date, "release_date", allow_offset=False),
+            "due": parse_date_input(due_date, "due_date", allow_offset=False),
+            "late": parse_date_input(late_due_date, "late_due_date", allow_offset=False),
+        }
     except ValueError as e:
         return f"Error: {e}"
 
-    if not confirm_write:
-        details = [
-            f"course_id=`{course_id}`",
-            f"assignment_id=`{assignment_id}`",
-        ]
-        if release_date:
-            details.append(f"release_date={release_date}")
-        if due_date:
-            details.append(f"due_date={due_date}")
-        if late_due_date:
-            details.append(f"late_due_date={late_due_date}")
-        return write_confirmation_required("modify_assignment_dates", details)
+    if all(value is None for value in requested.values()):
+        return "Error: at least one date must be provided."
+
+    order_error = check_date_order(
+        [(label, requested[key]) for key, label, _ in _DATE_FORM_FIELDS]
+    )
+    if order_error:
+        return f"Error: {order_error}"
+
+    header = [f"course_id=`{course_id}`", f"assignment_id=`{assignment_id}`"]
 
     try:
         conn = get_connection()
-        success = update_assignment_date(
-            session=conn.session,
-            course_id=course_id,
-            assignment_id=assignment_id,
-            release_date=rd,
-            due_date=dd,
-            late_due_date=ldd,
+        current = _read_date_form(conn, course_id, assignment_id)
+    except AuthError as e:
+        if confirm_write:
+            return f"Authentication error: {e}"
+        details = header + [
+            f"{label}={requested[key].strftime(_FORM_DATE_FORMAT)}"
+            for key, label, _ in _DATE_FORM_FIELDS
+            if requested[key] is not None
+        ]
+        details += [
+            _COURSE_LOCAL_NOTE,
+            f"⚠️ The current dates could not be read (Authentication error: "
+            f"{e}), so this preview cannot show the other values that will be "
+            "sent. With confirm_write=True the tool reads them first, keeps "
+            "every omitted date and the late-submission setting unchanged, "
+            "and refuses to write if it still cannot read them.",
+        ]
+        return write_confirmation_required("modify_assignment_dates", details)
+    except Exception as e:
+        return (
+            f"Error: cannot read the current dates of assignment "
+            f"`{assignment_id}`: {str(e) or repr(e)}. Nothing was changed."
         )
+
+    try:
+        plan = _plan_date_update(current, requested)
+    except _DateFormError as e:
+        return (
+            f"Error: cannot safely update assignment `{assignment_id}`: {e}. "
+            "Nothing was changed."
+        )
+    order_error = _plan_order_error(plan)
+    if order_error:
+        return (
+            f"Error: {order_error} Dates you don't pass keep their current "
+            "values, so pass the conflicting one as well. Nothing was changed."
+        )
+
+    if not confirm_write:
+        return write_confirmation_required(
+            "modify_assignment_dates",
+            header
+            + _describe_plan(plan, current, "currently")
+            + [
+                _COURSE_LOCAL_NOTE,
+                "All four settings above are sent together; values marked "
+                "unchanged are re-sent as they are.",
+            ],
+        )
+
+    try:
+        resp = _submit_date_form(conn, course_id, assignment_id, current["token"], plan)
     except AuthError as e:
         return f"Authentication error: {e}"
     except Exception as e:
-        return f"Error updating assignment dates: {e}"
+        return (
+            f"Error updating assignment dates: the request failed ({e!r}); "
+            "Gradescope may or may not have applied it. Check with "
+            "get_assignment_details."
+        )
 
-    if success:
-        updates = []
-        if release_date:
-            updates.append(f"Release date → {release_date}")
-        if due_date:
-            updates.append(f"Due date → {due_date}")
-        if late_due_date:
-            updates.append(f"Late due date → {late_due_date}")
-        return f"✅ Assignment `{assignment_id}` dates updated successfully:\n" + "\n".join(f"- {u}" for u in updates)
-    else:
-        return f"❌ Failed to update dates for assignment `{assignment_id}`. Check your permissions."
+    if resp.status_code >= 400:
+        return (
+            f"❌ Gradescope rejected the date change for assignment "
+            f"`{assignment_id}` (HTTP {resp.status_code}). Check your permissions."
+        )
+
+    summary = "\n".join(f"- {line}" for line in _describe_plan(plan, current, "was"))
+    form_errors = _form_error_text(resp.text)
+    try:
+        after = _read_date_form(conn, course_id, assignment_id)
+    except Exception as e:
+        if form_errors:
+            return (
+                f"❌ Gradescope rejected the date change for assignment "
+                f"`{assignment_id}`: {form_errors}"
+            )
+        return (
+            f"⚠️ The date change for assignment `{assignment_id}` was submitted "
+            f"(HTTP {resp.status_code}) but could not be verified: {e}. "
+            f"Check with get_assignment_details. Sent:\n{summary}"
+        )
+
+    mismatches, unknown = _verify_dates(plan, after)
+    if mismatches:
+        lines = [
+            f"❌ Gradescope did not apply the date change for assignment "
+            f"`{assignment_id}` as sent (re-read from the settings page):"
+        ]
+        lines += [f"- {m}" for m in mismatches]
+        if form_errors:
+            lines.append(f"- Gradescope reported: {form_errors}")
+        return "\n".join(lines)
+    if unknown:
+        return (
+            f"⚠️ The date change for assignment `{assignment_id}` was submitted, "
+            f"but {', '.join(unknown)} could not be read back to confirm it. "
+            f"Sent (course-local times):\n{summary}"
+        )
+    return (
+        f"✅ Assignment `{assignment_id}` dates updated successfully (read back "
+        f"from Gradescope; course-local times):\n{summary}"
+    )
 
 
 def rename_assignment(
@@ -226,10 +641,11 @@ def rename_assignment(
         )
     except AuthError as e:
         return f"Authentication error: {e}"
+    except InvalidTitleName:
+        return f"Error: The title '{new_title}' is invalid."
+    except AssignmentUpdateError as e:
+        return f"❌ Gradescope rejected the rename of assignment `{assignment_id}`: {e}"
     except Exception as e:
-        error_msg = str(e)
-        if "invalid" in error_msg.lower():
-            return f"Error: The title '{new_title}' is invalid."
         return f"Error renaming assignment: {e}"
 
     if success:
