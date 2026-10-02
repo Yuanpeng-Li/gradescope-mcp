@@ -1,11 +1,12 @@
 """Submission-related MCP tools."""
 
-import contextlib
 import hashlib
+import io
+import json
 import os
 import pathlib
 import re
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from gradescopeapi.classes.upload import upload_assignment
@@ -126,12 +127,70 @@ def _describe_upload(path: pathlib.Path, size: int, digest: str) -> str:
     return f"`{path.name}` ({size:,} bytes, sha256 {digest})"
 
 
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _expected_hashes(expected_sha256, count: int) -> list[str] | None:
+    """Normalize ``expected_sha256``: one hex digest per file, in order.
+
+    Backticks, surrounding whitespace, letter case and a ``sha256:`` prefix
+    are tolerated (agents copy the digests from the markdown preview).
+
+    Raises:
+        ValueError: the list is malformed or has the wrong length.
+    """
+    if expected_sha256 is None:
+        return None
+    if isinstance(expected_sha256, str) or not isinstance(expected_sha256, (list, tuple)):
+        raise ValueError(
+            "expected_sha256 must be a list of SHA-256 hex digests, one per file "
+            "in file_paths and in the same order (the preview lists them)"
+        )
+    if len(expected_sha256) != count:
+        raise ValueError(
+            f"expected_sha256 has {len(expected_sha256)} digest(s) for {count} "
+            "file(s); pass one SHA-256 per file in file_paths, in the same order "
+            "(the preview lists them)"
+        )
+    digests = []
+    for index, value in enumerate(expected_sha256, 1):
+        digest = value.strip().strip("`").strip().lower() if isinstance(value, str) else ""
+        digest = re.sub(r"^sha-?256[:\s]\s*", "", digest)
+        if not _SHA256_RE.fullmatch(digest):
+            raise ValueError(
+                f"expected_sha256 entry {index} ({value!r}) is not a SHA-256 hex "
+                "digest (64 hexadecimal characters)"
+            )
+        digests.append(digest)
+    return digests
+
+
+def _hash_mismatches(
+    infos: list[tuple[pathlib.Path, int, str]], expected: list[str]
+) -> list[str]:
+    """One line per file whose SHA-256 is not the approved one."""
+    return [
+        f"- `{path.name}`: approved sha256 {want}, now sha256 {digest} ({size:,} bytes)"
+        for (path, size, digest), want in zip(infos, expected)
+        if digest != want
+    ]
+
+
+def _changed_since_preview(mismatches: list[str]) -> str:
+    return (
+        "Error: the file content differs from the approved preview "
+        "(expected_sha256), so nothing was uploaded:\n"
+        + "\n".join(mismatches)
+        + "\nPreview the upload again and have the user approve the current content."
+    )
+
+
 class _UploadRecorder:
     """Session stand-in that keeps the final response of the upload POST.
 
     gradescopeapi's ``upload_assignment`` returns only a URL; the response is
-    kept to report where Gradescope sent the browser and what it said when
-    the upload did not create a submission.
+    kept to see where Gradescope sent the browser in answer to the POST
+    itself (its redirect history) and what the final page said.
     """
 
     def __init__(self, session):
@@ -147,27 +206,89 @@ class _UploadRecorder:
 
 
 # Gradescope's flash messages and other alerts on the page after an upload.
-_FLASH_SELECTORS = (".alert", ".flash", "#flash", "[role=alert]")
+_FLASH_SELECTORS = ".alert, .flash, #flash, [role=alert]"
+# The ones that report a failure: error-styled alerts, and any [role=alert]
+# that is not styled as a success or notice.
+_ERROR_FLASH_SELECTORS = (
+    ".alert-error, .alert-danger, .alert-alert, .flash-error, .flash-alert, "
+    ".flash-danger, [role=alert]:not(.alert-success):not(.alert-notice)"
+    ":not(.alert-info):not(.flash-success):not(.flash-notice)"
+)
 
 
-def _is_submission_url(url: str | None, course_id: str, assignment_id: str) -> bool:
-    """Whether ``url`` is the page of one submission of this assignment.
+def _submission_id(url: str | None, course_id: str, assignment_id: str) -> str | None:
+    """The submission ID if ``url`` is the page of one submission of this assignment.
 
-    A successful upload redirects to /courses/<cid>/assignments/<aid>/
-    submissions/<id> (or a page below it, such as the PDF page-selection
-    step); any other page (the assignment, the course, the home page after
-    a lost session) means no submission was confirmed.
+    That is /courses/<cid>/assignments/<aid>/submissions/<id>, or a page
+    below it such as the PDF page-selection step. Any other page (the
+    assignment, the course, the home page after a lost session) gives None.
     """
     if not url:
-        return False
+        return None
     pattern = (
         rf"/courses/{re.escape(str(course_id))}/assignments/"
-        rf"{re.escape(str(assignment_id))}/submissions/\d+(?:/[A-Za-z0-9_-]+)*/?"
+        rf"{re.escape(str(assignment_id))}/submissions/(\d+)(?:/[A-Za-z0-9_-]+)*/?"
     )
-    return re.fullmatch(pattern, urlsplit(str(url)).path) is not None
+    match = re.fullmatch(pattern, urlsplit(str(url)).path)
+    return match.group(1) if match else None
 
 
-def _flash_text(response) -> str | None:
+def _existing_submission_ids(conn, course_id: str, assignment_id: str) -> set[str] | None:
+    """IDs of this assignment's submissions the account can see before an upload.
+
+    Gradescope sends an account that has already submitted from the
+    assignment page on to its latest submission, whose page links to the
+    earlier ones; every submission of this assignment that the page or its
+    redirects mention is collected. Returns None when the page can't be
+    read. ``AuthError`` (an expired session) propagates, so nothing is
+    uploaded.
+    """
+    url = f"{conn.gradescope_base_url}/courses/{course_id}/assignments/{assignment_id}"
+    try:
+        resp = conn.session.get(url)
+    except AuthError:
+        raise
+    except Exception:
+        return None
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int) or not 200 <= status < 300:
+        return None
+    ids: set[str] = set()
+    for hop in [*(getattr(resp, "history", None) or []), resp]:
+        sub_id = _submission_id(getattr(hop, "url", None), course_id, assignment_id)
+        if sub_id is not None:
+            ids.add(sub_id)
+    text = getattr(resp, "text", "")
+    if isinstance(text, str):
+        mention = re.compile(
+            rf"/courses/{re.escape(str(course_id))}/assignments/"
+            rf"{re.escape(str(assignment_id))}/submissions/(\d+)"
+        )
+        ids.update(mention.findall(text))
+    return ids
+
+
+def _redirect_target(response, fallback: str | None) -> str | None:
+    """The page Gradescope sent the browser to in answer to the upload POST itself.
+
+    requests follows every redirect, so the final URL can be a page reached
+    later (e.g. the assignment page forwarding to an older submission).
+    ``history[0]`` is the POST's own answer and its Location the target;
+    without a redirect it is the response's own URL.
+    """
+    if response is None:
+        return fallback
+    history = list(getattr(response, "history", None) or [])
+    if not history:
+        return getattr(response, "url", None) or fallback
+    first = history[0]
+    location = (getattr(first, "headers", None) or {}).get("Location")
+    if not location:
+        return None
+    return urljoin(str(getattr(first, "url", None) or ""), str(location))
+
+
+def _flash_text(response, selectors: str = _FLASH_SELECTORS) -> str | None:
     """Alert or flash messages on a response page, if any (at most 300 characters)."""
     try:
         text = response.text
@@ -177,7 +298,7 @@ def _flash_text(response) -> str | None:
         return None
     soup = BeautifulSoup(text, "html.parser")
     messages: list[str] = []
-    for element in soup.select(", ".join(_FLASH_SELECTORS)):
+    for element in soup.select(selectors):
         message = " ".join(element.get_text(" ", strip=True).split())
         if message and message not in messages:
             messages.append(message)
@@ -190,6 +311,7 @@ def upload_submission(
     file_paths: list[str],
     leaderboard_name: str | None = None,
     confirm_write: bool = False,
+    expected_sha256: list[str] | None = None,
 ) -> str:
     """Upload files as a submission to a Gradescope assignment.
 
@@ -198,9 +320,18 @@ def upload_submission(
     directories, credential-looking names (keys, ``.env``, ...) and system
     directories are refused. When ``GRADESCOPE_MCP_UPLOAD_ROOT`` is set
     (``os.pathsep``-separated directories), files must resolve inside it;
-    otherwise symbolic links are refused. The preview lists each file's size
-    and SHA-256. Success is reported only when Gradescope redirects to the
-    new submission's page; any other outcome is reported as not confirmed,
+    otherwise symbolic links are refused.
+
+    The preview lists each file's size and SHA-256. Passing those digests
+    back as ``expected_sha256`` binds the upload to the approved content:
+    if any file differs, nothing is uploaded. Each file is read once, and
+    the bytes read are the bytes hashed and sent.
+
+    Success is reported only when Gradescope answers the upload POST itself
+    with a redirect to a submission of this assignment that was not among
+    the account's submissions seen on the assignment page just before the
+    upload, the final page is that submission's page (or one below it), and
+    it shows no error message. Anything else is reported as not confirmed,
     with the page Gradescope showed.
 
     Args:
@@ -209,12 +340,19 @@ def upload_submission(
         file_paths: List of absolute file paths to upload.
         leaderboard_name: Optional leaderboard display name.
         confirm_write: Must be True to perform the upload.
+        expected_sha256: Optional SHA-256 hex digests from the preview, one
+            per file in ``file_paths`` and in the same order.
     """
     if not course_id or not assignment_id:
         return "Error: both course_id and assignment_id are required."
 
     if not file_paths:
         return "Error: at least one file path is required."
+
+    try:
+        expected = _expected_hashes(expected_sha256, len(file_paths))
+    except ValueError as e:
+        return f"Error: {e}"
 
     try:
         roots = _upload_roots()
@@ -233,6 +371,10 @@ def upload_submission(
     validated_paths = [path for path, _size, _digest in validated]
 
     if not confirm_write:
+        if expected is not None:
+            mismatches = _hash_mismatches(validated, expected)
+            if mismatches:
+                return _changed_since_preview(mismatches)
         details = [
             f"course_id=`{course_id}`",
             f"assignment_id=`{assignment_id}`",
@@ -256,62 +398,158 @@ def upload_submission(
             "The submission is made as the logged-in Gradescope account and "
             "the files become readable by the course staff."
         )
+        details.append(
+            "To upload exactly the content shown here, pass "
+            f"expected_sha256={json.dumps([digest for _p, _s, digest in validated])} "
+            "together with confirm_write=True: the upload is then refused if "
+            "any file has changed since this preview."
+        )
         return write_confirmation_required("upload_submission", details)
+
+    # Each file is read once; those bytes are hashed, compared with the
+    # approved digests and sent, so a file rewritten in the meantime can't
+    # put different content into the upload than the result reports.
+    contents = []
+    for path in validated_paths:
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read(_MAX_UPLOAD_BYTES + 1)
+        except OSError as e:
+            return (
+                f"Error uploading submission: cannot read {path}: {e}. "
+                "Nothing was uploaded."
+            )
+        if len(data) > _MAX_UPLOAD_BYTES:
+            return (
+                f"Error: {path} grew past the upload limit of "
+                f"{_MAX_UPLOAD_BYTES:,} bytes. Nothing was uploaded."
+            )
+        contents.append(data)
+    sent = [
+        (path, len(data), hashlib.sha256(data).hexdigest())
+        for path, data in zip(validated_paths, contents)
+    ]
+    if expected is not None:
+        mismatches = _hash_mismatches(sent, expected)
+        if mismatches:
+            return _changed_since_preview(mismatches)
+
+    files = []
+    for path, data in zip(validated_paths, contents):
+        buffer = io.BytesIO(data)
+        # gradescopeapi takes the uploaded file's name and MIME type from .name.
+        buffer.name = str(path)
+        files.append(buffer)
 
     try:
         conn = get_connection()
+        existing = _existing_submission_ids(conn, course_id, assignment_id)
         recorder = _UploadRecorder(conn.session)
-        # ExitStack guarantees every successfully-opened handle is closed even
-        # if a later open() raises (EISDIR, EACCES, race-deleted file). The
-        # earlier try/finally only protected handles after the loop completed.
-        # The arguments are also passed positionally — `upload_assignment`'s
-        # signature is (session, course_id, assignment_id, *files, ...) so
-        # mixing kw-args with *file_handles raised TypeError.
-        with contextlib.ExitStack() as stack:
-            file_handles = [
-                stack.enter_context(open(path, "rb")) for path in validated_paths
-            ]
-            result_url = upload_assignment(
-                recorder,
-                course_id,
-                assignment_id,
-                *file_handles,
-                leaderboard_name=leaderboard_name,
-            )
-
+        # Files are passed positionally: upload_assignment's signature is
+        # (session, course_id, assignment_id, *files, leaderboard_name=...).
+        result_url = upload_assignment(
+            recorder,
+            course_id,
+            assignment_id,
+            *files,
+            leaderboard_name=leaderboard_name,
+        )
     except AuthError as e:
         return f"Authentication error: {e}"
     except Exception as e:
         return f"Error uploading submission: {e}"
 
-    if _is_submission_url(result_url, course_id, assignment_id):
-        return (
-            f"✅ Submission uploaded successfully!\n"
-            f"- **Files:** {', '.join(_describe_upload(*info) for info in validated)}\n"
-            f"- **Submission URL:** {result_url}"
-        )
+    return _upload_outcome(
+        course_id, assignment_id, sent, expected is not None, existing,
+        recorder.post_response, result_url,
+    )
 
-    # gradescopeapi returns None for the course page and ".../submissions";
-    # anything else that is not one submission's page is not a success either.
-    final = recorder.post_response
-    final_url = result_url or getattr(final, "url", None)
-    lines = [
-        f"❌ Upload not confirmed: Gradescope did not open a new submission of "
-        f"assignment `{assignment_id}`, so the submission was most likely not "
-        "created."
-    ]
+
+def _upload_outcome(
+    course_id: str,
+    assignment_id: str,
+    sent: list[tuple[pathlib.Path, int, str]],
+    hashes_checked: bool,
+    existing: set[str] | None,
+    response,
+    result_url: str | None,
+) -> str:
+    """Report an upload: ✅ only with evidence that a new submission exists.
+
+    ``response`` is the upload POST's final response (None if the upload
+    function did not go through the recorder) and ``result_url`` what
+    gradescopeapi returned (None for the course page and ".../submissions").
+    """
+    final_url = getattr(response, "url", None) or result_url
+    target = _redirect_target(response, result_url)
+    new_id = _submission_id(target, course_id, assignment_id)
+    final_id = _submission_id(final_url, course_id, assignment_id)
+    flash = _flash_text(response) if response is not None else None
+    error_flash = (
+        _flash_text(response, _ERROR_FLASH_SELECTORS) if response is not None else None
+    )
+
+    if new_id is None:
+        problem = (
+            f"Gradescope did not open a new submission of assignment "
+            f"`{assignment_id}`, so the submission was most likely not created."
+        )
+    elif existing is not None and new_id in existing:
+        problem = (
+            f"Gradescope opened submission `{new_id}`, which already existed "
+            "before this upload, so the upload most likely did not create a "
+            "new submission."
+        )
+    elif final_id != new_id:
+        problem = (
+            f"Gradescope opened submission `{new_id}` but then went on to "
+            "another page, so the upload may not have been accepted."
+        )
+    elif error_flash:
+        problem = (
+            f"Gradescope opened submission `{new_id}` but its page shows an "
+            "error message, so the upload may not have been accepted."
+        )
+    else:
+        lines = [
+            "✅ Submission uploaded successfully!",
+            f"- **Files:** {', '.join(_describe_upload(*info) for info in sent)}",
+            f"- **Submission ID:** `{new_id}`",
+            f"- **Submission URL:** {result_url or final_url}",
+        ]
+        if flash:
+            lines.append(f"- Gradescope said: {flash}")
+        if hashes_checked:
+            lines.append("- Every file matched the approved expected_sha256.")
+        else:
+            lines.append(
+                "- The content was not checked against an approved preview "
+                "(expected_sha256 was not passed)."
+            )
+        if existing is None:
+            lines.append(
+                "- The account's existing submissions could not be read before "
+                "the upload, so this ID was not compared with them."
+            )
+        return "\n".join(lines)
+
+    lines = [f"❌ Upload not confirmed: {problem}"]
+    if target and target != final_url:
+        lines.append(f"- Gradescope answered the upload with a redirect to: {target}")
     if final_url:
         lines.append(f"- Final page: {final_url}")
-    flash = _flash_text(final) if final is not None else None
     if flash:
         lines.append(f"- Gradescope said: {flash}")
-    lines += [
-        "- Possible reasons: the assignment is closed or past its due date, "
-        "you don't have permission to submit, the files were rejected, the "
-        "session was lost, or the course or assignment ID is wrong.",
+    if new_id is None:
+        lines.append(
+            "- Possible reasons: the assignment is closed or past its due date, "
+            "you don't have permission to submit, the files were rejected, the "
+            "session was lost, or the course or assignment ID is wrong."
+        )
+    lines.append(
         "- Each upload creates a new submission: check the assignment on "
-        "Gradescope before uploading again.",
-    ]
+        "Gradescope before uploading again."
+    )
     return "\n".join(lines)
 
 

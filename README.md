@@ -366,14 +366,28 @@ most 100 MB. Hidden files and directories and credential-like names (keys,
 `.env`, ...) are refused. When `GRADESCOPE_MCP_UPLOAD_ROOT` is set, files
 must resolve inside one of its directories. When it is not set, symbolic
 links and files under system directories (`/etc`, `/proc`, `/run`, ...) are
-refused. The preview lists each file's size and SHA-256.
+refused. The preview lists each file's size and SHA-256 and the
+`expected_sha256` list to pass back with `confirm_write=True`. When it is
+passed, a file whose content changed since the preview makes the call an
+`Error` and nothing is uploaded. Without it, the result says the content
+was not checked. Each file is read once, and the bytes read are the ones
+hashed and sent.
 
-Success is reported only when Gradescope redirects to the new submission's
-page (`/courses/<cid>/assignments/<aid>/submissions/<id>`, or a page below
-it such as the PDF page-selection step). Any other outcome is
-`❌ Upload not confirmed` with the final page and any message Gradescope
-showed. Check the assignment in Gradescope before uploading again, since
-every upload creates a new submission.
+Before uploading, the tool reads the assignment page to note the account's
+existing submissions. Success is reported only when all of these hold:
+- Gradescope answers the upload request itself with a redirect to a
+  submission of this assignment
+  (`/courses/<cid>/assignments/<aid>/submissions/<id>`).
+- That submission was not among the existing ones.
+- The final page is that submission's page, or a page below it such as
+  the PDF page-selection step.
+- The final page shows no error message.
+
+Any other outcome is `❌ Upload not confirmed`, with the redirect target,
+the final page and any message Gradescope showed. A rejected upload that
+ends on an older submission is therefore not reported as a success. Check
+the assignment in Gradescope before uploading again, since every upload
+creates a new submission.
 
 ### Scoring direction
 - Gradescope questions use `positive` or `negative` scoring.

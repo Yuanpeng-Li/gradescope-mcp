@@ -442,6 +442,7 @@ def tool_upload_submission(
     file_paths: list[str],
     leaderboard_name: str | None = None,
     confirm_write: bool = False,
+    expected_sha256: list[str] | None = None,
 ) -> str:
     """Upload files as a submission to a Gradescope assignment.
 
@@ -451,10 +452,16 @@ def tool_upload_submission(
     (keys, ``.env``, ...) and system directories are refused. If
     ``GRADESCOPE_MCP_UPLOAD_ROOT`` is set, files must resolve inside it;
     otherwise symbolic links are refused. The preview lists each file's
-    size and SHA-256.
+    size and SHA-256; pass those digests back as ``expected_sha256`` with
+    ``confirm_write=True`` so that the content the user approved is what
+    gets uploaded (a file that changed since the preview makes the call an
+    Error and nothing is uploaded).
 
-    Success is reported only when Gradescope redirects to the new
-    submission's page (``/courses/<cid>/assignments/<aid>/submissions/<id>``).
+    Success is reported only when Gradescope answers the upload itself with
+    a redirect to a submission of this assignment
+    (``/courses/<cid>/assignments/<aid>/submissions/<id>``) that was not
+    among the account's submissions on the assignment page just before, the
+    final page is that submission's page, and it shows no error message.
     Any other outcome is ``❌ Upload not confirmed`` with the final page and
     any message Gradescope showed; check the assignment on Gradescope before
     uploading again, because every upload creates a new submission.
@@ -467,9 +474,13 @@ def tool_upload_submission(
         confirm_write: Must be True to perform the upload. The default
             returns a preview and changes nothing. Setting it is not user
             approval: show the preview to the user first.
+        expected_sha256: Optional SHA-256 hex digests from the preview, one
+            per file in file_paths and in the same order. When given, the
+            upload is refused if any file's content differs.
     """
     return upload_submission(
-        course_id, assignment_id, file_paths, leaderboard_name, confirm_write
+        course_id, assignment_id, file_paths, leaderboard_name, confirm_write,
+        expected_sha256=expected_sha256,
     )
 
 

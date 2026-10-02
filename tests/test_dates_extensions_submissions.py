@@ -10,13 +10,17 @@ import hashlib
 import html
 import json
 import os
+import re
 import threading
 import time
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import anyio
 import pytest
 import requests
+from requests.adapters import BaseAdapter
+from requests.structures import CaseInsensitiveDict
 
 from gradescope_mcp import server
 from gradescope_mcp.auth import AuthError
@@ -1340,8 +1344,12 @@ _COURSE_PAGE = '<html><head><meta name="csrf-token" content="CSRF"></head></html
 
 
 def _upload_session(final_url: str, page: str = "<html></html>") -> FakeSession:
-    """Serves gradescopeapi's real upload_assignment: course page, then the POST."""
+    """Serves an upload: the assignment page (no submission yet), then
+    gradescopeapi's real upload_assignment: course page, then the POST."""
     return FakeSession([
+        ("GET", "/courses/1/assignments/2", FakeResponse(
+            text="<html>Submit HW</html>", url="https://gs.test/courses/1/assignments/2",
+        )),
         ("GET", "/courses/1", FakeResponse(text=_COURSE_PAGE)),
         ("POST", "/assignments/2/submissions", FakeResponse(text=page, url=final_url)),
     ])
@@ -1379,7 +1387,8 @@ def test_upload_redirect_elsewhere_is_not_reported_as_success(monkeypatch, uploa
     assert f"- Final page: {final_url}" in text
     assert "- Gradescope said: This assignment is closed." in text
     assert "uploaded successfully" not in text
-    assert session.methods() == ["GET", "POST"]
+    # The assignment page (existing submissions), the course page, the upload.
+    assert session.methods() == ["GET", "GET", "POST"]
 
 
 def test_upload_to_course_page_reports_final_page(monkeypatch, upload_file) -> None:
@@ -1475,3 +1484,315 @@ def test_review_grades_unrecognized_flag_without_score_column_is_unknown(monkeyp
     assert "**Graded:** at least 1/2 (1 unknown)" in text
     assert "| 1 | `501` |  | ✅ |" in text
     assert "| 2 | `502` |  | ? |" in text
+
+
+# ---------------------------------------------------------------------------
+# Round 3: upload confirmation needs a NEW submission (finding 2)
+# ---------------------------------------------------------------------------
+
+_GS = "https://www.gradescope.com"
+_LOGGED_IN = '<html><head><meta name="csrf-token" content="CSRF"></head><a href="/logout">x</a>'
+
+
+class _SiteAdapter(BaseAdapter):
+    """Serves a real ``requests.Session`` (redirects and all) from a route map.
+
+    ``routes`` maps (method, path) to (status, body, Location or None).
+    Every request is logged with its body, so the bytes uploaded can be
+    checked.
+    """
+
+    def __init__(self, routes):
+        super().__init__()
+        self.routes = routes
+        self.log: list[tuple[str, str, bytes]] = []
+
+    def send(self, request, **_kwargs):
+        path = urlsplit(request.url).path
+        body = request.body
+        if hasattr(body, "read"):
+            body = body.read()
+        if isinstance(body, str):
+            body = body.encode()
+        self.log.append((request.method, path, body or b""))
+        if (request.method, path) not in self.routes:
+            raise AssertionError(f"unexpected request {request.method} {request.url}")
+        status, text, location = self.routes[(request.method, path)]
+        response = requests.Response()
+        response.status_code = status
+        response._content = text.encode()
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        if location:
+            headers["Location"] = location
+        response.headers = CaseInsensitiveDict(headers)
+        response.url = request.url
+        response.request = request
+        response.encoding = "utf-8"
+        return response
+
+    def close(self):
+        pass
+
+    def posts(self) -> list[tuple[str, str, bytes]]:
+        return [entry for entry in self.log if entry[0] == "POST"]
+
+
+def _upload_site(monkeypatch, routes) -> _SiteAdapter:
+    """A logged-in site: the course page plus ``routes``; returns the adapter."""
+    adapter = _SiteAdapter({("GET", "/courses/1"): (200, _LOGGED_IN, None), **routes})
+    session = requests.Session()
+    session.mount("https://", adapter)
+    conn = SimpleNamespace(session=session, gradescope_base_url=_GS, logged_in=True)
+    monkeypatch.setattr(submissions, "get_connection", lambda: conn)
+    return adapter
+
+
+def _submission_page(sub_id: int, flash: str = "") -> str:
+    return f"{_LOGGED_IN}{flash}<h1>Submission {sub_id}</h1>"
+
+
+_SUB = "/courses/1/assignments/2/submissions"
+# The account already submitted: the assignment page forwards to submission
+# 100, whose page links to the older submission 99.
+_ALREADY_SUBMITTED = {
+    ("GET", "/courses/1/assignments/2"): (302, "", f"{_SUB}/100"),
+    ("GET", f"{_SUB}/100"): (200, _submission_page(100) + f'<a href="{_SUB}/99">older</a>', None),
+}
+
+
+def _upload_args(path, **extra) -> dict:
+    return {"course_id": "1", "assignment_id": "2", "file_paths": [str(path)],
+            "confirm_write": True, **extra}
+
+
+def test_rejected_upload_forwarded_to_the_previous_submission_is_not_success(monkeypatch, upload_file) -> None:
+    """Q3/upload_old_sub.py: a rejected POST went to the assignment page, which
+    forwarded to the account's existing submission 100 (with an error flash),
+    and the tool reported ✅ with submission 100."""
+    expired = '<div class="alert alert-error">The due date for this assignment has passed.</div>'
+    site = _upload_site(monkeypatch, {
+        ("GET", "/courses/1/assignments/2"): (302, "", f"{_GS}{_SUB}/100"),
+        ("GET", f"{_SUB}/100"): (200, _submission_page(100, expired), None),
+        ("POST", _SUB): (302, "", f"{_GS}/courses/1/assignments/2"),
+    })
+
+    text, is_error = _call_tool_flagged("tool_upload_submission", _upload_args(upload_file))
+
+    assert is_error
+    assert text.startswith("❌ Upload not confirmed: Gradescope did not open a new submission")
+    assert f"- Gradescope answered the upload with a redirect to: {_GS}/courses/1/assignments/2" in text
+    assert f"- Final page: {_GS}{_SUB}/100" in text
+    assert "- Gradescope said: The due date for this assignment has passed." in text
+    assert "uploaded successfully" not in text
+    assert len(site.posts()) == 1
+
+
+def test_upload_redirected_straight_to_an_existing_submission_is_not_success(monkeypatch, upload_file) -> None:
+    site = _upload_site(monkeypatch, {**_ALREADY_SUBMITTED, ("POST", _SUB): (302, "", f"{_SUB}/100")})
+
+    text, is_error = _call_tool_flagged("tool_upload_submission", _upload_args(upload_file))
+
+    assert is_error
+    assert text.startswith(
+        "❌ Upload not confirmed: Gradescope opened submission `100`, which already "
+        "existed before this upload"
+    )
+    assert len(site.posts()) == 1
+
+
+def test_upload_to_an_older_linked_submission_is_not_success(monkeypatch, upload_file) -> None:
+    # Submission 99 is only linked from the latest submission's page.
+    _upload_site(monkeypatch, {**_ALREADY_SUBMITTED, ("POST", _SUB): (302, "", f"{_SUB}/99"),
+                               ("GET", f"{_SUB}/99"): (200, _submission_page(99), None)})
+
+    text = submissions.upload_submission("1", "2", [str(upload_file)], confirm_write=True)
+
+    assert text.startswith("❌ Upload not confirmed: Gradescope opened submission `99`, which already existed")
+
+
+def test_new_submission_page_with_an_error_message_is_not_success(monkeypatch, upload_file) -> None:
+    error = '<div class="alert alert-danger">Your files could not be processed.</div>'
+    _upload_site(monkeypatch, {**_ALREADY_SUBMITTED, ("POST", _SUB): (302, "", f"{_SUB}/101"),
+                               ("GET", f"{_SUB}/101"): (200, _submission_page(101, error), None)})
+
+    text, is_error = _call_tool_flagged("tool_upload_submission", _upload_args(upload_file))
+
+    assert is_error
+    assert text.startswith(
+        "❌ Upload not confirmed: Gradescope opened submission `101` but its page "
+        "shows an error message"
+    )
+    assert "- Gradescope said: Your files could not be processed." in text
+
+
+def test_new_submission_that_moves_on_to_another_page_is_not_success(monkeypatch, upload_file) -> None:
+    _upload_site(monkeypatch, {**_ALREADY_SUBMITTED, ("POST", _SUB): (302, "", f"{_SUB}/101"),
+                               ("GET", f"{_SUB}/101"): (302, "", "/courses/1/assignments/2")})
+
+    text = submissions.upload_submission("1", "2", [str(upload_file)], confirm_write=True)
+
+    assert text.startswith(
+        "❌ Upload not confirmed: Gradescope opened submission `101` but then went on to another page"
+    )
+    assert f"- Final page: {_GS}{_SUB}/100" in text
+
+
+def test_upload_redirected_to_a_new_submission_is_success(monkeypatch, upload_file) -> None:
+    received = '<div class="alert alert-success" role="alert">Submission received.</div>'
+    site = _upload_site(monkeypatch, {
+        **_ALREADY_SUBMITTED,
+        ("POST", _SUB): (302, "", f"{_SUB}/101"),
+        ("GET", f"{_SUB}/101"): (302, "", f"{_SUB}/101/select_pages"),
+        ("GET", f"{_SUB}/101/select_pages"): (200, _submission_page(101, received), None),
+    })
+
+    text, is_error = _call_tool_flagged("tool_upload_submission", _upload_args(upload_file))
+
+    assert not is_error
+    assert text.startswith("✅ Submission uploaded successfully!")
+    assert "- **Submission ID:** `101`" in text
+    assert f"- **Submission URL:** {_GS}{_SUB}/101/select_pages" in text
+    assert "- Gradescope said: Submission received." in text
+    assert "could not be read before the upload" not in text
+    [(_method, _path, body)] = site.posts()
+    assert b"%PDF-1.4 answer" in body
+    assert [entry[:2] for entry in site.log][:2] == [
+        ("GET", "/courses/1/assignments/2"), ("GET", f"{_SUB}/100"),
+    ]
+
+
+def test_upload_whose_previous_submissions_are_unreadable_says_so(monkeypatch, upload_file) -> None:
+    _upload_site(monkeypatch, {
+        ("GET", "/courses/1/assignments/2"): (500, "oops", None),
+        ("POST", _SUB): (302, "", f"{_SUB}/101"),
+        ("GET", f"{_SUB}/101"): (200, _submission_page(101), None),
+    })
+
+    text = submissions.upload_submission("1", "2", [str(upload_file)], confirm_write=True)
+
+    assert text.startswith("✅ Submission uploaded successfully!")
+    assert "existing submissions could not be read before the upload" in text
+
+
+def test_upload_stops_when_the_session_expired_before_posting(monkeypatch, upload_file) -> None:
+    def expired(_url, _kwargs):
+        raise AuthError("Gradescope session expired (redirected to the login page).")
+
+    session = FakeSession([("GET", "/courses/1/assignments/2", expired)])
+    _use(monkeypatch, submissions, session)
+
+    text = submissions.upload_submission("1", "2", [str(upload_file)], confirm_write=True)
+
+    assert text.startswith("Authentication error:")
+    assert session.methods() == ["GET"]
+
+
+# ---------------------------------------------------------------------------
+# Round 3: the upload is bound to the approved content (finding 7)
+# ---------------------------------------------------------------------------
+
+
+def _previewed_hashes(preview: str) -> list[str]:
+    match = re.search(r"pass expected_sha256=(\[[^\]]*\])", preview)
+    assert match, preview
+    return json.loads(match.group(1))
+
+
+@pytest.fixture
+def capture_upload(monkeypatch):
+    """Replace upload_assignment; record the bytes of each file it is given."""
+    sent: list[bytes] = []
+    before_read: list = []
+
+    def fake_upload(_session, course_id, assignment_id, *files, leaderboard_name=None):
+        for hook in before_read:
+            hook()
+        sent.extend(f.read() for f in files)
+        return f"https://www.gradescope.com/courses/{course_id}/assignments/{assignment_id}/submissions/77"
+
+    monkeypatch.setattr(submissions, "upload_assignment", fake_upload)
+    session = FakeSession([("GET", "/courses/1/assignments/2", FakeResponse(text="<html></html>"))])
+    monkeypatch.setattr(submissions, "get_connection", lambda: _conn(session))
+    return SimpleNamespace(sent=sent, before_read=before_read)
+
+
+def test_upload_refuses_content_changed_since_the_preview(upload_file, capture_upload) -> None:
+    """Q3/upload_toctou.py: the approved file was rewritten before the confirm
+    call, and the new bytes were uploaded with ✅."""
+    upload_file.write_bytes(b"APPROVED CONTENT")
+    preview = _call_tool("tool_upload_submission", {**_upload_args(upload_file), "confirm_write": False})
+    approved = _previewed_hashes(preview)
+    assert approved == [hashlib.sha256(b"APPROVED CONTENT").hexdigest()]
+    upload_file.write_bytes(b"SOMETHING ELSE ENTIRELY")
+
+    text, is_error = _call_tool_flagged(
+        "tool_upload_submission", _upload_args(upload_file, expected_sha256=approved)
+    )
+
+    assert is_error
+    assert text.startswith("Error: the file content differs from the approved preview")
+    assert f"approved sha256 {approved[0]}" in text
+    assert hashlib.sha256(b"SOMETHING ELSE ENTIRELY").hexdigest() in text
+    assert "nothing was uploaded" in text
+    assert capture_upload.sent == []
+
+
+def test_upload_sends_exactly_the_approved_bytes(upload_file, capture_upload) -> None:
+    upload_file.write_bytes(b"APPROVED CONTENT")
+    approved = _previewed_hashes(submissions.upload_submission("1", "2", [str(upload_file)]))
+    # The file changes after the confirm call read it: what was read is sent.
+    capture_upload.before_read.append(lambda: upload_file.write_bytes(b"LATE EDIT"))
+
+    text = submissions.upload_submission(
+        "1", "2", [str(upload_file)], confirm_write=True, expected_sha256=approved
+    )
+
+    assert text.startswith("✅ Submission uploaded successfully!")
+    assert capture_upload.sent == [b"APPROVED CONTENT"]
+    assert f"sha256 {approved[0]}" in text
+    assert "- Every file matched the approved expected_sha256." in text
+
+
+def test_upload_without_expected_hash_says_the_content_was_not_checked(upload_file, capture_upload) -> None:
+    text = submissions.upload_submission("1", "2", [str(upload_file)], confirm_write=True)
+
+    assert text.startswith("✅")
+    assert "(expected_sha256 was not passed)" in text
+    assert capture_upload.sent == [b"%PDF-1.4 answer"]
+
+
+def test_expected_hash_tolerates_copy_formatting(upload_file, capture_upload) -> None:
+    digest = hashlib.sha256(b"%PDF-1.4 answer").hexdigest()
+
+    text = submissions.upload_submission(
+        "1", "2", [str(upload_file)], confirm_write=True,
+        expected_sha256=[f" `sha256:{digest.upper()}` "],
+    )
+
+    assert text.startswith("✅")
+
+
+@pytest.mark.parametrize(
+    "expected, message",
+    [
+        ([], "has 0 digest(s) for 1 file(s)"),
+        (["a" * 64, "b" * 64], "has 2 digest(s) for 1 file(s)"),
+        (["not-a-hash"], "is not a SHA-256 hex digest"),
+        (["a" * 63], "is not a SHA-256 hex digest"),
+    ],
+)
+def test_malformed_expected_hash_is_an_error_even_in_the_preview(upload_file, expected, message) -> None:
+    text, is_error = _call_tool_flagged("tool_upload_submission", {
+        **_upload_args(upload_file), "confirm_write": False, "expected_sha256": expected,
+    })
+
+    assert is_error
+    assert text.startswith("Error: expected_sha256")
+    assert message in text
+
+
+def test_preview_with_a_stale_expected_hash_is_an_error(upload_file) -> None:
+    text = submissions.upload_submission("1", "2", [str(upload_file)], expected_sha256=["0" * 64])
+
+    assert text.startswith("Error: the file content differs from the approved preview")
+
