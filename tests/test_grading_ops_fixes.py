@@ -2205,3 +2205,138 @@ def test_apply_grade_preview_flags_overwrite_on_an_ungraded_submission(monkeypat
     assert "already graded" not in preview
     assert gs.posts() == []
 
+
+# ---------------------------------------------------------------------------
+# Round 3 [1]: a group overwrite names the graded members it was approved for
+# ---------------------------------------------------------------------------
+
+GROUP_OVERWRITE = {**GROUP_ARGS, "overwrite_graded": True}
+SAVE_MANY = f"/courses/{C}/questions/{Q}/submissions/101/save_many_grades"
+
+
+def _graded_group_world(monkeypatch) -> OfflineGradescope:
+    gs = _group_world(monkeypatch)
+    gs.answer_groups["submissions"][0]["graded"] = True  # member 101
+    return gs
+
+
+def test_group_overwrite_refuses_members_graded_after_the_preview(monkeypatch) -> None:
+    """Reviewer repro Q1/group_blanket.py: the preview listed 101 as graded;
+    a TA grades 102 before the confirm."""
+    gs = _graded_group_world(monkeypatch)
+
+    preview, is_error = _call_mcp("tool_grade_answer_group", GROUP_OVERWRITE)
+    assert not is_error
+    assert "existing grades will be overwritten for confirmed [`101`]" in preview
+    assert (
+        '- expected_graded_ids=["101"] — the members whose grades this write '
+        "overwrites"
+    ) in preview
+
+    gs.answer_groups["submissions"][1]["graded"] = True  # a TA grades 102
+    confirm = {**GROUP_OVERWRITE, "confirm_write": True, "expected_member_count": 2}
+
+    result, is_error = _call_mcp(
+        "tool_grade_answer_group", {**confirm, "expected_graded_ids": ["101"]}
+    )
+    assert is_error
+    assert result.startswith(
+        "Error: answer group `3`'s graded members changed since the preview. "
+        "Graded now but not in expected_graded_ids: [`102`]; in "
+        "expected_graded_ids but not graded now: [(none)]. Nothing was sent."
+    )
+
+    # overwrite_graded=True alone is not an approval of named members.
+    result, is_error = _call_mcp("tool_grade_answer_group", confirm)
+    assert is_error
+    assert result.startswith(
+        "Error: answer group `3` has 2 graded member(s) at write time "
+        "(confirmed [`101`, `102`]; inferred [(none)]), and overwrite_graded=True "
+        "must come with expected_graded_ids"
+    )
+    assert gs.posts() == []
+
+
+def test_group_overwrite_with_the_previewed_ids_names_the_overwritten_members(monkeypatch) -> None:
+    gs = _graded_group_world(monkeypatch)
+
+    result, is_error = _call_mcp("tool_grade_answer_group", {
+        **GROUP_OVERWRITE, "confirm_write": True, "expected_member_count": 2,
+        "expected_graded_ids": [101],
+    })
+
+    assert not is_error, result
+    assert gs.posts() == [SAVE_MANY]
+    assert (
+        "⚠️ **Overwrote existing grades** (members graded at write time): "
+        "confirmed [`101`]\n**Members at write time:** 2 confirmed + 0 inferred"
+    ) in result
+
+
+def test_group_expected_graded_ids_cover_inferred_members(monkeypatch) -> None:
+    gs = _group_world(monkeypatch)
+    gs.answer_groups["submissions"].append(
+        {"id": 150, "unconfirmed_group_id": 3, "graded": True}
+    )
+
+    preview = answer_groups.grade_answer_group(C, Q, "3", ["200"], overwrite_graded=True)
+    assert 'expected_graded_ids=["150"]' in preview
+
+    result = answer_groups.grade_answer_group(
+        C, Q, "3", ["200"], confirm_write=True, overwrite_graded=True,
+        expected_member_count=3, expected_graded_ids=["`0150`"],
+    )
+
+    assert result.startswith("✅ Batch grade saved for answer group `3`")
+    assert (
+        "confirmed [(none)]; inferred [`150`] (if Gradescope applied the batch "
+        "grade to inferred members)"
+    ) in result
+    assert gs.posts() == [SAVE_MANY]
+
+
+def test_group_without_graded_members_needs_no_expected_graded_ids(monkeypatch) -> None:
+    gs = _group_world(monkeypatch)
+
+    preview = answer_groups.grade_answer_group(C, Q, "3", ["200"], overwrite_graded=True)
+    assert "- expected_graded_ids=[] —" in preview
+    plain = answer_groups.grade_answer_group(C, Q, "3", ["200"])
+    assert "expected_graded_ids" not in plain
+
+    result = answer_groups.grade_answer_group(
+        C, Q, "3", ["200"], confirm_write=True, expected_member_count=2,
+    )
+    assert result.startswith("✅ Batch grade saved")
+    assert "Overwrote existing grades" not in result
+
+    # A stale expected list is refused at preview time too.
+    stale = answer_groups.grade_answer_group(
+        C, Q, "3", ["200"], overwrite_graded=True, expected_graded_ids=["101"],
+    )
+    assert stale.startswith("Error: answer group `3`'s graded members changed")
+    assert gs.posts() == [SAVE_MANY]
+
+
+@pytest.mark.parametrize("bad", ["101", 101, [True], [None], [""], ["``"]])
+def test_group_expected_graded_ids_must_be_a_list_of_ids(monkeypatch, bad) -> None:
+    gs = _graded_group_world(monkeypatch)
+
+    result = answer_groups.grade_answer_group(
+        C, Q, "3", ["200"], confirm_write=True, overwrite_graded=True,
+        expected_graded_ids=bad,
+    )
+
+    assert result.startswith("Error: expected_graded_ids")
+    assert gs.log == []
+
+
+def test_group_expected_graded_ids_schema_takes_ids_only() -> None:
+    prop = _tool_schema("tool_grade_answer_group")["properties"]["expected_graded_ids"]
+    array = next(option for option in prop["anyOf"] if option.get("type") == "array")
+    assert array["items"]["pattern"] == "^[0-9]+$"
+    assert prop["default"] is None
+
+    with pytest.raises(Exception, match="expected_graded_ids"):
+        anyio.run(server.mcp.call_tool, "tool_grade_answer_group", {
+            **GROUP_OVERWRITE, "expected_graded_ids": ["abc"],
+        })

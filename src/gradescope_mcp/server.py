@@ -1329,6 +1329,7 @@ def tool_grade_answer_group(
     confirm_write: bool = False,
     overwrite_graded: bool = False,
     expected_member_count: Count | None = None,
+    expected_graded_ids: list[GradescopeID] | None = None,
 ) -> str:
     """Batch-grade ALL submissions in an answer group at once.
 
@@ -1344,7 +1345,12 @@ def tool_grade_answer_group(
     sent. The preview shows the members and their graded counts, the items
     CHECKED and UNCHECKED for every member, the projected per-member score
     (with a warning when Gradescope did not report the scoring direction)
-    and the member count to pass back as ``expected_member_count``.
+    and the member count to pass back as ``expected_member_count``. With
+    ``overwrite_graded=True`` it also prints the graded member IDs to pass
+    back as ``expected_graded_ids``: a write over graded members is refused
+    without them, and refused when the members graded at write time differ
+    (e.g. a member graded after the preview). The result names the members
+    whose grades were overwritten.
 
     Args:
         course_id: The Gradescope course ID.
@@ -1367,12 +1373,17 @@ def tool_grade_answer_group(
         expected_member_count: The confirmed + inferred member count from the
             preview. Pass it together with confirm_write=True so the write
             aborts if the group's membership changed since the preview.
+        expected_graded_ids: The graded member IDs printed by the preview
+            with overwrite_graded=True (the members the user approved
+            overwriting). Required with confirm_write=True when any member
+            is graded; the write aborts unless exactly these are graded.
     """
     return grade_answer_group(
         course_id, question_id, group_id,
         rubric_item_ids, point_adjustment, comment, confirm_write,
         overwrite_graded=overwrite_graded,
         expected_member_count=expected_member_count,
+        expected_graded_ids=expected_graded_ids,
     )
 
 

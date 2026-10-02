@@ -88,7 +88,7 @@ def _member_stats(subs: list[dict[str, Any]]) -> dict[str, Any]:
         "count": len(subs),
         "graded": len(graded),
         "graded_individually": len(individually),
-        "graded_ids": [str(s.get("id")) for s in graded],
+        "graded_ids": [_canonical_id(s.get("id")) for s in graded],
     }
 
 
@@ -110,11 +110,39 @@ def _display_title(group: dict[str, Any], limit: int = 120) -> str:
     return text
 
 
-def _format_id_list(ids: list[str]) -> str:
-    shown = ", ".join(f"`{i}`" for i in ids[:_MAX_LISTED_IDS])
-    if len(ids) > _MAX_LISTED_IDS:
-        shown += f", ... (+{len(ids) - _MAX_LISTED_IDS} more)"
+def _format_id_list(ids: list[str], limit: int | None = _MAX_LISTED_IDS) -> str:
+    shown_ids = ids if limit is None else ids[:limit]
+    shown = ", ".join(f"`{i}`" for i in shown_ids)
+    if len(ids) > len(shown_ids):
+        shown += f", ... (+{len(ids) - len(shown_ids)} more)"
     return shown or "(none)"
+
+
+def _canonical_id(value: Any) -> str:
+    """A submission ID as text; digit strings lose leading zeros, as the MCP
+    layer's IDs do, so ``"0101"``, ``"101"`` and ``101`` compare equal."""
+    text = str(value).strip().strip("`").strip()
+    if text.isascii() and text.isdigit():
+        text = str(int(text))
+    return text
+
+
+def _normalize_member_ids(ids: Any) -> list[str]:
+    """Canonical submission IDs from ``expected_graded_ids``, order kept.
+
+    Accepts strings or numbers (and backticks copied from markdown). Raises
+    ``ValueError`` for anything that is not a list of IDs.
+    """
+    if not isinstance(ids, (list, tuple)):
+        raise ValueError("expected_graded_ids must be a list of submission IDs.")
+    normalized: list[str] = []
+    for raw in ids:
+        text = "" if isinstance(raw, bool) or raw is None else _canonical_id(raw)
+        if not text:
+            raise ValueError(f"expected_graded_ids has an invalid submission ID: {raw!r}.")
+        if text not in normalized:
+            normalized.append(text)
+    return normalized
 
 
 def _fetch_answer_groups_json(
@@ -607,6 +635,7 @@ def grade_answer_group(
     confirm_write: bool = False,
     overwrite_graded: bool = False,
     expected_member_count: int | None = None,
+    expected_graded_ids: list[str] | None = None,
 ) -> str:
     """Batch-grade all submissions in an answer group at once.
 
@@ -626,6 +655,13 @@ def grade_answer_group(
     than ``group_id``, or a save URL in another course/question or through a
     submission known to be outside the group refuses the write.
 
+    Overwrite approval is tied to the members the preview listed as graded:
+    a write over graded members needs ``overwrite_graded=True`` together
+    with ``expected_graded_ids``, the graded member IDs the preview printed.
+    The write is refused, with nothing sent, when the members graded at
+    write time differ from that list (e.g. a member graded after the
+    preview). The result names the members whose grades were overwritten.
+
     Args:
         course_id: The Gradescope course ID.
         question_id: The question ID.
@@ -644,6 +680,11 @@ def grade_answer_group(
         expected_member_count: Confirmed + inferred member count shown by the
             preview. When given, the write aborts if the group's membership
             changed since the preview.
+        expected_graded_ids: The confirmed + inferred member IDs the preview
+            listed as graded (printed as ``expected_graded_ids=[...]`` by a
+            preview with ``overwrite_graded=True``). When given, the write
+            aborts unless exactly these members are graded. Required with
+            ``confirm_write=True`` when any member is graded at write time.
     """
     if not course_id or not question_id or not group_id:
         return "Error: course_id, question_id, and group_id are required."
@@ -683,6 +724,12 @@ def grade_answer_group(
         or expected_member_count < 0
     ):
         return "Error: expected_member_count must be a non-negative integer."
+
+    if expected_graded_ids is not None:
+        try:
+            expected_graded_ids = _normalize_member_ids(expected_graded_ids)
+        except ValueError as e:
+            return f"Error: {e}"
 
     try:
         conn = get_connection()
@@ -780,6 +827,19 @@ def grade_answer_group(
         )
 
     graded_total = c_stats["graded"] + i_stats["graded"]
+    graded_now = c_stats["graded_ids"] + i_stats["graded_ids"]
+    if expected_graded_ids is not None and set(expected_graded_ids) != set(graded_now):
+        newly_graded = [i for i in graded_now if i not in expected_graded_ids]
+        no_longer = [i for i in expected_graded_ids if i not in graded_now]
+        return (
+            f"Error: answer group `{group_id}`'s graded members changed since "
+            f"the preview. Graded now but not in expected_graded_ids: "
+            f"[{_format_id_list(newly_graded, None)}]; in expected_graded_ids "
+            f"but not graded now: [{_format_id_list(no_longer, None)}]. "
+            "Nothing was sent. Re-run the preview and show the user the "
+            "graded members before overwriting any of them."
+        )
+
     if graded_total and not overwrite_graded:
         return (
             f"Error: answer group `{group_id}` already has {graded_total} graded "
@@ -791,6 +851,22 @@ def grade_answer_group(
             "overwrites them. Nothing was sent; re-run with "
             "overwrite_graded=True only if the user approved overwriting "
             "existing grades."
+        )
+
+    # overwrite_graded=True alone would overwrite whichever members are
+    # graded when the write runs, including grades entered after the
+    # preview. The approval must name the graded members the preview showed.
+    if confirm_write and graded_total and expected_graded_ids is None:
+        return (
+            f"Error: answer group `{group_id}` has {graded_total} graded "
+            f"member(s) at write time (confirmed "
+            f"[{_format_id_list(c_stats['graded_ids'])}]; inferred "
+            f"[{_format_id_list(i_stats['graded_ids'])}]), and "
+            "overwrite_graded=True must come with expected_graded_ids: the "
+            "graded member IDs from the preview the user approved overwriting. "
+            "Nothing was sent. Re-run the preview with overwrite_graded=True, "
+            "show it to the user, and pass its expected_graded_ids with "
+            "confirm_write=True."
         )
 
     check_set = set(known_ids)
@@ -906,6 +982,14 @@ def grade_answer_group(
             f"expected_member_count={member_count} — pass it with "
             "confirm_write=True so the write aborts if membership changes"
         )
+        if overwrite_graded:
+            details.append(
+                f"expected_graded_ids={json.dumps(graded_now)} — the members "
+                "whose grades this write overwrites. Pass it with "
+                "confirm_write=True and overwrite_graded=True (required when "
+                "any member is graded): the write is refused if any other "
+                "member is graded by then (e.g. graded after this preview)"
+            )
         details.append(
             "group_title (student-derived):\n"
             + format_untrusted(_display_title(target_group, limit=200), "ANSWER GROUP TITLE")
@@ -984,10 +1068,26 @@ def grade_answer_group(
             "get_answer_group_detail."
         )
 
+    overwrote = ""
+    if graded_total:
+        # Every ID is listed: this is the record of which grades were
+        # replaced. They are the members expected_graded_ids approved.
+        overwrote = (
+            f"⚠️ **Overwrote existing grades** (members graded at write time): "
+            f"confirmed [{_format_id_list(c_stats['graded_ids'], None)}]"
+            + (
+                f"; inferred [{_format_id_list(i_stats['graded_ids'], None)}] "
+                "(if Gradescope applied the batch grade to inferred members)"
+                if i_stats["graded_ids"] else ""
+            )
+            + "\n"
+        )
+
     return (
         f"✅ Batch grade saved for answer group `{group_id}` "
         f"(save_many_grades returned status {status}).\n"
-        f"**Members at write time:** {c_stats['count']} confirmed + "
+        + overwrote
+        + f"**Members at write time:** {c_stats['count']} confirmed + "
         f"{i_stats['count']} inferred\n"
         f"**Rubric items checked:** {[str(ri['id']) for ri in checked_items]}\n"
         f"**Rubric items unchecked:** {[str(ri['id']) for ri in unchecked_items]}\n"

@@ -182,7 +182,7 @@ def test_every_id_parameter_requires_digits() -> None:
             props.update({f"{row_name}.{k}": v for k, v in row["properties"].items()})
         for prop, sub in props.items():
             base = prop.rsplit(".", 1)[-1]
-            is_id = base in ID_PARAMS or base == "rubric_item_ids"
+            is_id = base in ID_PARAMS or base in ("rubric_item_ids", "expected_graded_ids")
             strings = _string_schemas(sub)
             if is_id:
                 assert strings, (name, prop)
