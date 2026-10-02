@@ -95,7 +95,7 @@ the private local cache).
 | Tool | Kind | Description |
 |------|------|-------------|
 | `tool_apply_grade` | write | Set one submission's rubric items, point adjustment and comment; an already graded submission needs `overwrite_graded`; reads the score back |
-| `tool_apply_grade_batch` | write | Grade up to 50 submissions of one question in one call; typed rows, graded rows skipped unless `overwrite_graded`, per-row read-back |
+| `tool_apply_grade_batch` | write | Grade up to 50 submissions of one question in one call; typed rows, a graded row skipped unless that row has `overwrite: true`, per-row read-back |
 | `tool_create_rubric_item` | write | Create a rubric item (positive weight; ADD/DEDUCT shown in the preview) |
 | `tool_update_rubric_item` | write | Update an existing rubric item's description or weight |
 | `tool_delete_rubric_item` | write | Delete a rubric item (removes it from every submission) |
@@ -114,7 +114,7 @@ the private local cache).
 |------|------|-------------|
 | `tool_get_answer_groups` | read-only | AI-clustered answer groups with sizes, graded counts and inferred members |
 | `tool_get_answer_group_detail` | read-only | One group's members, crops and graded counts (confirmed and inferred) |
-| `tool_grade_answer_group` | write | Grade every member of one group; `overwrite_graded` and `expected_member_count` guards |
+| `tool_grade_answer_group` | write | Grade every member of one group; `overwrite_graded` + `expected_graded_ids` and `expected_member_count` guards |
 
 ### Regrades
 | Tool | Kind | Description |
@@ -156,8 +156,9 @@ message instead of content.
 Despite its name, `auto_grade_question` does not grade on its own: it tells
 the agent to preview each batch (at most 50 rows) with
 `tool_apply_grade_batch(confirm_write=False)` and to write only the rows the
-user explicitly approves. Already graded rows are written only if the user
-approves overwriting them, after a new preview with `overwrite_graded=True`.
+user explicitly approves. An already graded row is written only if the user
+approves overwriting that row's grade: the row gets `"overwrite": true` and
+the batch is previewed again.
 `review_regrade_requests` likewise previews each approved change with
 `tool_apply_grade(overwrite_graded=True, confirm_write=False)` (a regraded
 submission is already graded) and repeats that call with
@@ -308,16 +309,20 @@ submission is already graded) and repeats that call with
 - `confidence` (optional): below 0.6 the grade is not written; 0.6 to 0.8
   inclusive it is written but flagged NEEDS HUMAN REVIEW; above 0.8 it is
   normal. NaN and infinite values are rejected.
-- Already graded submissions are not overwritten by default.
+- Already graded submissions are not overwritten by default, and an
+  overwrite approval covers only the grades the user saw.
   `tool_apply_grade` refuses one (`Error: submission ... is already
-  graded`) and `tool_apply_grade_batch` skips such rows unless
-  `overwrite_graded=True`; set it only after the user approved overwriting
-  those grades. The graded state is re-read when the write runs, so a
-  grade entered after the preview (for example by another grader) is
-  protected too; the batch lists such rows under "Not written: already
-  graded at write time". With `overwrite_graded=True` the result names
-  every grade it overwrote. A graded submission that already holds
-  exactly the requested grade is reported as such, and nothing is sent.
+  graded`) unless `overwrite_graded=True`. `tool_apply_grade_batch` has no
+  batch-wide flag: a graded row is skipped unless that row has
+  `"overwrite": true`, and the preview refuses `"overwrite": true` on a row
+  that is not graded (there it could only overwrite a grade entered after
+  the preview). Set either only after the user approved overwriting those
+  grades. The graded state is re-read when the write runs, so a grade
+  entered after the preview (for example by another grader) is protected
+  too: the batch lists such rows under "Not written: already graded at
+  write time", whatever the other rows carry. The result names every grade
+  it overwrote. A graded submission that already holds exactly the
+  requested grade is reported as such, and nothing is sent.
 - The grade is posted to the save URL of the grading page Gradescope
   serves. If that page belongs to another submission, nothing is sent:
   `tool_apply_grade` returns an Error, the batch preview refuses the batch,
@@ -326,15 +331,23 @@ submission is already graded) and repeats that call with
   the input schema); a larger batch is refused before any request, so split
   it. Rows accept only `submission_id` (required and unique; `"031"` and
   `"31"` are the same row), `rubric_item_ids`, `point_adjustment`,
-  `comment` and `confidence`. The preview loads every row and marks
-  already graded rows as SKIPPED (or OVERWRITTEN with
-  `overwrite_graded=True`); execution re-reads each row before saving it
-  and reports the scores read back from Gradescope.
+  `comment`, `confidence` and `overwrite`. The preview loads every row and
+  marks already graded rows as SKIPPED (or OVERWRITTEN when the row has
+  `"overwrite": true`); execution re-reads each row before saving it and
+  reports the scores read back from Gradescope. Leave rows the preview
+  marked SKIPPED out of the confirmed call: execution cannot know what the
+  preview showed, so such a row is written if its grade was cleared in
+  the meantime.
 
 ### Answer groups
 - `tool_grade_answer_group` refuses (with an Error listing them) when any
   confirmed or inferred member is already graded, unless
-  `overwrite_graded=True`. Set that only with the user's approval.
+  `overwrite_graded=True`. Set that only with the user's approval. Its
+  preview then prints `expected_graded_ids`, the graded members whose
+  grades the write overwrites; `confirm_write=True` over graded members
+  is refused without that list, and refused when the members graded by
+  then differ from it (for example a member graded after the preview).
+  The result names the members whose grades were overwritten.
 - The grade page must belong to the requested group. A redirect to another
   group's page (or to a page that does not name the group), a page for
   another `answer_group`, or a save URL outside the course and question or

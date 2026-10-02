@@ -27,7 +27,7 @@ The agent is not a silent auto-grader. Its job is to:
 - Skip ambiguity. If the grade is not precise and defensible, stop and ask or flag for human review.
 - Preserve user authority. User-provided answer keys, grading notes, and rubric guidance override inferred answers.
 - Prefer structured output. When a tool supports `output_format` (`tool_get_submission_grading_context`, `tool_get_next_ungraded`, `tool_get_answer_groups`, `tool_get_answer_group_detail`, `tool_export_assignment_scores`), prefer `output_format="json"` for planning.
-- Default to preserving existing grades. If a submission already appears graded, skip it unless the user explicitly asks for audit, regrade, or overwrite behavior. The grade tools enforce this: `tool_apply_grade`, `tool_apply_grade_batch` and `tool_grade_answer_group` do not write over a graded submission unless `overwrite_graded=True`, which you pass only after the user approved overwriting those grades.
+- Default to preserving existing grades. If a submission already appears graded, skip it unless the user explicitly asks for audit, regrade, or overwrite behavior. The grade tools enforce this, and the approval is always tied to the grades the user saw: `tool_apply_grade` needs `overwrite_graded=True`, a `tool_apply_grade_batch` row needs its own `"overwrite": true` (there is no batch-wide flag), and `tool_grade_answer_group` needs `overwrite_graded=True` plus the `expected_graded_ids` its preview printed. Pass them only after the user approved overwriting those grades.
 - Default to no submission-specific comment. Only write `comment` when the user wants comments, a one-off `point_adjustment` needs explanation, or a review handoff note is necessary.
 - Do not confuse "leave unchanged" with "clear". In `tool_apply_grade` and in each `tool_apply_grade_batch` row, `rubric_item_ids=None` means keep current rubric state, while `rubric_item_ids=[]` means clear all rubric items.
 - In `tool_grade_answer_group`, `rubric_item_ids` is required and is the exact set checked for every member; every other rubric item is unchecked. `[]` clears every rubric item for every member (allowed only together with a `point_adjustment` or `comment`).
@@ -241,8 +241,8 @@ but `tool_get_grading_progress` reports 11/39 graded. Cause: the 28
 full-credit submissions had empty rubric. Fix: re-batch with
 `rubric_item_ids=["<correct_item_id>"]` on those 28; scores stay the
 same and the dashboard catches up. If the preview marks any of those rows
-as already graded (SKIPPED), ask the user before re-previewing with
-`overwrite_graded=True`.
+as already graded (SKIPPED), ask the user; add `"overwrite": true` only to
+the rows they approve and preview again.
 
 ### Reference priority
 
@@ -288,8 +288,8 @@ editor, or via a future MCP tool):
    at 3/3 (no items applied = no deductions) is now at 0/3 (no items
    applied = no awards). You must re-batch grades with the correct items
    per student — renaming alone is **not** enough. Those submissions are
-   already graded, so the batch skips them unless the user approves
-   `overwrite_graded=True`.
+   already graded, so the batch skips each row unless the user approves
+   overwriting it and the row carries `"overwrite": true`.
 4. The safest rollback path when the switch was a mistake is: flip
    `scoring_type` back to its original value. Existing items + applied
    item state then reproduce the original scores with no batch needed.
@@ -400,6 +400,7 @@ Inferred-member safety:
 Already-graded members:
 - If any confirmed or inferred member is already graded, `tool_grade_answer_group` returns an Error listing them unless `overwrite_graded=True`, even for a preview
 - Default to not overwriting. Show the user the listed members and ask; only if they explicitly approve overwriting those grades, preview again with `overwrite_graded=True` (still `confirm_write=False`) and keep it on the approved write
+- That preview prints `expected_graded_ids=[...]`, the graded members whose grades the write overwrites. The approved write must pass it: with graded members, `confirm_write=True` is refused without it, and refused when the members graded by then differ (for example a member graded after the preview). Nothing is sent in either case; preview again and ask the user about the new list
 
 Preview first:
 - Call `tool_grade_answer_group(..., confirm_write=False)`
@@ -419,8 +420,9 @@ Example approval question:
 - "Apply this rule to answer group `17`? Confirmed: 12 (0 graded), inferred: 3 (1 graded, would be overwritten), check `[101, 104]`, uncheck `[102, 103]`, projected 8/10 each, no comment, no point adjustment."
 
 Only after explicit approval:
-- Call `tool_grade_answer_group(..., confirm_write=True, expected_member_count=<count from the preview>)`, adding `overwrite_graded=True` only if the user approved overwriting
-- The write aborts if the group's membership changed since the preview; preview again in that case
+- Call `tool_grade_answer_group(..., confirm_write=True, expected_member_count=<count from the preview>)`, adding `overwrite_graded=True` and `expected_graded_ids=<list from the preview>` only if the user approved overwriting those members' grades
+- The write aborts if the group's membership or its set of graded members changed since the preview; preview again in that case
+- After an overwrite, the result names the members whose grades were overwritten; show them to the user
 - The result's read-back line reports Gradescope's graded flags only; spot-check a few members with `tool_get_submission_grading_context(..., output_format="json")`
 
 If the group is too ambiguous or the batch write looks risky:
@@ -547,13 +549,13 @@ Only after explicit approval:
 
 For large classes, per-submission approval may be too slow. Use `tool_apply_grade_batch` for one question at a time:
 
-1. Build one row per submission, at most 50 rows per call (a larger batch is refused; split it). A row accepts only `submission_id` (required, unique within the batch; `"031"` and `"31"` are the same row), `rubric_item_ids`, `point_adjustment`, `comment` and `confidence`; an omitted key keeps the current value, and any other key (for example `rubric_items`) is rejected by the schema.
-2. Preview with `tool_apply_grade_batch(course_id, question_id, grades=[...], confirm_write=False)`. The preview loads every row's grading page and shows the current score, the items to check and uncheck, the projected score and the confidence. Already graded rows are marked SKIPPED (they will not be written) unless `overwrite_graded=True`, which marks them OVERWRITTEN; rows that already hold exactly the requested grade will not be re-sent. It also warns about rows flagged NEEDS HUMAN REVIEW (confidence 0.6 to 0.8); rows below 0.6 are skipped. One invalid row (duplicate `submission_id`, unknown rubric ID, malformed number, a grading page that belongs to another submission) refuses the whole batch, and nothing is written.
-3. Present a compact table, including every SKIPPED, OVERWRITTEN and NEEDS HUMAN REVIEW warning, and ask the user for a bounded approval round of 10-30 submissions. Only if the user explicitly approves overwriting the graded rows, preview the batch again with `overwrite_graded=True` and show that preview.
-4. Execute only the approved rows, exactly as previewed (with the same `overwrite_graded` value), with `confirm_write=True`. If the user changes or drops a row, preview the changed batch again and get approval for it.
-5. Read the result: succeeded / failed / skipped / needs-review counts, the score each row read back from Gradescope, and any read-back mismatches. Stop on any failure or mismatch and re-read that submission with `tool_get_submission_grading_context(..., output_format="json")`. Show the user every row under "Not written: already graded at write time" (graded after the preview, possibly by another grader; don't re-send it without approval), every "OVERWROTE existing grade" note, and the rows under "Already holding the requested grade (nothing sent)".
+1. Build one row per submission, at most 50 rows per call (a larger batch is refused; split it). A row accepts only `submission_id` (required, unique within the batch; `"031"` and `"31"` are the same row), `rubric_item_ids`, `point_adjustment`, `comment`, `confidence` and `overwrite`; an omitted key keeps the current value, and any other key (for example `rubric_items`) is rejected by the schema. Leave `overwrite` out at first.
+2. Preview with `tool_apply_grade_batch(course_id, question_id, grades=[...], confirm_write=False)`. The preview loads every row's grading page and shows the current score, the items to check and uncheck, the projected score and the confidence. Already graded rows are marked SKIPPED (they will not be written) unless the row has `"overwrite": true`, which marks it OVERWRITTEN; rows that already hold exactly the requested grade will not be re-sent. It also warns about rows flagged NEEDS HUMAN REVIEW (confidence 0.6 to 0.8); rows below 0.6 are skipped. One invalid row (duplicate `submission_id`, unknown rubric ID, malformed number, a grading page that belongs to another submission, `"overwrite": true` on a row that is not graded) refuses the whole batch, and nothing is written.
+3. Present a compact table, including every SKIPPED, OVERWRITTEN and NEEDS HUMAN REVIEW warning, and ask the user for a bounded approval round of 10-30 submissions. Overwrite approval is per row: only for a graded row whose grade the user explicitly approves overwriting, add `"overwrite": true` to that row (never to the other rows), preview the batch again and show that preview.
+4. Execute only the approved rows, exactly as previewed (each row's `overwrite` key included), with `confirm_write=True`. Leave out the rows the preview marked SKIPPED: the write re-reads each row but cannot know what the preview showed, so a SKIPPED row left in is written if its grade is cleared before then. Dropping SKIPPED rows needs no new preview; if the user changes or drops any other row, preview the changed batch again and get approval for it.
+5. Read the result: succeeded / failed / skipped / needs-review counts, the score each row read back from Gradescope, and any read-back mismatches. Stop on any failure or mismatch and re-read that submission with `tool_get_submission_grading_context(..., output_format="json")`. Show the user every row under "Not written: already graded at write time" (graded after the preview, possibly by another grader, and without `"overwrite": true`; don't re-send it without approval), every "OVERWROTE existing grade" note (a row with `"overwrite": true` overwrites the grade it holds at write time, so compare it with the previewed grade), and the rows under "Already holding the requested grade (nothing sent)".
 
-Leave already-graded submissions out of a batch unless the user approved overwriting them; `overwrite_graded=True` is only for grades the user approved overwriting.
+Leave already-graded submissions out of a batch unless the user approved overwriting them; `"overwrite": true` goes only on the rows whose grades the user approved overwriting.
 
 Suggested table shape:
 
@@ -651,7 +653,7 @@ Use this default order unless the user directs otherwise:
 8. `tool_get_answer_groups` to choose batch vs individual grading
 9. `tool_list_question_submissions(filter="ungraded")` for ID planning or parallel work
 10. Answer-group path:
-    `tool_get_answer_group_detail` -> `tool_grade_answer_group(confirm_write=False)` -> approval question -> `tool_grade_answer_group(confirm_write=True, expected_member_count=...)`
+    `tool_get_answer_group_detail` -> `tool_grade_answer_group(confirm_write=False)` -> approval question -> `tool_grade_answer_group(confirm_write=True, expected_member_count=...)` (plus `overwrite_graded=True, expected_graded_ids=...` when the user approved overwriting graded members)
 11. Individual path:
     `tool_get_submission_grading_context` -> `tool_assess_submission_readiness` if needed -> `tool_smart_read_submission` if needed -> `tool_cache_relevant_pages` if needed -> preview (`tool_apply_grade` or `tool_apply_grade_batch` with `confirm_write=False`) -> approval question or batch approval table -> execute the approved rows with `confirm_write=True`
 12. `tool_get_assignment_statistics`
