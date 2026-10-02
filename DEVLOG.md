@@ -6,6 +6,211 @@
 
 ---
 
+## Session 11 — 2026-10-02: Hardening Pass (Write Safety, Sessions, Interface, Docs)
+
+### Why
+
+A multi-agent code review of the Session 10 state (findings V1-V4) found
+writes that could do more than their previews showed, missing session-expiry
+handling, a credential leak path, a shared world-readable cache, and an MCP
+surface and docs that had drifted from the code. This session fixes them in
+focused commits (`d9d81ca`..`bd8cede`) plus this documentation update. Where
+correct behavior depends on Gradescope behavior that can't be observed
+offline, the code takes the conservative option and says so.
+
+### Grade-write validation (`grading_ops.py`, `answer_groups.py`)
+
+- Unknown or stale rubric item IDs are refused before anything is sent
+  (V1-3). Previously the write went ahead with every listed item silently
+  dropped and all other items sent unchecked; `tool_apply_grade_batch` wrote
+  such rows with a warning. Integer and backticked IDs are normalized (V1-2).
+- `tool_apply_grade` previews the student, current score, the items it will
+  CHECK and UNCHECK, the resolved adjustment and comment, and the projected
+  score; the result reports the score read back from Gradescope (V1-8).
+- The documented confidence tiers now exist in code (V1-4): below 0.6
+  nothing is written; 0.6 to 0.8 inclusive is written but flagged NEEDS
+  HUMAN REVIEW; NaN/inf are rejected.
+- `tool_apply_grade_batch` (V1-9): unknown keys, duplicate submission IDs
+  and malformed numbers refuse the batch; the preview loads every row and
+  flags rows that would be OVERWRITTEN; execution re-reads each row right
+  before saving and reads it back afterwards.
+- Rubric CRUD (V1-5): negative weights need `allow_negative=True`; previews
+  state the ADD/DEDUCT effect; create warns about duplicates and treats a
+  non-JSON success as an unknown result; update/delete verify the item
+  exists and read the rubric back.
+- `tool_grade_answer_group` (V1-6, V1-7): everything is validated before the
+  preview; already-graded members need `overwrite_graded=True`;
+  `expected_member_count` aborts the write if membership changed; the
+  preview lists checked and unchecked items and the projected score; the
+  POST no longer follows redirects and needs a JSON 2xx to count as saved.
+
+### Dates and timezones (`assignments.py`, `extensions.py`)
+
+- Date inputs need an explicit time (`YYYY-MM-DDTHH:MM`); bare dates,
+  non-zero seconds and impossible dates are rejected; `""` means unset.
+- `tool_modify_assignment_dates` used to send empty values for omitted
+  dates and `allow_late_submissions=0` unless a late due date was given,
+  while its preview showed only the supplied dates (V1-1). It now merges the
+  current values from the assignment settings, keeps the late-submission flag
+  unless `late_due_date` is given, refuses when a value it must keep is
+  unreadable, and verifies by re-reading the settings.
+- `tool_set_extension` interpreted naive dates in the server host's timezone
+  (V2-2). Naive dates now use the course timezone from the extensions page
+  or the new `timezone` argument; offset dates are absolute; the order is
+  checked; the preview shows the UTC instants and the current extension,
+  and the write is read back.
+
+### Read-side correctness
+
+- Grading progress follows the outline numbering and no longer falls back to
+  another assignment's data (V3-5); outline subparts render (nested rows).
+- Student lookups match email case-insensitively; scores CSV responses that
+  are HTML are rejected; the export summary reports what its statistics are
+  based on (V3-6, V3-8). `tool_get_student_assignment_link` accepts
+  `student_email` (V3-7).
+- Statistics no longer delete the overall table and tolerate undefined
+  values (V3-9, V3-10).
+- Regrade completion needs positive evidence; unreadable rows are ❓ unknown;
+  regrade detail shows the current score, adjustment, comment and scoring
+  direction (V3-11, V3-12).
+- Graders are read from the grader column by header and described as who
+  last graded (V3-13); extension 401 handling no longer matches IDs
+  containing "401" (V3-14); the submissions fallback table is read by
+  header, and roster rows that can't be parsed are reported instead of
+  dropped.
+- `tool_list_question_submissions` reports `graded: null` when unknown
+  (V3-2); `tool_get_next_ungraded` stays within the question, wraps around,
+  and returns an Error instead of a false "all graded" (V3-1);
+  `tool_get_student_submission_map` keys students by email (V3-3); the
+  grading context lists crop pages ±1 instead of the first few pages and
+  reports `page_count` (V3-4).
+- Student-authored text (typed answers, regrade messages, answer-group
+  titles and inferred answers) is returned in `<<<BEGIN UNTRUSTED ...>>>`
+  blocks or flagged in JSON (V2-8). Answer-group counts are consistent
+  between listing and detail (V3-16).
+- Uploads (V2-7): absolute regular files up to 100 MB; hidden and
+  credential-like files and system directories refused; optional
+  `GRADESCOPE_MCP_UPLOAD_ROOT`; the preview shows SHA-256.
+
+### Workflow and readiness (`grading_workflow.py`)
+
+- Readiness is described and computed as pre-read context, not grading
+  confidence (V4-1). It now uses per-submission signals (student work
+  located, placeholder pages, crop pages missing from the submission), and
+  "no student work" is capped at `not_ready`.
+- All workflow tools collect and score the same pages, so they report the
+  same readiness for a submission (V4-2).
+- The grading artifact includes `scoring_type`, `floor`, `ceiling` and
+  signed rubric effects (V4-6), and a rubric summary is labelled "not a
+  reference answer" (V4-3). Outline failures are reported as unknown
+  instead of "expected for scanned PDFs" (V4-5).
+- Assignment resolution falls back when a given `assignment_id` is wrong or
+  inaccessible and memoizes per process (V4-4).
+- `tool_cache_relevant_pages` caches all pages by default in the
+  implementation too, checks image bytes, names unnumbered pages uniquely,
+  lists failed pages while keeping the rest, and no longer sends the CSRF
+  header to third-party image hosts (V4-7).
+- The answer key skips group headers, keeps weight-0 leaves and sorts by
+  label (V4-8); smart-read merges Tiers 1-2 (same page image), lists every
+  other page and shows typed answers (V4-9).
+
+### Cache hardening (`cache.py`)
+
+- The shared `/tmp/gradescope-mcp` root (created with default permissions,
+  adoptable by another user, symlink-following writes) is replaced by a
+  private per-user root: `GRADESCOPE_MCP_CACHE_DIR`, else
+  `$XDG_RUNTIME_DIR/gradescope-mcp`, else `<tempdir>/gradescope-mcp-<uid>`
+  (V2-4). Directories are 0700, files 0600, written atomically through
+  `O_EXCL | O_NOFOLLOW` temp files; unsafe roots are refused.
+- `tests/conftest.py` gives every test its own cache and no credentials
+  (V4-12).
+
+### Authentication and session recovery (`auth.py`, `server.py`)
+
+- gradescopeapi's login sent the credentials as URL query parameters, and a
+  connect failure could carry that URL (with the password) into tool output
+  (V2-1). The server now logs in itself with a form body and scrubs
+  credentials from every message.
+- A rejected login is cached: later calls fail fast without contacting
+  Gradescope until the credentials change.
+- Every request has a default timeout (10 s connect, 60 s read;
+  `GRADESCOPE_MCP_HTTP_TIMEOUT`) through `TimeoutHTTPAdapter` (V2-6).
+- Session expiry is detected by a response hook (`SessionExpiredError`)
+  before redirects are followed, and every tool and resource re-runs once
+  on a fresh login (V2-3). The unused, flawed opt-in helpers
+  `with_session_retry`, `request_with_retry` and
+  `is_session_expired_response` were removed.
+
+### Interface, annotations and prompts (`server.py`, `tools/common.py`)
+
+- All 38 tools carry complete `ToolAnnotations` and a title; the 11
+  `confirm_write` tools are `destructiveHint`, 3 local-cache tools are
+  neither read-only nor destructive.
+- IDs are validated as digit strings at the schema layer (numbers accepted)
+  before any URL is built (V2-5). Batch rows are a strict `GradeRow` type;
+  `output_format` and `filter` are enums; the workflow tools require
+  `question_id` / `submission_id`.
+- Handled failures (`Error`, `Authentication error`, `❌`) are returned with
+  `isError: true`; resources raise JSON-RPC errors; tools return text only
+  (no duplicated `structuredContent`) (V2-9).
+- New wrapper parameters: `output_format` on the grading context,
+  `allow_negative`, `timezone`, `overwrite_graded`, `expected_member_count`
+  and `student_email`.
+- All 7 prompts were rewritten so none reaches a write without a preview and
+  explicit approval; `auto_grade_question` is an approval-gated batch flow
+  (V4-10).
+- The crop-page selection rule is shared in `tools/common.py` (V4-13).
+
+### Documentation (this commit)
+
+- `README.md`, `AGENT.md` and the skill were checked against the code:
+  complete tool inventory with annotation kinds, configuration and
+  environment variables, write safety, `isError`, dates and timezones,
+  untrusted text, cache location, authentication; the skill now uses
+  `tool_apply_grade_batch`, the answer-group guards, the confidence tiers
+  as implemented, and paths printed by the tools.
+- The skill installs into a client skills directory (for Claude Code
+  `~/.claude/skills/`), not `/tmp`. `OPERATIONS_LOGS/` is documented as a
+  local, untracked log (it was referenced but never shipped).
+- `.env.example` lists the optional variables; the root-anchored
+  `/tmp/gradescope-*` line, which could never match the system `/tmp`, was
+  removed from `.gitignore`.
+- `tests/test_docs_consistency.py` checks the stated counts, inventories,
+  prompt and resource tables, tool and parameter names used in the docs,
+  documented environment variables, the confidence thresholds and the
+  project tree against the code. README and AGENT no longer state a test
+  count; it is recorded here.
+
+### Corrections to earlier entries
+
+- Session 7 item 4 said `prepare_grading_artifact` and
+  `assess_submission_readiness` produce identical readiness scores. They fed
+  different page lists into the score until this session.
+- Sessions 8-10 describe `/tmp/gradescope-mcp` as the cache root; see Cache
+  hardening above.
+- The May 2026 commits (`924e1ab`, `2b4d052`, `e18c629`, `1e9743b`) were not
+  logged: they added `tool_apply_grade_batch`,
+  `tool_get_student_submission_map`, `tool_get_student_assignment_link`, the
+  JSON score export, fixes surfaced by an earlier review, and the opt-in
+  auth retry helpers removed above.
+
+### Behavior changes for MCP clients
+
+- Failures now arrive with `isError: true`; schema errors read
+  `Error executing tool <name>: ... validation error ...`.
+- Numeric IDs are accepted; non-numeric IDs, unknown batch-row keys and
+  values outside an enum are rejected before the tool runs.
+- `tool_grade_answer_group` requires `rubric_item_ids`; the four workflow
+  tools take `question_id` / `submission_id` as required arguments.
+- Results no longer include `structuredContent`.
+
+### Current state
+
+- **38 tools** + **3 resources** + **7 prompts**
+- **482 automated tests** (`uv run pytest -q`), all passing
+
+---
+
 ## Session 10 — 2026-09-29: Upgrade To MCP Python SDK v2 And gradescopeapi 1.8.1
 
 ### What was done
@@ -84,6 +289,8 @@
 - `OPERATIONS_LOGS/RECORDS.md`
   - Converted from a minimal placeholder into a clearer mutation-log template
   - Added logging rules for sensitive data handling and rollback expectations
+  - *Note (2026-10-02): `OPERATIONS_LOGS/` is gitignored, so this file was
+    only ever local and is not in the repository.*
 
 - `.env.example`
   - Clarified that `.env` is loaded automatically by the module entry point
@@ -223,6 +430,7 @@ Systematic code review identified 12+ potential bugs; 10 were confirmed as real 
 
 4. **Readiness score inconsistency** (`grading_workflow.py`):
    - Same root cause as item 3. Both `prepare_grading_artifact` and `assess_submission_readiness` now produce identical scores.
+   - *Correction (2026-10-02): they still scored different page lists; see Session 11.*
 
 #### High-priority fixes
 5. **`get_assignment_outline` missing question IDs** (`grading.py`):
