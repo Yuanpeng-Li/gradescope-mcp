@@ -727,3 +727,76 @@ def test_outline_renders_nested_subparts(monkeypatch) -> None:
     assert [n["id"] for n in tree] == [1]
     assert [n["id"] for n in tree[0]["children"]] == [2]
     assert [n["id"] for n in tree[0]["children"][0]["children"]] == [4, 3]
+
+
+# ---------------------------------------------------------------------------
+# V3-9 / V3-10 — statistics
+# ---------------------------------------------------------------------------
+
+SUMMARY = {"mean": 0.8, "median": 0.85, "min": 0.1, "max": 1.0, "standardDeviation": 0.12, "reliability": "--"}
+Q_STATS = {
+    "11": {"title": "1.1", "weight": 5, "mean": 0.9, "graded": 30, "standardDeviation": 0.1},
+    "12": {"title": "1.2", "weight": 5, "mean": 0.0, "graded": 0, "standardDeviation": 0.0},
+    "13": {"title": "1.10", "weight": 5, "mean": 0.5, "graded": 30, "standardDeviation": 0.1},
+}
+
+
+def _stats(monkeypatch, info: dict) -> str:
+    router = Router()
+    router.add("GET", "/statistics.json", FakeResp(200, json_obj={"assignment_statistics_info": info}))
+    _install(monkeypatch, router, statistics)
+    return statistics.get_assignment_statistics("1", "2")
+
+
+def test_statistics_keeps_overall_table_and_omits_orphan_headings(monkeypatch) -> None:
+    base = {"assignment": {"title": "HW1", "totalPoints": 15}, "assignmentFullyGraded": True}
+
+    # A: per-question stats but no questionAverages.
+    out = _stats(monkeypatch, {**base, "summaryStatistics": {"assignment": SUMMARY, "questions": Q_STATS}})
+    assert "| Mean | 80.0% (12.0/15.0) |" in out
+    assert "| Std Dev | 12.0% |" in out
+    assert "### Per-Question Statistics" in out
+
+    # B: all three present -> no empty averages heading.
+    out = _stats(monkeypatch, {
+        **base, "summaryStatistics": {"assignment": SUMMARY, "questions": Q_STATS},
+        "questionAverages": [["1.1", 90.0]],
+    })
+    assert "### Per-Question Averages" not in out
+    assert "| Mean | 80.0%" in out
+
+    # C: no assignment summary -> the Fully graded line survives.
+    out = _stats(monkeypatch, {**base, "summaryStatistics": {"questions": Q_STATS}})
+    assert "**Fully graded:** Yes" in out
+
+    # Only questionAverages -> the simple table is rendered.
+    out = _stats(monkeypatch, {**base, "questionAverages": [["1.10", 50.0], ["1.2", 90.0]]})
+    assert "### Per-Question Averages" in out
+    assert out.index("| 1.2 |") < out.index("| 1.10 |")
+
+
+def test_statistics_tolerates_null_and_placeholder_values(monkeypatch) -> None:
+    base = {"assignment": {"title": "HW1", "totalPoints": 15}, "assignmentFullyGraded": False}
+    for bad in (None, "--"):
+        out = _stats(monkeypatch, {
+            **base,
+            "summaryStatistics": {
+                "assignment": {**SUMMARY, "mean": bad},
+                "questions": {"12": {"title": "1.2", "weight": 5, "mean": bad, "graded": 3}},
+            },
+        })
+        assert "| Mean | — |" in out
+        assert "| 1.2 | 5 | — | 3 |" in out
+
+
+def test_statistics_skips_ungraded_low_flags_and_sorts_naturally(monkeypatch) -> None:
+    out = _stats(monkeypatch, {
+        "assignment": {"title": "HW1", "totalPoints": 15}, "assignmentFullyGraded": False,
+        "summaryStatistics": {"assignment": SUMMARY, "questions": Q_STATS},
+    })
+    table = out[out.index("### Per-Question Statistics"):]
+    assert table.index("| 1.2 |") < table.index("| 1.10 |")
+    low = out[out.index("Low-Scoring"):]
+    assert "**1.10**" in low
+    assert "**1.2**" not in low  # graded == 0: mean 0 says nothing yet
+    assert "Grading is not complete" in out
