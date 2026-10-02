@@ -663,3 +663,106 @@ def test_cache_tool_drops_a_stalled_page_on_time_and_keeps_the_rest(monkeypatch,
     assert text.startswith("Cached 1 of 2 relevant page(s)")
     assert re.search(r"page 1: download took longer than 0\.5 s \(\d+ bytes received\); stopped", text)
     assert "page_2.jpg" in text
+
+
+# ---------------------------------------------------------------------------
+# [10] Regrade completion: only specific, visible evidence is ✅
+# ---------------------------------------------------------------------------
+
+
+def _regrade_rows(cells: list[str]) -> str:
+    rows = "".join(
+        f"<tr><td>S{i}</td><td>1.1</td><td>TA</td><td>{cell}</td>"
+        f"<td><a href='/courses/1/questions/11/submissions/{i}/grade'>Review</a></td></tr>"
+        for i, cell in enumerate(cells, 1)
+    )
+    return (
+        "<html><title>Regrade Requests</title><table><thead><tr><th>Student</th>"
+        "<th>Question</th><th>Grader</th><th>Completed</th><th></th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></html>"
+    )
+
+
+def _regrades(monkeypatch, cells: list[str]) -> str:
+    page = _regrade_rows(cells)
+    session = SimpleNamespace(get=lambda url, **_kw: SimpleNamespace(status_code=200, text=page))
+    conn = SimpleNamespace(gradescope_base_url="https://gs.test", session=session)
+    monkeypatch.setattr(regrades, "get_connection", lambda: conn)
+    return regrades.get_regrade_requests("1", "2")
+
+
+@pytest.mark.parametrize("cell, status", [
+    # Reviewer probe Q4/icons2.py: each of these was ✅ (or ❓ for the checked input).
+    ('<i class="fa fa-check d-none"></i>', "❓"),
+    ('<i class="fa fa-check" style="display:none"></i>', "❓"),
+    ('<i class="fa fa-check" hidden></i>', "❓"),
+    ('<span class="check"></span>', "❓"),
+    ('<input type="checkbox" class="check">', "⏳"),
+    ('<input type="checkbox" checked>', "✅"),
+    # Hidden by an enclosing element or by visibility.
+    ('<span class="d-none"><i class="fa fa-check"></i></span>', "❓"),
+    ('<i class="fa fa-check" style="visibility: hidden"></i>', "❓"),
+    ('<i class="fa fa-check invisible"></i>', "❓"),
+    # Generic CSS-checkbox classes are not check icons.
+    ('<span class="checkmark"></span>', "❓"),
+    ('<span class="check-mark"></span>', "❓"),
+    # Greyed-out or screen-reader-only check icons are not visible evidence.
+    ('<i class="fa fa-check text-muted"></i>', "❓"),
+    ('<span class="is-disabled"><i class="fa fa-check"></i></span>', "❓"),
+    ('<svg class="icon--inactive"><use href="#check"></use></svg>', "❓"),
+    ('<i class="fa fa-check sr-only"></i>', "❓"),
+    # Checkboxes are read by their state only.
+    ('<input type="checkbox" class="sr-only" checked><span class="checkmark"></span>', "✅"),
+    ('<input type="checkbox" class="d-none" checked><span class="check"></span>', "❓"),
+    ('<label><input type="checkbox"> Completed</label>', "⏳"),
+    ('<div role="checkbox" aria-checked="true"></div>', "✅"),
+    ('<div role="checkbox" aria-checked="false"></div>', "⏳"),
+    ('<input type="checkbox" checked><input type="checkbox">', "❓"),
+    # Hidden text and labels are ignored; sr-only text still counts.
+    ('<span class="d-none">Completed</span>', "❓"),
+    ('<span class="d-none">Completed</span><span>Pending</span>', "⏳"),
+    ('<i class="fa fa-check d-none" title="Completed"></i>', "❓"),
+    ('<i class="fa fa-check" aria-hidden="true"></i><span class="sr-only">Completed</span>', "✅"),
+    # Visible, specific evidence is still ✅.
+    ('<i class="fa fa-check"></i>', "✅"),
+    ('<i class="fa fa-check" aria-hidden="true"></i>', "✅"),
+    ('<svg><use href="/icons.svg#check"></use></svg>', "✅"),
+    ('<span class="glyphicon glyphicon-ok"></span>', "✅"),
+    ("", "⏳"),
+])
+def test_regrade_completion_needs_specific_visible_evidence(monkeypatch, cell, status) -> None:
+    out = _regrades(monkeypatch, [cell])
+    assert f"| 1 | {status} | S1 | 1.1 | TA | qid=11, sid=1 |" in out
+
+
+def test_same_check_element_hidden_for_open_requests_does_not_hide_them(monkeypatch) -> None:
+    """The finding's scenario: every row renders the same check element and
+    open requests hide it. Before the fix all three rows were ✅ and the
+    review prompt would skip the two open requests."""
+    out = _regrades(monkeypatch, [
+        '<i class="fa fa-check"></i>',
+        '<i class="fa fa-check d-none"></i>',
+        '<i class="fa fa-check" style="display: none"></i>',
+    ])
+    assert "**Pending:** 0 | **Completed:** 1 | **Unknown:** 2 | **Total:** 3" in out
+
+    out = _regrades(monkeypatch, ['<span class="check"></span>'] * 3)
+    assert "**Completed:** 0" in out and "**Unknown:** 3" in out
+
+
+def test_classifying_a_cell_does_not_change_the_page() -> None:
+    soup = BeautifulSoup(
+        '<table><tr><td><i class="fa fa-check d-none"></i><span class="d-none">x</span></td></tr></table>',
+        "html.parser",
+    )
+    cell = soup.find("td")
+    before = str(cell)
+
+    assert regrades._classify_completion(cell) is None
+    assert str(cell) == before
+
+
+def test_regrade_docstring_describes_the_visible_evidence_rule() -> None:
+    doc = _flat(regrades.get_regrade_requests.__doc__)
+    assert "positive, visible evidence" in doc
+    assert "a hidden or greyed-out check icon and a generic ``check`` class" in doc

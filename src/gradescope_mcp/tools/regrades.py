@@ -8,6 +8,7 @@ Regrade messages are student-authored and are returned inside labelled
 untrusted blocks.
 """
 
+import copy
 import re
 
 from bs4 import BeautifulSoup
@@ -43,16 +44,42 @@ _REGRADE_DONE_TOKENS = frozenset({
     "✓", "✔", "✔️", "✅",
 })
 
-# Icon classes / sprite names that positively mean "completed" (Font
-# Awesome, Bootstrap Icons, Glyphicons and generic names). Any other icon is
+# Icon-library classes that positively mean "completed" (Font Awesome,
+# Bootstrap Icons, Glyphicons, ``icon-*``). Generic names such as ``check``
+# or ``checkmark`` are not included: they are also the usual classes of a
+# CSS checkbox, which is drawn for both states. Any other icon is
 # unreadable, not "pending".
 _CHECK_ICON_NAMES = frozenset({
-    "check", "checkmark", "check-mark", "icon-check", "icon-checkmark",
-    "icon-check-circle", "fa-check", "fa-check-circle", "fa-check-circle-o",
-    "fa-check-square", "fa-check-square-o", "fa-circle-check",
-    "fa-square-check", "bi-check", "bi-check-lg", "bi-check-circle",
-    "bi-check-circle-fill", "bi-check2", "bi-check2-circle", "glyphicon-ok",
-    "glyphicon-check",
+    "icon-check", "icon-checkmark", "icon-check-circle", "fa-check",
+    "fa-check-circle", "fa-check-circle-o", "fa-check-square",
+    "fa-check-square-o", "fa-circle-check", "fa-square-check", "bi-check",
+    "bi-check-lg", "bi-check-circle", "bi-check-circle-fill", "bi-check2",
+    "bi-check2-circle", "glyphicon-ok", "glyphicon-check",
+})
+
+# SVG sprite symbols (``<use href="...#name">``) that draw a check mark. A
+# sprite reference always draws its glyph, so generic symbol names count.
+_CHECK_SPRITE_NAMES = _CHECK_ICON_NAMES | {
+    "check", "checkmark", "check-mark", "check-circle",
+}
+
+# Classes that keep an element (and everything inside it) from being shown.
+_HIDDEN_CLASSES = frozenset({"hidden", "d-none", "hide", "invisible", "is-hidden"})
+
+# Classes that show an element to screen readers only: their text still
+# counts, but an icon carrying one of them is not visible evidence.
+_SCREEN_READER_ONLY_CLASSES = frozenset({
+    "sr-only", "visually-hidden", "screen-reader-only", "screen-reader-text",
+})
+
+_HIDDEN_STYLE_RE = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)", re.IGNORECASE
+)
+
+# Class-name parts marking an icon as greyed out / not active. A check icon
+# styled this way is not read as completed.
+_INACTIVE_CLASS_PARTS = frozenset({
+    "muted", "disabled", "inactive", "incomplete", "unchecked", "pending",
 })
 
 # Elements that carry no completion information of their own.
@@ -113,19 +140,96 @@ def _resolve_columns(headers: list[str]) -> dict[str, int | None]:
     return columns
 
 
-def _has_check_icon(cell) -> bool:
-    """Whether the cell holds an icon whose class or sprite name is a check mark."""
+def _classes(el) -> list[str]:
+    classes = el.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    return [c.lower() for c in classes]
+
+
+def _is_hidden(el) -> bool:
+    """Whether ``el`` itself is not rendered (hidden attribute, class or style)."""
+    if el.has_attr("hidden"):
+        return True
+    if any(c in _HIDDEN_CLASSES for c in _classes(el)):
+        return True
+    style = el.get("style")
+    return isinstance(style, str) and bool(_HIDDEN_STYLE_RE.search(style))
+
+
+def _visible_copy(cell):
+    """A copy of ``cell`` without the elements that are not rendered."""
+    visible = copy.copy(cell)
+    for el in visible.find_all(True):
+        if not el.decomposed and _is_hidden(el):
+            el.decompose()
+    return visible
+
+
+def _has_content(cell) -> bool:
+    """Whether ``cell`` holds any text or non-layout element."""
+    return bool(cell.get_text(strip=True)) or any(
+        el.name not in _LAYOUT_ONLY_TAGS for el in cell.find_all(True)
+    )
+
+
+def _checkbox_state(cell) -> tuple[bool, bool | None]:
+    """``(found, completed)`` from checkbox controls in ``cell``.
+
+    A checkbox is read by its checked state only, never by its classes:
+    all checked = completed, none checked = pending, mixed = unknown.
+    """
+    states = []
     for el in cell.find_all(True):
-        classes = el.get("class") or []
-        if isinstance(classes, str):
-            classes = classes.split()
-        names = [c.lower() for c in classes]
+        if el.name == "input" and str(el.get("type") or "").lower() == "checkbox":
+            states.append(el.has_attr("checked"))
+        elif str(el.get("role") or "").lower() == "checkbox":
+            value = str(el.get("aria-checked") or "").strip().lower()
+            states.append(True if value == "true" else False if value == "false" else None)
+    if not states:
+        return False, None
+    if all(state is True for state in states):
+        return True, True
+    if all(state is False for state in states):
+        return True, False
+    return True, None
+
+
+def _has_check_icon(cell) -> bool:
+    """Whether ``cell`` holds a visible check-mark icon.
+
+    ``cell`` must already be stripped of hidden elements. The icon must use
+    a specific icon-library class or check sprite, and neither it nor an
+    enclosing element in the cell may be screen-reader-only or styled as
+    inactive (muted, disabled, unchecked, ...).
+    """
+    for el in cell.find_all(True):
+        is_check = any(name in _CHECK_ICON_NAMES for name in _classes(el))
         if el.name == "use":
             for attr in ("href", "xlink:href"):
                 ref = el.get(attr)
                 if isinstance(ref, str) and "#" in ref:
-                    names.append(ref.rsplit("#", 1)[1].lower())
-        if any(name in _CHECK_ICON_NAMES for name in names):
+                    sprite = ref.rsplit("#", 1)[1].lower()
+                    is_check = is_check or sprite in _CHECK_SPRITE_NAMES
+        if not is_check:
+            continue
+        chain = [el]
+        for parent in el.parents:
+            if parent is cell:
+                break
+            chain.append(parent)
+        if any(_is_dimmed(node) for node in chain):
+            continue
+        return True
+    return False
+
+
+def _is_dimmed(el) -> bool:
+    """Whether ``el`` is screen-reader-only or styled as inactive."""
+    for name in _classes(el):
+        if name in _SCREEN_READER_ONLY_CLASSES:
+            return True
+        if _INACTIVE_CLASS_PARTS.intersection(re.split(r"[-_]+", name)):
             return True
     return False
 
@@ -133,15 +237,25 @@ def _has_check_icon(cell) -> bool:
 def _classify_completion(cell) -> bool | None:
     """True = completed, False = pending, None = cannot tell.
 
-    Only positive evidence counts as completed: a date/time stamp, a
-    recognised token, an icon's aria-label/title/alt, or a check-mark icon
-    class. Only a truly empty cell (no text, no labels, no elements) counts
-    as pending; a cell holding an unlabelled icon or image is unknown, since
-    Gradescope may render completion as a bare icon. A cell whose only
-    content is a link is never read as the completion value.
+    Only positive, visible evidence counts as completed: a checked
+    checkbox, a date/time stamp, a recognised token, an icon's
+    aria-label/title/alt, or a visible icon-library check-mark class.
+    Hidden elements (``hidden``, ``d-none``, ``display:none``, ...) are
+    ignored; a cell whose only content is hidden is unknown. A checkbox is
+    read by its checked state alone (unchecked = pending). Only a truly
+    empty cell (no text, no labels, no elements) counts as pending; a cell
+    holding an unlabelled icon or image is unknown, since Gradescope may
+    render completion as a bare icon. A cell whose only content is a link
+    is never read as the completion value.
     """
     if cell is None:
         return None
+    visible = _visible_copy(cell)
+    found, checked = _checkbox_state(visible)
+    if found:
+        return checked
+    cell_has_hidden_content = _has_content(cell) and not _has_content(visible)
+    cell = visible
     text = " ".join(cell.get_text(" ", strip=True).split())
     anchors = cell.find_all("a")
     if anchors and text == " ".join(
@@ -175,9 +289,12 @@ def _classify_completion(cell) -> bool | None:
         return None
     if _has_check_icon(cell):
         return True
-    if any(el.name not in _LAYOUT_ONLY_TAGS for el in cell.find_all(True)):
-        # An unlabelled icon, image or wrapper: there is something to read,
-        # but not as text, so the status is unknown rather than pending.
+    if cell_has_hidden_content or any(
+        el.name not in _LAYOUT_ONLY_TAGS for el in cell.find_all(True)
+    ):
+        # An unlabelled icon, image or wrapper, or content that is only
+        # hidden: there is something to read, but not as visible text, so
+        # the status is unknown rather than pending.
         return None
     # A truly empty completion cell means the request has not been decided.
     return False
@@ -196,10 +313,12 @@ def get_regrade_requests(course_id: str, assignment_id: str) -> str:
     Returns a table of pending and completed regrade requests with student name,
     question, grader, and status. Requires instructor/TA access.
 
-    A request is marked completed only on positive evidence (a date/time,
-    a recognised status word, icon label or check-mark icon) and pending only
-    on a pending word or a truly empty cell; anything else, including an
-    unlabelled icon, is shown as unknown (❓) rather than guessed.
+    A request is marked completed only on positive, visible evidence (a
+    checked checkbox, a date/time, a recognised status word, icon label or
+    visible icon-library check-mark icon) and pending only on a pending
+    word, an unchecked checkbox or a truly empty cell; anything else,
+    including an unlabelled icon, a hidden or greyed-out check icon and a
+    generic ``check`` class, is shown as unknown (❓) rather than guessed.
 
     Args:
         course_id: The Gradescope course ID.
