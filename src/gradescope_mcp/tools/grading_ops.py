@@ -26,6 +26,8 @@ from gradescope_mcp.tools.common import (
     is_placeholder_page,
     normalize_rubric_ids,
     normalize_url,
+    page_number,
+    select_crop_pages,
     split_known_rubric_ids,
 )
 from gradescope_mcp.tools.grading import _build_question_tree, _get_outline_data
@@ -289,13 +291,6 @@ def _grade_path(course_id: str, question_id: str, submission_id: str) -> str:
     return f"/courses/{course_id}/questions/{question_id}/submissions/{submission_id}/grade"
 
 
-def _page_number(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _select_context_pages(
     pages: list | None, crop_rects: list | None,
 ) -> tuple[list[dict], list[int], int]:
@@ -314,19 +309,12 @@ def _select_context_pages(
     ]
     crop_numbers = {
         n for n in (
-            _page_number(rect.get("page_number"))
+            page_number(rect.get("page_number"))
             for rect in crop_rects or [] if isinstance(rect, dict)
         )
         if n is not None
     }
-    if not crop_numbers:
-        return real, [], len(real)
-    real_numbers = {_page_number(p.get("number")) for p in real}
-    if not crop_numbers & real_numbers:
-        return real, sorted(crop_numbers), len(real)
-    wanted = {n + delta for n in crop_numbers for delta in (-1, 0, 1)}
-    selected = [p for p in real if _page_number(p.get("number")) in wanted]
-    return selected, sorted(crop_numbers), len(real)
+    return select_crop_pages(real, crop_numbers), sorted(crop_numbers), len(real)
 
 
 def _heading_title(question: dict, question_id: str) -> str:
@@ -545,7 +533,7 @@ def get_submission_grading_context(
             lines.append(f"**Relevant pages:** {crop_pages}")
         for p in selected_pages:
             page_num = p.get("number") or "?"
-            marker = " (crop region)" if _page_number(page_num) in crop_pages else ""
+            marker = " (crop region)" if page_number(page_num) in crop_pages else ""
             lines.append(f"- Page {page_num}{marker}: [View]({normalize_url(p['url'])})")
         if real_page_count > len(selected_pages):
             lines.append(f"- _...and {real_page_count - len(selected_pages)} more pages_")

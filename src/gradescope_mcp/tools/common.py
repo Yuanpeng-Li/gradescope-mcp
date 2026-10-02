@@ -20,6 +20,31 @@ def is_placeholder_page(page: dict) -> bool:
     return MISSING_PDF_MARKER in url or not url
 
 
+def page_number(value: Any) -> int | None:
+    """Return a page or crop-region page number as an int, or None if it isn't one."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def select_crop_pages(pages: list[dict], crop_page_numbers: Iterable[Any]) -> list[dict]:
+    """Choose which of a submission's pages to show for a question.
+
+    ``pages`` are the submission's readable pages (missing-PDF placeholders
+    already removed). When some crop-region page is among them, those pages
+    and their immediate neighbours are kept. With no crop info, or crop
+    pages that match none of the submission's pages (e.g. a mis-tagged
+    submission), every page is kept so an answer is never silently hidden.
+    """
+    crop = {n for n in map(page_number, crop_page_numbers) if n is not None}
+    numbers = [page_number(p.get("number")) for p in pages]
+    if not crop or not crop.intersection(numbers):
+        return list(pages)
+    wanted = {n + delta for n in crop for delta in (-1, 0, 1)}
+    return [p for p, n in zip(pages, numbers) if n in wanted]
+
+
 def escape_md_cell(value: Any) -> str:
     """Make a value safe to place inside a markdown table cell.
 

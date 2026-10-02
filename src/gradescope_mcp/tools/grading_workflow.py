@@ -32,6 +32,7 @@ from gradescope_mcp.tools.common import (
     format_untrusted,
     is_placeholder_page,
     normalize_url,
+    select_crop_pages,
 )
 from gradescope_mcp.tools.grading import _get_outline_data
 from gradescope_mcp.tools.grading_ops import _get_grading_context
@@ -462,28 +463,10 @@ def _select_relevant_pages(
 
     Same fallback when crop pages don't intersect the actual submission pages
     at all (e.g., student tagged the wrong region): return everything rather
-    than guess.
+    than guess. The rule is shared with the grading context
+    (``common.select_crop_pages``).
     """
-    if not pages:
-        return []
-
-    crop_page_numbers = {
-        rect.get("page_number")
-        for rect in crop_rects
-        if rect.get("page_number") is not None
-    }
-    if not crop_page_numbers:
-        return list(pages)
-
-    wanted = set()
-    for page_number in crop_page_numbers:
-        wanted.update({page_number - 1, page_number, page_number + 1})
-
-    filtered = [
-        page for page in pages
-        if page.get("number") in wanted
-    ]
-    return filtered or list(pages)
+    return select_crop_pages(pages, [rect.get("page_number") for rect in crop_rects])
 
 
 def _is_page_number(value: Any) -> bool:
