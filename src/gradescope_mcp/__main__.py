@@ -19,8 +19,14 @@ parents) are never consulted: a ``.env`` planted there could route the login
 through a proxy (``HTTPS_PROXY``) or lift the upload restrictions. On POSIX,
 a ``.env`` owned by another user (other than root) or writable by everyone is
 skipped. The files loaded or skipped are logged at startup.
+
+Problems finding or reading a ``.env`` never stop the server from starting:
+a working directory that no longer exists, or a ``.env`` that cannot be
+opened or decoded (e.g. a root-owned ``0600`` file), is skipped with a
+warning instead.
 """
 
+import io
 import logging
 import os
 import re
@@ -64,9 +70,14 @@ def source_checkout(package_dir: Path) -> Path | None:
     return checkout if _declares_gradescope_mcp(checkout / "pyproject.toml") else None
 
 
-def dotenv_candidates(cwd: Path, package_dir: Path) -> list[Path]:
-    """Existing ``.env`` files to load, highest precedence first."""
-    candidates = [cwd / ".env"]
+def dotenv_candidates(cwd: Path | None, package_dir: Path) -> list[Path]:
+    """Existing ``.env`` files to load, highest precedence first.
+
+    ``cwd`` is None when the working directory is unavailable. A file whose
+    existence cannot be checked (e.g. permission denied) is still listed, so
+    the loader reports why it was skipped instead of dropping it silently.
+    """
+    candidates = [] if cwd is None else [cwd / ".env"]
     checkout = source_checkout(package_dir)
     if checkout is not None:
         candidates.append(checkout / ".env")
@@ -74,13 +85,23 @@ def dotenv_candidates(cwd: Path, package_dir: Path) -> list[Path]:
     seen: set[Path] = set()
     for path in candidates:
         try:
-            resolved = path.resolve()
+            if not path.is_file():
+                continue
         except OSError:
-            continue
-        if path.is_file() and resolved not in seen:
+            pass
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):  # RuntimeError: symlink loop
+            resolved = path
+        if resolved not in seen:
             seen.add(resolved)
             files.append(path)
     return files
+
+
+def _os_reason(e: OSError) -> str:
+    """A short description of ``e`` for a log line."""
+    return e.strerror or type(e).__name__
 
 
 def _untrusted_reason(path: Path) -> str | None:
@@ -88,7 +109,7 @@ def _untrusted_reason(path: Path) -> str | None:
     try:
         info = path.stat()
     except OSError as e:
-        return f"cannot be read ({e.strerror or type(e).__name__})"
+        return f"cannot be read ({_os_reason(e)})"
     getuid = getattr(os, "getuid", None)
     if getuid is None:  # Windows: no POSIX ownership to check
         return None
@@ -107,16 +128,39 @@ def load_env_files(
     Returns the files loaded and the files skipped (with the reason), in
     precedence order. Variables already in the environment are kept.
     """
-    cwd = Path.cwd() if cwd is None else cwd
-    package_dir = Path(__file__).resolve().parent if package_dir is None else package_dir
     loaded: list[Path] = []
     skipped: list[tuple[Path, str]] = []
+    if cwd is None:
+        try:
+            cwd = Path.cwd()
+        except OSError as e:
+            # E.g. the client was started in a directory that has since been
+            # removed. Skip the working directory's .env rather than fail.
+            skipped.append(
+                (Path(".env"), f"the working directory is unavailable ({_os_reason(e)})")
+            )
+    if package_dir is None:
+        try:
+            package_dir = Path(__file__).resolve().parent
+        except (OSError, RuntimeError):
+            package_dir = Path(__file__).parent
     for path in dotenv_candidates(cwd, package_dir):
         reason = _untrusted_reason(path)
+        if reason is None:
+            # Read the file here so an unreadable or undecodable file (a
+            # root-owned 0600 .env passes the ownership check) is skipped
+            # with a reason instead of raising out of main(). Parsing the
+            # text in full before setting anything keeps the load atomic.
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as e:
+                reason = f"cannot be read ({_os_reason(e)})"
+            except UnicodeDecodeError:
+                reason = "it is not valid UTF-8 text"
         if reason is not None:
             skipped.append((path, reason))
             continue
-        load_dotenv(path, override=False)
+        load_dotenv(stream=io.StringIO(text), override=False)
         loaded.append(path)
     return loaded, skipped
 
