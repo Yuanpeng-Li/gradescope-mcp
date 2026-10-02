@@ -477,9 +477,11 @@ def tool_upload_submission(
     a redirect to a submission of this assignment
     (``/courses/<cid>/assignments/<aid>/submissions/<id>``) that was not
     among the account's submissions on the assignment page just before, the
-    final page is that submission's page, and it shows no error message.
-    Any other outcome is ``❌ Upload not confirmed`` with the final page and
-    any message Gradescope showed; check the assignment on Gradescope before
+    final page is that submission's page, and it shows no visible
+    error-styled message (hidden elements, templates and ``<noscript>`` are
+    ignored; a warning or other message is quoted under a ⚠️ line of the
+    success result). Any other outcome is ``❌ Upload not confirmed`` with
+    the final page and any message Gradescope showed; check the assignment on Gradescope before
     uploading again, because every upload creates a new submission.
 
     Args:
@@ -538,8 +540,11 @@ def tool_set_extension(
     they are wall-clock times in the course timezone that Gradescope reports
     on the extensions page, never the server's timezone. The ``timezone``
     argument is needed only when Gradescope reports no course timezone; a
-    ``timezone`` that differs from the reported one is an Error and nothing
-    is sent. With an offset (``Z``, ``-07:00``) dates are absolute. Don't
+    ``timezone`` that differs from the reported one, or that can't be
+    checked because the page reports several zones or an unknown one, is an
+    Error and nothing is sent. If ``timezone`` stood in for an unreported
+    zone and the read-back reports another, the result warns (⚠️) that the
+    dates were resolved in the wrong zone. With an offset (``Z``, ``-07:00``) dates are absolute. Don't
     mix the two styles. At least one date is required and they must be in
     order: release_date <= due_date <= late_due_date.
 
@@ -568,8 +573,8 @@ def tool_set_extension(
         timezone: IANA timezone (e.g. "America/New_York") for dates without
             an offset, needed only when Gradescope reports no course
             timezone (e.g. no extensions exist yet). If given, it must be
-            the course timezone Gradescope reports; otherwise the call is
-            an Error.
+            the course timezone Gradescope reports (the only one); otherwise
+            the call is an Error.
     """
     return set_extension(
         course_id,
@@ -848,10 +853,15 @@ def tool_get_regrade_requests(
     grader, status, and the question_id / submission_id for fetching
     details. Status is ✅ completed, ⏳ pending, or ❓ unknown; ❓ means the
     completion cell or column could not be read and the request must be
-    checked manually. A recognised check-mark icon counts as ✅ completed,
-    an unlabelled icon or image in the completion cell is ❓ unknown, and
-    only an empty cell (or a pending word) is ⏳ pending. An unexpected page
-    (e.g. a login page) returns an Error. Requires instructor/TA access.
+    checked manually. Only visible, specific evidence counts as ✅
+    completed: a checked checkbox, a date/time, a status word or label, or
+    a visible icon-library check-mark icon (e.g. ``fa-check``). ⏳ pending
+    is an unchecked checkbox, a pending word, or an empty cell. Anything
+    else is ❓ unknown: an unlabelled icon or image, a hidden or greyed-out
+    check icon, a generic ``check`` class, content that is only hidden, and
+    a checkbox whose state contradicts the cell's visible text (a checked
+    box next to "Pending"). An unexpected page (e.g. a login page) returns
+    an Error. Requires instructor/TA access.
 
     Args:
         course_id: The Gradescope course ID.

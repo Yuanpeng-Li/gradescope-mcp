@@ -665,6 +665,126 @@ def test_cache_tool_drops_a_stalled_page_on_time_and_keeps_the_rest(monkeypatch,
     assert "page_2.jpg" in text
 
 
+def _hooked_client(base_url: str) -> requests.Session:
+    """A client whose session carries the real expiry hook for ``base_url``
+    (a Gradescope-hosted page URL goes through that session)."""
+    conn = SimpleNamespace(session=_client(), gradescope_base_url=base_url)
+    auth._install_expiry_hook(conn)
+    return conn.session
+
+
+def _html_head(*extra: str) -> bytes:
+    lines = ["HTTP/1.1 200 OK", "Content-Type: text/html; charset=utf-8", "Connection: close", *extra]
+    return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+
+def test_same_site_image_labelled_html_is_still_sniffed(local_http) -> None:
+    """Round-4 C10 (reviewer repro round3-G3/hook_cases.py /mislabeled): the
+    expiry hook read the body of a same-site text/html answer, the read1
+    loop then read the drained stream, and a JPEG was rejected as 'not an
+    image'."""
+    def mislabeled(conn, _stop):
+        conn.sendall(_html_head(f"Content-Length: {len(BODY)}") + BODY)
+
+    base = local_http(mislabeled)
+    assert gw._download_page_image(_hooked_client(base), base + "/p1.jpg") == (BODY, "jpg")
+
+
+def test_body_already_read_by_a_hook_is_taken_from_content(local_http) -> None:
+    """Round-4 C10: any hook that reads ``response.content`` drains the raw
+    stream; the page is then taken from the content it read."""
+    session = _client()
+
+    def read_body(response, *_args, **_kwargs):
+        response.content  # noqa: B018 - drains response.raw
+
+    session.hooks["response"].append(read_body)
+
+    data, extension = gw._download_page_image(session, local_http(_full) + "/p1.jpg")
+
+    assert data == BODY and extension == "jpg"
+
+
+def test_same_site_html_page_is_bounded_by_the_deadline_and_the_cap(monkeypatch, local_http) -> None:
+    """Round-4 C13 (reviewer repro round3-G3/hook_cases.py /htmldrip): the
+    expiry hook read a same-site HTML body in full inside session.get,
+    before the deadline or the size cap applied (6 s for a 1 s budget)."""
+    monkeypatch.setattr(gw, "_PAGE_DEADLINE_SECONDS", 0.5)
+
+    def html_drip(conn, stop):
+        conn.sendall(_html_head() + b"<html>")
+        _drip(conn, stop, b" ")
+
+    base = local_http(html_drip)
+    started = time.monotonic()
+    with pytest.raises(gw._PageFetchError, match=r"took longer than 0\.5 s"):
+        gw._download_page_image(_hooked_client(base), base + "/p1.jpg")
+    assert time.monotonic() - started < 5
+
+    monkeypatch.setattr(gw, "_MAX_PAGE_BYTES", 256 * 1024)
+
+    def huge_html(conn, _stop):
+        conn.sendall(_html_head() + b"<html>" + b"x" * (8 * 1024 * 1024))
+
+    base = local_http(huge_html)
+    with pytest.raises(gw._PageFetchError, match="too large"):
+        gw._download_page_image(_hooked_client(base), base + "/p1.jpg")
+
+
+def test_same_site_logged_out_page_is_still_a_session_expiry(monkeypatch, local_http) -> None:
+    """The hook leaves a streamed page's logged-out check to the reader,
+    which still raises SessionExpiredError and flags the thread."""
+    monkeypatch.setattr(auth._local, "expired", None, raising=False)
+    monkeypatch.setattr(auth._local, "pending_write", False, raising=False)
+    page = (
+        b'<html><form action="/login" method="post">'
+        b'<input type="hidden" name="authenticity_token" value="T"></form></html>'
+    )
+
+    def logged_out(conn, _stop):
+        conn.sendall(_html_head(f"Content-Length: {len(page)}") + page)
+
+    base = local_http(logged_out)
+    with pytest.raises(auth.SessionExpiredError, match="logged-out page"):
+        gw._download_page_image(_hooked_client(base), base + "/p1.jpg")
+    assert auth._local.expired is not None
+
+    # A logged-in HTML page (logout link) is only "not an image".
+    monkeypatch.setattr(auth._local, "expired", None)
+    logged_in = page.replace(b"</form>", b'</form><a href="/logout">Log out</a>')
+
+    def html_page(conn, _stop):
+        conn.sendall(_html_head(f"Content-Length: {len(logged_in)}") + logged_in)
+
+    base = local_http(html_page)
+    with pytest.raises(gw._PageFetchError, match="not an image"):
+        gw._download_page_image(_hooked_client(base), base + "/p1.jpg")
+    assert auth._local.expired is None
+
+
+@pytest.mark.parametrize("handler", [_full, _chunked, _gzipped], ids=["content-length", "chunked", "gzip"])
+def test_urllib3_without_read1_falls_back_to_iter_content(monkeypatch, local_http, handler) -> None:
+    """Round-4 C8 (reviewer repro round3-G3/dl_cases.py with urllib3 1.26):
+    HTTPResponse.read1 (urllib3 2.2) and shutdown() (2.3) are missing on an
+    older urllib3, and every page failed with AttributeError."""
+    from urllib3.response import HTTPResponse
+
+    for cls in HTTPResponse.__mro__:
+        for name in ("read1", "shutdown"):
+            if name in vars(cls):
+                monkeypatch.delattr(cls, name)
+    assert not hasattr(HTTPResponse, "read1")
+
+    data, extension = gw._download_page_image(_client(), local_http(handler) + "/p1.jpg")
+
+    assert data == BODY and extension == "jpg"
+
+
+def test_pyproject_declares_the_urllib3_the_page_reader_needs() -> None:
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    assert '"urllib3>=2.3"' in pyproject
+
+
 # ---------------------------------------------------------------------------
 # [10] Regrade completion: only specific, visible evidence is ✅
 # ---------------------------------------------------------------------------
@@ -714,7 +834,8 @@ def _regrades(monkeypatch, cells: list[str]) -> str:
     # Checkboxes are read by their state only.
     ('<input type="checkbox" class="sr-only" checked><span class="checkmark"></span>', "✅"),
     ('<input type="checkbox" class="d-none" checked><span class="check"></span>', "❓"),
-    ('<label><input type="checkbox"> Completed</label>', "⏳"),
+    # A label contradicting the state is conflicting evidence (round-4 C9).
+    ('<label><input type="checkbox"> Completed</label>', "❓"),
     ('<div role="checkbox" aria-checked="true"></div>', "✅"),
     ('<div role="checkbox" aria-checked="false"></div>', "⏳"),
     ('<input type="checkbox" checked><input type="checkbox">', "❓"),
@@ -750,6 +871,45 @@ def test_same_check_element_hidden_for_open_requests_does_not_hide_them(monkeypa
     assert "**Completed:** 0" in out and "**Unknown:** 3" in out
 
 
+@pytest.mark.parametrize("cell, status", [
+    # Reviewer probe round3-G3/icons3.py: a checked box next to visible
+    # "Pending" was ✅, the one status the review prompt skips.
+    ('<input type="checkbox" checked> Pending', "❓"),
+    ('<input type="checkbox" checked><span>Not completed</span>', "❓"),
+    ('<div role="checkbox" aria-checked="true"></div> pending', "❓"),
+    ('<input type="checkbox" checked title="Not completed">', "❓"),
+    ('<input type="checkbox"> Completed', "❓"),
+    ('<input type="checkbox"> Oct 3, 2026', "❓"),
+    # Agreeing or neutral text keeps the checkbox's reading.
+    ('<input type="checkbox" checked> Completed', "✅"),
+    ('<input type="checkbox" checked> Oct 3, 2026', "✅"),
+    ('<input type="checkbox"> Pending', "⏳"),
+    ('<label><input type="checkbox" checked> Mark as resolved</label>', "✅"),
+    ('<label><input type="checkbox"> Mark as resolved</label>', "⏳"),
+    # Hidden contradicting text is not evidence.
+    ('<input type="checkbox" checked><span class="d-none">Pending</span>', "✅"),
+])
+def test_checkbox_contradicted_by_visible_text_is_unknown(monkeypatch, cell, status) -> None:
+    out = _regrades(monkeypatch, [cell])
+    assert f"| 1 | {status} | S1 | 1.1 | TA | qid=11, sid=1 |" in out
+
+
+def test_regrade_tool_description_matches_the_classifier(monkeypatch) -> None:
+    """Round-4 C11: the MCP-visible description still said only an empty
+    cell (or a pending word) is pending."""
+    tools = {t.name: t for t in anyio.run(server.mcp.list_tools)}
+    doc = _flat(tools["tool_get_regrade_requests"].description)
+    assert "only an empty cell" not in doc
+    assert "⏳ pending is an unchecked checkbox, a pending word, or an empty cell" in doc
+    assert "a generic ``check`` class" in doc
+    assert "a checkbox whose state contradicts the cell's visible text" in doc
+    out = _regrades(monkeypatch, [
+        '<input type="checkbox">', '<span class="check"></span>',
+        '<input type="checkbox" checked> Pending',
+    ])
+    assert "**Pending:** 1 | **Completed:** 0 | **Unknown:** 2 | **Total:** 3" in out
+
+
 def test_classifying_a_cell_does_not_change_the_page() -> None:
     soup = BeautifulSoup(
         '<table><tr><td><i class="fa fa-check d-none"></i><span class="d-none">x</span></td></tr></table>',
@@ -765,4 +925,5 @@ def test_classifying_a_cell_does_not_change_the_page() -> None:
 def test_regrade_docstring_describes_the_visible_evidence_rule() -> None:
     doc = _flat(regrades.get_regrade_requests.__doc__)
     assert "positive, visible evidence" in doc
-    assert "a hidden or greyed-out check icon and a generic ``check`` class" in doc
+    assert "a hidden or greyed-out check icon, a generic ``check`` class" in doc
+    assert "a checkbox whose state contradicts the cell's visible text" in doc

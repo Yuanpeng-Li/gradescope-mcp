@@ -15,8 +15,10 @@ from bs4 import BeautifulSoup
 
 from gradescope_mcp.auth import get_connection, AuthError
 from gradescope_mcp.tools.common import (
+    element_classes,
     escape_md_cell,
     format_untrusted,
+    is_hidden_element,
     is_placeholder_page,
     normalize_url,
     page_number,
@@ -63,18 +65,11 @@ _CHECK_SPRITE_NAMES = _CHECK_ICON_NAMES | {
     "check", "checkmark", "check-mark", "check-circle",
 }
 
-# Classes that keep an element (and everything inside it) from being shown.
-_HIDDEN_CLASSES = frozenset({"hidden", "d-none", "hide", "invisible", "is-hidden"})
-
 # Classes that show an element to screen readers only: their text still
 # counts, but an icon carrying one of them is not visible evidence.
 _SCREEN_READER_ONLY_CLASSES = frozenset({
     "sr-only", "visually-hidden", "screen-reader-only", "screen-reader-text",
 })
-
-_HIDDEN_STYLE_RE = re.compile(
-    r"display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)", re.IGNORECASE
-)
 
 # Class-name parts marking an icon as greyed out / not active. A check icon
 # styled this way is not read as completed.
@@ -140,28 +135,11 @@ def _resolve_columns(headers: list[str]) -> dict[str, int | None]:
     return columns
 
 
-def _classes(el) -> list[str]:
-    classes = el.get("class") or []
-    if isinstance(classes, str):
-        classes = classes.split()
-    return [c.lower() for c in classes]
-
-
-def _is_hidden(el) -> bool:
-    """Whether ``el`` itself is not rendered (hidden attribute, class or style)."""
-    if el.has_attr("hidden"):
-        return True
-    if any(c in _HIDDEN_CLASSES for c in _classes(el)):
-        return True
-    style = el.get("style")
-    return isinstance(style, str) and bool(_HIDDEN_STYLE_RE.search(style))
-
-
 def _visible_copy(cell):
     """A copy of ``cell`` without the elements that are not rendered."""
     visible = copy.copy(cell)
     for el in visible.find_all(True):
-        if not el.decomposed and _is_hidden(el):
+        if not el.decomposed and is_hidden_element(el):
             el.decompose()
     return visible
 
@@ -204,7 +182,7 @@ def _has_check_icon(cell) -> bool:
     inactive (muted, disabled, unchecked, ...).
     """
     for el in cell.find_all(True):
-        is_check = any(name in _CHECK_ICON_NAMES for name in _classes(el))
+        is_check = any(name in _CHECK_ICON_NAMES for name in element_classes(el))
         if el.name == "use":
             for attr in ("href", "xlink:href"):
                 ref = el.get(attr)
@@ -226,12 +204,32 @@ def _has_check_icon(cell) -> bool:
 
 def _is_dimmed(el) -> bool:
     """Whether ``el`` is screen-reader-only or styled as inactive."""
-    for name in _classes(el):
+    for name in element_classes(el):
         if name in _SCREEN_READER_ONLY_CLASSES:
             return True
         if _INACTIVE_CLASS_PARTS.intersection(re.split(r"[-_]+", name)):
             return True
     return False
+
+
+def _text_evidence(candidates: list[str]) -> bool | None:
+    """Completion stated by a cell's visible text or labels (lower-cased).
+
+    A recognised token first, then a pending word, then a date/time stamp;
+    None when none of them says anything.
+    """
+    for c in candidates:
+        if c in _REGRADE_DONE_TOKENS:
+            return True
+        if c in _REGRADE_PENDING_TOKENS:
+            return False
+    for c in candidates:
+        if _PENDING_WORDS_RE.search(c):
+            return False
+    for c in candidates:
+        if _DATE_RE.search(c):
+            return True
+    return None
 
 
 def _classify_completion(cell) -> bool | None:
@@ -242,18 +240,18 @@ def _classify_completion(cell) -> bool | None:
     aria-label/title/alt, or a visible icon-library check-mark class.
     Hidden elements (``hidden``, ``d-none``, ``display:none``, ...) are
     ignored; a cell whose only content is hidden is unknown. A checkbox is
-    read by its checked state alone (unchecked = pending). Only a truly
-    empty cell (no text, no labels, no elements) counts as pending; a cell
-    holding an unlabelled icon or image is unknown, since Gradescope may
-    render completion as a bare icon. A cell whose only content is a link
-    is never read as the completion value.
+    read by its checked state (unchecked = pending), unless the cell's
+    visible text or labels say the opposite (a checked box next to
+    "Pending", an unchecked one next to "Completed"): conflicting evidence
+    is unknown. Only a truly empty cell (no text, no labels, no elements)
+    counts as pending; a cell holding an unlabelled icon or image is
+    unknown, since Gradescope may render completion as a bare icon. A cell
+    whose only content is a link is never read as the completion value.
     """
     if cell is None:
         return None
     visible = _visible_copy(cell)
     found, checked = _checkbox_state(visible)
-    if found:
-        return checked
     cell_has_hidden_content = _has_content(cell) and not _has_content(visible)
     cell = visible
     text = " ".join(cell.get_text(" ", strip=True).split())
@@ -274,17 +272,13 @@ def _classify_completion(cell) -> bool | None:
                 labels.append(" ".join(value.split()))
 
     candidates = [c.lower() for c in [text, *labels] if c]
-    for c in candidates:
-        if c in _REGRADE_DONE_TOKENS:
-            return True
-        if c in _REGRADE_PENDING_TOKENS:
-            return False
-    for c in candidates:
-        if _PENDING_WORDS_RE.search(c):
-            return False
-    for c in candidates:
-        if _DATE_RE.search(c):
-            return True
+    evidence = _text_evidence(candidates)
+    if found:
+        if evidence is not None and evidence is not checked:
+            return None
+        return checked
+    if evidence is not None:
+        return evidence
     if candidates or link_only:
         return None
     if _has_check_icon(cell):
@@ -317,8 +311,10 @@ def get_regrade_requests(course_id: str, assignment_id: str) -> str:
     checked checkbox, a date/time, a recognised status word, icon label or
     visible icon-library check-mark icon) and pending only on a pending
     word, an unchecked checkbox or a truly empty cell; anything else,
-    including an unlabelled icon, a hidden or greyed-out check icon and a
-    generic ``check`` class, is shown as unknown (❓) rather than guessed.
+    including an unlabelled icon, a hidden or greyed-out check icon, a
+    generic ``check`` class and a checkbox whose state contradicts the
+    cell's visible text (a checked box next to "Pending"), is shown as
+    unknown (❓) rather than guessed.
 
     Args:
         course_id: The Gradescope course ID.

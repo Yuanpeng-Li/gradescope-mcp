@@ -448,7 +448,11 @@ def set_extension(
     Dates without a UTC offset are wall-clock times in the course's
     timezone, read from Gradescope's extensions page; ``timezone`` supplies
     it when Gradescope reports none and is refused when it differs from the
-    one Gradescope reports. Dates with an offset (``Z``, ``-07:00``) are
+    one Gradescope reports, or when the page reports several zones or one
+    this server can't load (then no argument can be checked). When it stood
+    in for an unreported zone and the read-back after the write reveals a
+    different one, the result warns (⚠️) that dates without an offset were
+    resolved in the wrong zone. Dates with an offset (``Z``, ``-07:00``) are
     absolute. Never the MCP host's timezone. Gradescope stores each date as
     a UTC instant: the preview shows the resolved instant.
 
@@ -472,7 +476,7 @@ def set_extension(
         timezone: IANA timezone (e.g. "America/New_York") for dates without
             an offset. Needed only when Gradescope reports no course
             timezone; if given, it must be the course timezone Gradescope
-            reports, or the call is an Error.
+            reports (the only one), or the call is an Error.
     """
     if not all([course_id, assignment_id, user_id]):
         return "Error: course_id, assignment_id, and user_id are all required."
@@ -562,13 +566,24 @@ def _apply_extension(
 
     course_zone, zone_problem = _course_zone(page)
     # Dates without an offset are course-local, so a timezone argument may
-    # only stand in for a course timezone Gradescope doesn't report.
-    if zone_arg is not None and course_zone is not None and zone_arg.key != course_zone.key:
+    # only stand in for a course timezone Gradescope doesn't report. When the
+    # page reports several zones or one this server can't load, no argument
+    # can be checked against the course's, so it is refused as well.
+    reported = sorted(page["timezones"])
+    if zone_arg is not None and any(name != zone_arg.key for name in reported):
+        if course_zone is not None:
+            return (
+                f"Error: timezone='{zone_arg.key}' differs from the course "
+                f"timezone Gradescope reports ({course_zone.key}). Omit timezone "
+                f"or pass '{course_zone.key}': dates without an offset are "
+                "wall-clock times in the course timezone, and a date meant in "
+                "another zone needs its UTC offset (e.g. -04:00) instead of a "
+                "timezone argument. Nothing was changed."
+            )
         return (
-            f"Error: timezone='{zone_arg.key}' differs from the course timezone "
-            f"Gradescope reports ({course_zone.key}). Dates without an offset are "
-            "wall-clock times in the course timezone: omit timezone (or pass "
-            f"'{course_zone.key}'), or give the dates with a UTC offset. Nothing "
+            f"Error: timezone='{zone_arg.key}' cannot be checked against the "
+            f"course timezone: {zone_problem}. Omit timezone and give every "
+            "date with its UTC offset (e.g. 2026-10-04T23:59-07:00). Nothing "
             "was changed."
         )
     zone = zone_arg or course_zone
@@ -589,11 +604,17 @@ def _apply_extension(
         )
 
     if naive_args and zone is None:
+        # A timezone argument is refused when the page reports zones it
+        # can't be checked against, so only offsets are suggested then.
+        fix = (
+            "Give the dates with a UTC offset" if reported
+            else "Pass timezone='Area/City' (the course's timezone) or give "
+            "the dates with a UTC offset"
+        )
         return (
             f"Error: cannot tell which timezone {', '.join(naive_args)} "
             f"{'is' if len(naive_args) == 1 else 'are'} in: {zone_problem}. "
-            "Pass timezone='Area/City' (the course's timezone) or give the dates "
-            "with a UTC offset. Nothing was changed."
+            f"{fix}. Nothing was changed."
         )
 
     try:
@@ -711,7 +732,8 @@ def _apply_extension(
             f"user ID and the Gradescope web UI.\n{summary}"
         )
 
-    read_zone = stored_zone or _course_zone(after)[0]
+    after_zone = _course_zone(after)[0]
+    read_zone = course_zone or after_zone or zone_arg
     differences = []
     for arg, value in resolved:
         raw = _raw_setting(stored, _FIELD_KEYS[arg])
@@ -736,6 +758,51 @@ def _apply_extension(
         differences.append(
             f"- visible: sent true, extensions page shows "
             f"{_setting_text(stored[_VISIBLE_KEY])}"
+        )
+    # The timezone argument stood in for a course timezone Gradescope did not
+    # report before the write; the read-back (now with an extension) may
+    # reveal it.
+    zone_mismatch = ""
+    after_names = sorted(after["timezones"])
+    if (
+        zone_arg is not None
+        and course_zone is None
+        and any(name != zone_arg.key for name in after_names)
+    ):
+        revealed = ", ".join(after_names)
+        if naive_args:
+            zone_mismatch = (
+                f"- timezone: {', '.join(naive_args)} had no UTC offset and "
+                f"{'was' if len(naive_args) == 1 else 'were'} resolved in "
+                f"timezone='{zone_arg.key}', because Gradescope reported no "
+                "course timezone before the write, but the extensions page now "
+                f"reports {revealed}"
+            )
+            if after_zone is not None:
+                zone_mismatch += " (" + "; ".join(
+                    f"{arg} = {value.astimezone(after_zone):%Y-%m-%d %H:%M %Z} "
+                    "course time"
+                    for arg, value in resolved
+                    if arg in naive_args
+                ) + ")"
+            zone_mismatch += (
+                ". If the dates were meant as course-local times, the stored "
+                "dates are wrong: preview the extension again without "
+                "timezone and confirm it."
+            )
+        else:
+            summary += (
+                f"\n- The extensions page now reports the course timezone "
+                f"{revealed}; the dates had UTC offsets, so timezone='"
+                f"{zone_arg.key}' only affected how they are shown."
+            )
+    if zone_mismatch:
+        return (
+            f"⚠️ Extension for {target} was written (HTTP 200), but its dates "
+            "may be in the wrong timezone:\n"
+            + zone_mismatch
+            + "".join(f"\n{line}" for line in differences)
+            + f"\nWhat was sent:\n{summary}"
         )
     if differences:
         return (

@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from gradescopeapi.classes.upload import upload_assignment
 
 from gradescope_mcp.auth import get_connection, AuthError
+from gradescope_mcp.tools.common import element_classes, is_hidden_element
 from gradescope_mcp.tools.grading import get_student_submission_content
 from gradescope_mcp.tools.safety import write_confirmation_required
 
@@ -206,14 +207,22 @@ class _UploadRecorder:
 
 
 # Gradescope's flash messages and other alerts on the page after an upload.
-_FLASH_SELECTORS = ".alert, .flash, #flash, [role=alert]"
-# The ones that report a failure: error-styled alerts, and any [role=alert]
-# that is not styled as a success or notice.
-_ERROR_FLASH_SELECTORS = (
-    ".alert-error, .alert-danger, .alert-alert, .flash-error, .flash-alert, "
-    ".flash-danger, [role=alert]:not(.alert-success):not(.alert-notice)"
-    ":not(.alert-info):not(.flash-success):not(.flash-notice)"
+_FLASH_SELECTORS = (
+    ".alert, .flash, #flash, [role=alert], .alert-error, .alert-danger, "
+    ".alert-alert, .flash-error, .flash-alert, .flash-danger"
 )
+# Classes that style a flash message as a failure, and as a success or notice.
+# A message with neither (a warning, a bare [role=alert]) is not read as a
+# failure: it is reported next to the result instead.
+_ERROR_FLASH_CLASSES = frozenset({
+    "alert-error", "alert-danger", "alert-alert", "flash-error", "flash-alert",
+    "flash-danger",
+})
+_NOTICE_FLASH_CLASSES = frozenset({
+    "alert-success", "alert-notice", "alert-info", "flash-success", "flash-notice",
+})
+# Elements whose content the browser does not show as part of the page.
+_NOT_RENDERED_TAGS = frozenset({"noscript", "template", "script", "style"})
 
 
 def _submission_id(url: str | None, course_id: str, assignment_id: str) -> str | None:
@@ -288,21 +297,56 @@ def _redirect_target(response, fallback: str | None) -> str | None:
     return urljoin(str(getattr(first, "url", None) or ""), str(location))
 
 
-def _flash_text(response, selectors: str = _FLASH_SELECTORS) -> str | None:
-    """Alert or flash messages on a response page, if any (at most 300 characters)."""
+def _is_rendered(element) -> bool:
+    """Whether ``element`` is shown on the page: neither it nor an enclosing
+    element is hidden (attribute, class or style) or a noscript/template."""
+    for node in [element, *element.parents]:
+        if node.name in _NOT_RENDERED_TAGS:
+            return False
+        if node.name != "[document]" and is_hidden_element(node):
+            return False
+    return True
+
+
+def _flash_messages(response) -> dict[str, str | None]:
+    """The visible flash messages on a response page, by kind.
+
+    Returns ``{"error": ..., "notice": ..., "other": ...}``, each the joined
+    text (at most 300 characters) or None. A message is an error when it or
+    an enclosing alert is error-styled (``alert-danger``, ``flash-error``,
+    ...), a notice when success/notice/info-styled, and "other" otherwise
+    (e.g. ``alert-warning`` or a bare ``role=alert``). Hidden elements, JS
+    templates and ``<noscript>`` content are ignored. A container holding
+    other alerts (e.g. ``#flash``) is read through those alerts.
+    """
+    found: dict[str, list[str]] = {"error": [], "notice": [], "other": []}
     try:
         text = response.text
     except Exception:
-        return None
-    if not isinstance(text, str) or not text:
-        return None
-    soup = BeautifulSoup(text, "html.parser")
-    messages: list[str] = []
-    for element in soup.select(selectors):
-        message = " ".join(element.get_text(" ", strip=True).split())
-        if message and message not in messages:
-            messages.append(message)
-    return "; ".join(messages)[:300] or None
+        text = None
+    if isinstance(text, str) and text:
+        soup = BeautifulSoup(text, "html.parser")
+        matched = [el for el in soup.select(_FLASH_SELECTORS) if _is_rendered(el)]
+        ids = {id(el) for el in matched}
+        for element in matched:
+            if any(id(inner) in ids for inner in element.find_all(True)):
+                continue
+            message = " ".join(element.get_text(" ", strip=True).split())
+            if not message:
+                continue
+            classes: set[str] = set()
+            for node in [element, *element.parents]:
+                if id(node) in ids:
+                    classes.update(element_classes(node))
+            if classes & _ERROR_FLASH_CLASSES:
+                kind = "error"
+            elif classes & _NOTICE_FLASH_CLASSES:
+                kind = "notice"
+            else:
+                kind = "other"
+            if message not in found[kind]:
+                found[kind].append(message)
+    return {kind: "; ".join(msgs)[:300] or None for kind, msgs in found.items()}
 
 
 def upload_submission(
@@ -331,8 +375,10 @@ def upload_submission(
     with a redirect to a submission of this assignment that was not among
     the account's submissions seen on the assignment page just before the
     upload, the final page is that submission's page (or one below it), and
-    it shows no error message. Anything else is reported as not confirmed,
-    with the page Gradescope showed.
+    it shows no visible error-styled message (see ``_flash_messages``; a
+    warning or unstyled message is quoted under a ⚠️ line of the success
+    result). Anything else is reported as not confirmed, with the page
+    Gradescope showed.
 
     Args:
         course_id: The Gradescope course ID.
@@ -484,10 +530,11 @@ def _upload_outcome(
     target = _redirect_target(response, result_url)
     new_id = _submission_id(target, course_id, assignment_id)
     final_id = _submission_id(final_url, course_id, assignment_id)
-    flash = _flash_text(response) if response is not None else None
-    error_flash = (
-        _flash_text(response, _ERROR_FLASH_SELECTORS) if response is not None else None
+    messages = (
+        _flash_messages(response) if response is not None
+        else {"error": None, "notice": None, "other": None}
     )
+    error_flash = messages["error"]
 
     if new_id is None:
         problem = (
@@ -517,8 +564,14 @@ def _upload_outcome(
             f"- **Submission ID:** `{new_id}`",
             f"- **Submission URL:** {result_url or final_url}",
         ]
-        if flash:
-            lines.append(f"- Gradescope said: {flash}")
+        if messages["notice"]:
+            lines.append(f"- Gradescope said: {messages['notice']}")
+        if messages["other"]:
+            lines.append(
+                "- ⚠️ The submission page also shows a message that is not "
+                f"styled as an error: \"{messages['other']}\" The submission "
+                "was created; check it on Gradescope if this reads like a problem."
+            )
         if hashes_checked:
             lines.append("- Every file matched the approved expected_sha256.")
         else:
@@ -538,8 +591,13 @@ def _upload_outcome(
         lines.append(f"- Gradescope answered the upload with a redirect to: {target}")
     if final_url:
         lines.append(f"- Final page: {final_url}")
-    if flash:
-        lines.append(f"- Gradescope said: {flash}")
+    others = "; ".join(m for m in (messages["notice"], messages["other"]) if m)[:300]
+    if error_flash:
+        lines.append(f"- Gradescope's error message: {error_flash}")
+        if others:
+            lines.append(f"- Other messages on the page: {others}")
+    elif others:
+        lines.append(f"- Gradescope said: {others}")
     if new_id is None:
         lines.append(
             "- Possible reasons: the assignment is closed or past its due date, "

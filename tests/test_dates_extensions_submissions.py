@@ -1385,7 +1385,7 @@ def test_upload_redirect_elsewhere_is_not_reported_as_success(monkeypatch, uploa
     assert is_error
     assert text.startswith("❌ Upload not confirmed")
     assert f"- Final page: {final_url}" in text
-    assert "- Gradescope said: This assignment is closed." in text
+    assert "- Gradescope's error message: This assignment is closed." in text
     assert "uploaded successfully" not in text
     # The assignment page (existing submissions), the course page, the upload.
     assert session.methods() == ["GET", "GET", "POST"]
@@ -1582,7 +1582,7 @@ def test_rejected_upload_forwarded_to_the_previous_submission_is_not_success(mon
     assert text.startswith("❌ Upload not confirmed: Gradescope did not open a new submission")
     assert f"- Gradescope answered the upload with a redirect to: {_GS}/courses/1/assignments/2" in text
     assert f"- Final page: {_GS}{_SUB}/100" in text
-    assert "- Gradescope said: The due date for this assignment has passed." in text
+    assert "- Gradescope's error message: The due date for this assignment has passed." in text
     assert "uploaded successfully" not in text
     assert len(site.posts()) == 1
 
@@ -1622,7 +1622,81 @@ def test_new_submission_page_with_an_error_message_is_not_success(monkeypatch, u
         "❌ Upload not confirmed: Gradescope opened submission `101` but its page "
         "shows an error message"
     )
-    assert "- Gradescope said: Your files could not be processed." in text
+    assert "- Gradescope's error message: Your files could not be processed." in text
+
+
+@pytest.mark.parametrize(
+    ("flash", "final", "warning"),
+    [
+        # A plain role=alert success message (no success class).
+        ('<div class="alert" role="alert">Your submission was received.</div>',
+         "", '"Your submission was received."'),
+        # A hidden JS error template.
+        ('<div class="alert alert-error u-hidden js-uploadError" style="display:none">'
+         "Something went wrong uploading your file.</div>", "", None),
+        ('<div class="alert alert-danger" hidden>Upload failed.</div>'
+         '<div class="d-none"><p class="flash-error">Upload failed.</p></div>', "", None),
+        # A <noscript> banner (html.parser parses inside noscript) and a template.
+        ('<noscript><div class="alert alert-danger">Please enable JavaScript.</div></noscript>'
+         '<template><div class="alert alert-danger" role="alert">{{error}}</div></template>',
+         "", None),
+        # A warning on the PDF page-selection step.
+        ('<div class="alert alert-warning" role="alert">Assign pages to every question.</div>',
+         "/select_pages", '"Assign pages to every question."'),
+    ],
+    ids=["plain-role-alert", "hidden-template", "hidden-classes", "noscript-template", "warning"],
+)
+def test_new_submission_page_without_a_visible_error_message_is_success(
+    monkeypatch, upload_file, flash, final, warning
+) -> None:
+    """Round-4 C4 (reviewer repro round3-G2/upload_adv.py): hidden, noscript,
+    template, unstyled and warning alerts on the new submission's page made
+    a created submission an isError failure."""
+    routes = {**_ALREADY_SUBMITTED, ("POST", _SUB): (302, "", f"{_SUB}/101")}
+    if final:
+        routes[("GET", f"{_SUB}/101")] = (302, "", f"{_SUB}/101{final}")
+    routes[("GET", f"{_SUB}/101{final}")] = (200, _submission_page(101, flash), None)
+    _upload_site(monkeypatch, routes)
+
+    text, is_error = _call_tool_flagged("tool_upload_submission", _upload_args(upload_file))
+
+    assert not is_error, text
+    assert text.startswith("✅ Submission uploaded successfully!")
+    assert "- **Submission ID:** `101`" in text
+    assert "error message" not in text and "went wrong" not in text
+    assert "Please enable JavaScript" not in text and "Upload failed" not in text
+    if warning:
+        assert (
+            "- ⚠️ The submission page also shows a message that is not styled as "
+            f"an error: {warning} The submission was created"
+        ) in text
+    else:
+        assert "⚠️" not in text and "Gradescope said" not in text
+
+
+def test_upload_error_line_quotes_only_the_visible_error_message(monkeypatch, upload_file) -> None:
+    """Round-4 C4: an error alert inside a #flash container is read as an
+    error, and the other (or hidden) messages are not quoted as the error."""
+    flash = (
+        '<div id="flash"><div class="alert alert-danger"><p role="alert">'
+        "Your files could not be processed.</p></div>"
+        '<div class="alert alert-success">Your submission was received.</div></div>'
+        '<div class="alert alert-error" style="display: none">Hidden template.</div>'
+    )
+    _upload_site(monkeypatch, {**_ALREADY_SUBMITTED, ("POST", _SUB): (302, "", f"{_SUB}/101"),
+                               ("GET", f"{_SUB}/101"): (200, _submission_page(101, flash), None)})
+
+    text, is_error = _call_tool_flagged("tool_upload_submission", _upload_args(upload_file))
+
+    assert is_error
+    assert text.startswith(
+        "❌ Upload not confirmed: Gradescope opened submission `101` but its page "
+        "shows an error message"
+    )
+    assert "- Gradescope's error message: Your files could not be processed.\n" in text
+    assert "- Other messages on the page: Your submission was received.\n" in text
+    assert "Hidden template" not in text
+    assert "Gradescope said" not in text
 
 
 def test_new_submission_that_moves_on_to_another_page_is_not_success(monkeypatch, upload_file) -> None:
@@ -1905,3 +1979,169 @@ def test_timezone_argument_stands_in_when_no_course_timezone_is_reported(monkeyp
 
     assert "= 2026-10-02T03:59:00Z" in preview
     assert "(timezone argument; Gradescope reports no course timezone)" in preview
+
+
+def test_timezone_refusal_advises_omitting_it_not_only_an_offset(monkeypatch) -> None:
+    """Round-4 C6 (reviewer repro round3-G2/ext_adv.py T1): the refusal
+    offered "or give the dates with a UTC offset", but dates that already
+    carry one are refused the same way while timezone differs."""
+    srv = ExtensionServer({"3": {"due_date": _abs("2026-10-03T06:59:00Z")}})
+    _use(monkeypatch, extensions, srv.session)
+
+    text, is_error = _call_tool_flagged("tool_set_extension", {
+        "course_id": "1", "assignment_id": "2", "user_id": "3",
+        "due_date": "2026-10-04T23:59-07:00", "timezone": "America/New_York",
+    })
+
+    assert is_error
+    assert "or give the dates with a UTC offset" not in text
+    assert "Omit timezone or pass 'America/Los_Angeles'" in text
+    # Following that advice works.
+    preview = extensions.set_extension("1", "2", "3", due_date="2026-10-04T23:59-07:00")
+    assert "Write confirmation required" in preview
+    assert srv.posted == []
+
+
+def _two_zone_session(overrides_by_zone: dict) -> FakeSession:
+    page = "".join(
+        _extensions_page(overrides, zone) for zone, overrides in overrides_by_zone.items()
+    )
+    return FakeSession([("GET", "/assignments/2/extensions", FakeResponse(text=page))])
+
+
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.parametrize("arg", ["Asia/Tokyo", "America/Los_Angeles"])
+def test_timezone_argument_is_refused_when_the_page_reports_several_zones(
+    monkeypatch, confirm, arg
+) -> None:
+    """Round-4 C5 (reviewer repro round3-G2/ext_adv.py T2): with two zones on
+    the page the check was skipped and the note claimed Gradescope reports
+    no course timezone. Even one of the listed zones can't be checked."""
+    session = _two_zone_session({
+        "America/Los_Angeles": {"3": {"due_date": _abs("2026-10-03T06:59:00Z")}},
+        "America/New_York": {"4": {"due_date": _abs("2026-10-03T03:59:00Z")}},
+    })
+    _use(monkeypatch, extensions, session)
+
+    text, is_error = _call_tool_flagged("tool_set_extension", {
+        "course_id": "1", "assignment_id": "2", "user_id": "3",
+        "due_date": "2026-10-04T23:59", "timezone": arg, "confirm_write": confirm,
+    })
+
+    assert is_error
+    assert text == (
+        f"Error: timezone='{arg}' cannot be checked against the course "
+        "timezone: the extensions page lists several timezones "
+        "(America/Los_Angeles, America/New_York). Omit timezone and give every "
+        "date with its UTC offset (e.g. 2026-10-04T23:59-07:00). Nothing was "
+        "changed."
+    )
+    assert "reports no course timezone" not in text
+    assert [method for method, _url, _kw in session.calls] == ["GET"]
+
+
+def test_several_zones_without_a_timezone_argument_suggest_only_offsets(monkeypatch) -> None:
+    session = _two_zone_session({
+        "America/Los_Angeles": {"3": {"due_date": _abs("2026-10-03T06:59:00Z")}},
+        "America/New_York": {"4": {"due_date": _abs("2026-10-03T03:59:00Z")}},
+    })
+    _use(monkeypatch, extensions, session)
+
+    naive = extensions.set_extension("1", "2", "3", due_date="2026-10-04T23:59")
+    offset = extensions.set_extension("1", "2", "3", due_date="2026-10-04T23:59-07:00")
+
+    assert naive.startswith("Error: cannot tell which timezone due_date is in: the extensions page lists several")
+    assert "Give the dates with a UTC offset. Nothing was changed." in naive
+    assert "Pass timezone=" not in naive
+    assert "Write confirmation required" in offset
+    assert "Timezone for dates without an offset" not in offset
+
+
+def test_timezone_argument_is_refused_when_the_course_zone_is_unknown_here(monkeypatch) -> None:
+    """Round-4 C5 (reviewer repro round3-G2/ext_adv.py T3)."""
+    srv = ExtensionServer(
+        {"3": {"due_date": _abs("2026-10-03T06:59:00Z")}}, timezone="Mars/Olympus_Mons"
+    )
+    _use(monkeypatch, extensions, srv.session)
+
+    text = extensions.set_extension(
+        "1", "2", "3", due_date="2026-10-04T23:59", timezone="Asia/Tokyo"
+    )
+
+    assert text.startswith(
+        "Error: timezone='Asia/Tokyo' cannot be checked against the course "
+        "timezone: the course timezone 'Mars/Olympus_Mons' is not known on this server."
+    )
+    assert srv.posted == []
+
+
+def _zone_revealed_by_the_write(srv: ExtensionServer, zone: str) -> None:
+    store = srv._post
+
+    def post_then_reveal(url, kwargs):
+        response = store(url, kwargs)
+        srv.timezone = zone
+        return response
+
+    srv.session.routes[1] = ("POST", "/assignments/2/extensions", post_then_reveal)
+
+
+def test_stand_in_timezone_contradicted_by_the_read_back_is_flagged(monkeypatch) -> None:
+    """Round-4 C7 (reviewer repro round3-G2/ext_adv.py T4): no zone before the
+    write, so timezone=America/New_York stood in; the read-back reports
+    America/Los_Angeles, and the result was a plain ✅."""
+    srv = ExtensionServer(overrides={}, timezone=None)
+    _zone_revealed_by_the_write(srv, "America/Los_Angeles")
+    _use(monkeypatch, extensions, srv.session)
+
+    text, is_error = _call_tool_flagged("tool_set_extension", {
+        "course_id": "1", "assignment_id": "2", "user_id": "3",
+        "due_date": "2026-10-04T23:59", "timezone": "America/New_York",
+        "confirm_write": True,
+    })
+
+    assert not is_error
+    assert text.startswith(
+        "⚠️ Extension for user `3` on assignment `2` was written (HTTP 200), but "
+        "its dates may be in the wrong timezone:\n"
+        "- timezone: due_date had no UTC offset and was resolved in "
+        "timezone='America/New_York', because Gradescope reported no course "
+        "timezone before the write, but the extensions page now reports "
+        "America/Los_Angeles (due_date = 2026-10-04 20:59 PDT course time)."
+    )
+    assert "preview the extension again without timezone" in text
+    assert "- due_date → 2026-10-04 23:59 America/New_York (EDT) = 2026-10-05T03:59:00Z" in text
+    assert "✅" not in text
+    assert len(srv.posted) == 1
+
+
+def test_stand_in_timezone_confirmed_by_the_read_back_is_success(monkeypatch) -> None:
+    srv = ExtensionServer(overrides={}, timezone=None)
+    _zone_revealed_by_the_write(srv, "America/New_York")
+    _use(monkeypatch, extensions, srv.session)
+
+    text = extensions.set_extension(
+        "1", "2", "3", due_date="2026-10-04T23:59", timezone="America/New_York",
+        confirm_write=True,
+    )
+
+    assert text.startswith("✅ Extension for user `3` on assignment `2` updated")
+    assert "⚠️" not in text
+
+
+def test_stand_in_timezone_with_offset_dates_only_notes_the_revealed_zone(monkeypatch) -> None:
+    srv = ExtensionServer(overrides={}, timezone=None)
+    _zone_revealed_by_the_write(srv, "America/Los_Angeles")
+    _use(monkeypatch, extensions, srv.session)
+
+    text = extensions.set_extension(
+        "1", "2", "3", due_date="2026-10-04T23:59-07:00", timezone="America/New_York",
+        confirm_write=True,
+    )
+
+    assert text.startswith("✅ Extension for user `3` on assignment `2` updated")
+    assert (
+        "- The extensions page now reports the course timezone America/Los_Angeles; "
+        "the dates had UTC offsets, so timezone='America/New_York' only affected "
+        "how they are shown."
+    ) in text

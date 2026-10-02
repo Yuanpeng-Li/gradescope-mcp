@@ -35,6 +35,9 @@ what an error may say:
   ``/account/auth``), serves its login page, answers 401 "You must be logged
   in", or serves the logged-out home page (a page with the login form and no
   logout link, e.g. after a redirect to ``/``), and flags the current thread.
+  A streamed body is never read by the hook: its logged-out-page check runs
+  when the reader has read the body within its own limits
+  (``check_streamed_body``).
   ``with_session_recovery`` (applied to every MCP tool and resource in
   ``server.py``) sees the flag and drops the expired connection. It re-runs
   the call once on a fresh login, so a call logs in again at most once,
@@ -483,25 +486,38 @@ def _with_cooldown(reason: str, seconds: float) -> str:
 # ------------------------------------------------------------------
 
 
+def _content_type(response: requests.Response) -> str:
+    content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0]
+    return content_type.strip().lower()
+
+
 def _shows_logged_out_page(response: requests.Response, stream: bool = False) -> bool:
     """Whether a page is Gradescope's logged-out page: the login form, no logout link.
 
     Gradescope may send an expired session to its home page instead of
     ``/login``; requests follows that redirect (turning a POST into a GET),
     and the caller would get a 200 with the anonymous home page. Only HTML is
-    inspected (a missing Content-Type counts as HTML unless the body is
-    streamed), and a page is parsed only if it has a ``<form`` tag posting to
-    ``/login``. A page that also links to ``/logout`` belongs to a logged-in
-    session and does not count.
+    inspected (a missing Content-Type counts as HTML). A streamed body is not
+    read here (False): reading it would bypass the reader's size and time
+    limits, so the hook leaves that check to ``check_streamed_body``.
     """
-    content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0]
-    content_type = content_type.strip().lower()
-    if content_type not in _HTML_TYPES and (content_type or stream):
+    content_type = _content_type(response)
+    if stream or (content_type and content_type not in _HTML_TYPES):
         return False
     try:
         content = response.content
     except Exception:
         return False
+    return _is_logged_out_body(response, content)
+
+
+def _is_logged_out_body(response: requests.Response, content: bytes) -> bool:
+    """Whether ``content``, the body of ``response``, is the logged-out page.
+
+    It is parsed only if it has a ``<form`` tag posting to ``/login``. A page
+    that also links to ``/logout`` belongs to a logged-in session and does
+    not count.
+    """
     if not content or not _LOGIN_FORM_TAG_RE.search(content):
         return False
     try:
@@ -570,14 +586,20 @@ def _install_expiry_hook(conn: GSConnection) -> None:
     it (and before it could turn a POST into a GET of the login page). A
     redirect to another page that turns out to be the logged-out home page
     raises on that page. Responses that are not expiry signals are counted
-    as accepted writes where they apply (``_note_write``).
+    as accepted writes where they apply (``_note_write``). A streamed body is
+    never read here (that would bypass the reader's size and time limits):
+    for a streamed same-site HTML page the logged-out-page check is left to
+    the reader (``check_streamed_body``).
     """
     site = _site(conn.gradescope_base_url)
 
     def _check_session(response, *args, **kwargs):
-        reason = _expiry_reason(response, site, stream=bool(kwargs.get("stream")))
+        stream = bool(kwargs.get("stream"))
+        reason = _expiry_reason(response, site, stream=stream)
         if reason is None:
             _note_write(response, site)
+            if stream:
+                _defer_body_check(response, site, conn)
             return response
         _local.pending_write = False
         _local.expired = conn
@@ -590,6 +612,45 @@ def _install_expiry_hook(conn: GSConnection) -> None:
 
     _check_session._gradescope_expiry_hook = True
     conn.session.hooks["response"].append(_check_session)
+
+
+def _defer_body_check(response: requests.Response, site: str, conn: GSConnection) -> None:
+    """Leave the logged-out-page check of a streamed response to its reader.
+
+    Applies to a same-site 2xx HTML response (the kind ``_shows_logged_out_page``
+    reads when not streamed); ``check_streamed_body`` runs the check.
+    """
+    if (
+        _site(response.url) != site
+        or not 200 <= response.status_code < 300
+        or _content_type(response) not in _HTML_TYPES
+    ):
+        return
+
+    def check(body: bytes) -> None:
+        if _is_logged_out_body(response, body):
+            _local.pending_write = False
+            _local.expired = conn
+            raise SessionExpiredError(
+                "Gradescope session expired (Gradescope served its logged-out "
+                "page with the login form)."
+            )
+
+    response._gradescope_body_check = check
+
+
+def check_streamed_body(response: requests.Response, body: bytes) -> None:
+    """Finish the expiry check of a streamed response once its body was read.
+
+    The expiry hook does not read a streamed body, so the code that reads it
+    (within its own size and time limits) passes the body here. Raises
+    ``SessionExpiredError`` and flags the thread, as the hook does, when the
+    body is Gradescope's logged-out page; does nothing for responses the
+    hook did not defer.
+    """
+    check = getattr(response, "_gradescope_body_check", None)
+    if check is not None:
+        check(body)
 
 
 def _remove_expiry_hook(conn: GSConnection) -> None:

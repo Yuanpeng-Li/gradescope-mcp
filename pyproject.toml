@@ -9,6 +9,9 @@ dependencies = [
     "gradescopeapi>=1.8.1",
     "mcp>=2.2.0,<3",
     "python-dotenv>=1.2.2",
+    # Page downloads use HTTPResponse.read1 (2.2) and shutdown() (2.3); an
+    # older urllib3 falls back to iter_content without the hard deadline.
+    "urllib3>=2.3",
 ]
 
 [project.scripts]

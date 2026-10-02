@@ -30,7 +30,7 @@ from gradescope_mcp.cache import (
     get_artifact_path,
     write_artifact,
 )
-from gradescope_mcp.auth import AuthError, get_connection
+from gradescope_mcp.auth import AuthError, check_streamed_body, get_connection
 from gradescope_mcp.tools.common import (
     format_untrusted,
     is_placeholder_page,
@@ -1177,9 +1177,18 @@ def _iter_page_chunks(resp: Any):
     A urllib3 body is read with ``read1``, which returns as soon as any bytes
     arrive instead of blocking until a whole chunk is in (``iter_content``
     does the latter, so a 1-byte trickle never reached the deadline check).
+    A body something else already read (e.g. a response hook reading
+    ``resp.content``) is taken from ``resp.content``, since its stream is
+    drained, and a urllib3 older than 2.2 (no ``read1``) falls back to
+    ``iter_content``.
     """
+    if getattr(resp, "_content_consumed", False) and isinstance(
+        getattr(resp, "_content", None), bytes
+    ):
+        yield from resp.iter_content(chunk_size=_PAGE_CHUNK_BYTES)
+        return
     raw = getattr(resp, "raw", None)
-    if not isinstance(raw, Urllib3Response):
+    if not isinstance(raw, Urllib3Response) or not hasattr(raw, "read1"):
         yield from resp.iter_content(chunk_size=_PAGE_CHUNK_BYTES)
         return
     while True:
@@ -1245,7 +1254,10 @@ def _download_page_image(session: Any, url: str) -> tuple[bytes, str]:
     The body is streamed: a declared Content-Length over the cap is refused
     before reading, and an undeclared or understated one is cut off as soon
     as the cap is exceeded. The whole download, from the request on, must
-    finish within ``_PAGE_DEADLINE_SECONDS``.
+    finish within ``_PAGE_DEADLINE_SECONDS``. On the Gradescope session the
+    expiry hook does not read the streamed body; a same-site HTML answer is
+    checked for the logged-out page here, after the bounded read
+    (``check_streamed_body`` raises ``SessionExpiredError``).
     """
     deadline = time.monotonic() + _PAGE_DEADLINE_SECONDS
     resp = session.get(url, stream=True)
@@ -1258,6 +1270,7 @@ def _download_page_image(session: Any, url: str) -> tuple[bytes, str]:
                 f"too large ({declared} bytes; limit {_MAX_PAGE_BYTES} bytes)"
             )
         data = _read_page_body(resp, deadline)
+        check_streamed_body(resp, data)
         content_type = (
             str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         )

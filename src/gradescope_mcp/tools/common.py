@@ -47,6 +47,32 @@ def select_crop_pages(pages: list[dict], crop_page_numbers: Iterable[Any]) -> li
     return [p for p, n in zip(pages, numbers) if n in wanted]
 
 
+# Classes that keep an element (and everything inside it) from being shown.
+HIDDEN_CLASSES = frozenset({"hidden", "d-none", "hide", "invisible", "is-hidden"})
+
+_HIDDEN_STYLE_RE = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)", re.IGNORECASE
+)
+
+
+def element_classes(el) -> list[str]:
+    """A BeautifulSoup element's classes, lower-cased."""
+    classes = el.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    return [c.lower() for c in classes]
+
+
+def is_hidden_element(el) -> bool:
+    """Whether ``el`` itself is not rendered (hidden attribute, class or style)."""
+    if el.has_attr("hidden"):
+        return True
+    if any(c in HIDDEN_CLASSES for c in element_classes(el)):
+        return True
+    style = el.get("style")
+    return isinstance(style, str) and bool(_HIDDEN_STYLE_RE.search(style))
+
+
 def escape_md_cell(value: Any) -> str:
     """Make a value safe to place inside a markdown table cell.
 
