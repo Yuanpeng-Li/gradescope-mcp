@@ -1299,6 +1299,8 @@ def _assignment(assignment_id="5", **dates):
 def _use_assignments(monkeypatch, items) -> None:
     conn = SimpleNamespace(account=SimpleNamespace(get_assignments=lambda _cid: items))
     monkeypatch.setattr(assignments, "get_connection", lambda: conn)
+    # get_assignments reads the page itself (to see assignment containers).
+    monkeypatch.setattr(assignments, "_fetch_assignment_listing", lambda _conn, _cid: (items, []))
 
 
 def test_assignment_details_not_found_is_an_mcp_error(monkeypatch) -> None:

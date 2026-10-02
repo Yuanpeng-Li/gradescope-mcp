@@ -155,10 +155,8 @@ def test_get_assignments_renders_zero_grade_as_zero(monkeypatch) -> None:
             max_grade=10.0,
         ),
     ]
-    monkeypatch.setattr(
-        assignments, "get_connection",
-        lambda: SimpleNamespace(account=SimpleNamespace(get_assignments=lambda *_: sample)),
-    )
+    monkeypatch.setattr(assignments, "get_connection", lambda: SimpleNamespace())
+    monkeypatch.setattr(assignments, "_fetch_assignment_listing", lambda *_: (sample, []))
 
     result = assignments.get_assignments("1")
     assert "0.0/10.0" in result

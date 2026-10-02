@@ -31,7 +31,8 @@ def _get_outline_data(course_id: str, assignment_id: str) -> dict:
     Supports both AssignmentEditor (online assignments) and
     AssignmentOutline (scanned PDF exams) components.
 
-    Returns the full props dict with questions, assignment info, etc.
+    Returns the full props dict with questions, assignment info, etc., plus
+    ``_outline_component``: the component the outline was read from.
     Raises ValueError if the page structure is not as expected.
     """
     conn = get_connection()
@@ -49,7 +50,10 @@ def _get_outline_data(course_id: str, assignment_id: str) -> dict:
     # Try AssignmentEditor first (online/homework assignments)
     editor = soup.find(attrs={"data-react-class": "AssignmentEditor"})
     if editor is not None:
-        return json.loads(editor.get("data-react-props", "{}"))
+        props = json.loads(editor.get("data-react-props", "{}"))
+        if isinstance(props, dict):
+            props["_outline_component"] = "AssignmentEditor"
+        return props
 
     # Fallback: AssignmentOutline (scanned PDF exams)
     outline_tag = soup.find(attrs={"data-react-class": "AssignmentOutline"})
@@ -83,6 +87,7 @@ def _get_outline_data(course_id: str, assignment_id: str) -> dict:
 
         _flatten(outline_list)
         props["questions"] = questions
+        props["_outline_component"] = "AssignmentOutline"
         return props
 
     raise ValueError(
@@ -196,12 +201,15 @@ def get_assignment_outline(course_id: str, assignment_id: str) -> str:
     tree = _build_question_tree(questions)
 
     # Format output
-    assignment_info = props.get("assignment", {})
+    assignment_info = props.get("assignment") or {}
     lines = [f"## Assignment Outline\n"]
 
-    if assignment_info:
-        atype = assignment_info.get("type", "Unknown")
-        lines.append(f"**Type:** {atype}")
+    atype = assignment_info.get("type") if isinstance(assignment_info, dict) else None
+    if not atype and props.get("_outline_component") == "AssignmentEditor":
+        # The online-assignment editor's props carry no assignment type.
+        atype = "Online assignment"
+    if atype or assignment_info:
+        lines.append(f"**Type:** {atype or 'Unknown'}")
 
     lines.append(f"**Total questions:** {len(questions)}\n")
 

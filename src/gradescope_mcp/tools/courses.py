@@ -1,11 +1,26 @@
 """Course-related MCP tools."""
 
 import json
+import re
 
 from bs4 import BeautifulSoup
 
 from gradescope_mcp.auth import get_connection, AuthError
 from gradescope_mcp.tools.common import escape_md_cell
+
+
+# gradescopeapi reads the course box's assignment count with ``.text``, which
+# glues the count to a child element: "1 assignmentNo Published Grades".
+_GLUED_COUNT_RE = re.compile(r"^(\d+\s+assignments?)(?![a-z])\s*(\S.*)$")
+
+
+def _assignment_count_text(value) -> str:
+    """The course box's assignment count, e.g. "1 assignment · No Published Grades"."""
+    text = " ".join(str(value or "").split())
+    match = _GLUED_COUNT_RE.match(text)
+    if match:
+        return f"{match.group(1)} · {match.group(2)}"
+    return text or "N/A"
 
 
 def list_courses() -> str:
@@ -31,7 +46,7 @@ def list_courses() -> str:
                 f"- **{course.name}** ({course.full_name})\n"
                 f"  - ID: `{course_id}`\n"
                 f"  - Semester: {course.semester} {course.year}\n"
-                f"  - Assignments: {course.num_assignments}"
+                f"  - Assignments: {_assignment_count_text(course.num_assignments)}"
             )
 
     student_courses = courses.get("student", {})
@@ -42,7 +57,7 @@ def list_courses() -> str:
                 f"- **{course.name}** ({course.full_name})\n"
                 f"  - ID: `{course_id}`\n"
                 f"  - Semester: {course.semester} {course.year}\n"
-                f"  - Assignments: {course.num_assignments}"
+                f"  - Assignments: {_assignment_count_text(course.num_assignments)}"
             )
 
     if not lines:

@@ -411,7 +411,8 @@ def tool_get_assignments(course_id: GradescopeID) -> str:
     those columns show N/A. Dates Gradescope reports with a UTC offset are
     shown with it (e.g. ``2026-10-01 23:59 UTC-07:00``, ``2026-10-02 06:59
     UTC``); tool_modify_assignment_dates takes course-local wall-clock
-    times.
+    times. Assignment containers Gradescope lists on the staff page are
+    not assignments: they are named in a note below the table, not counted.
 
     Args:
         course_id: The Gradescope course ID (found via list_courses).
@@ -610,9 +611,11 @@ def tool_modify_assignment_dates(
     turn late submissions off. The preview reads the current settings and
     lists all four values that will be sent, so it returns an error
     (Authentication error / Error) instead of a partial preview when they
-    can't be read. The result is verified by re-reading the settings.
-    Confirmed changes to the same assignment run one at a time (a call
-    waits up to 300 s for another one, then returns an Error).
+    can't be read. Preview and result name the course timezone the
+    settings page reports and warn when the due date is synced from an LMS
+    (a later sync may overwrite it). The result is verified by re-reading
+    the settings. Confirmed changes to the same assignment run one at a
+    time (a call waits up to 300 s for another one, then returns an Error).
     Requires instructor or TA access.
 
     Args:
@@ -1383,11 +1386,16 @@ def tool_grade_answer_group(
 
     Validated before the preview: the rubric IDs must be in the question's
     rubric (unknown IDs are refused), the group must have confirmed
-    members, and the page must carry a CSRF token and save URL. The grade
-    page must belong to ``group_id`` (no redirect to another group's page,
-    matching ``answer_group``, a save URL in this course and question whose
+    members (a group without any is refused before its grade page is
+    fetched: Gradescope has no grading page for it), and the page must
+    carry a CSRF token and save URL. The grade page must belong to
+    ``group_id`` (no redirect to another group's page, matching
+    ``answer_group``, a save URL in this course and question whose
     submission is not known to be outside the group); otherwise nothing is
-    sent. The preview shows the members and their graded counts, the items
+    sent. Gradescope serves the group grade page as the group's
+    representative submission in group mode; its ``/save_many_grades``
+    save URL is used only when that page is in group mode for
+    ``group_id`` and its submission is a confirmed member. The preview shows the members and their graded counts, the items
     CHECKED and UNCHECKED for every member, the projected per-member score
     (with a warning when Gradescope did not report the scoring direction)
     and the member count to pass back as ``expected_member_count``. With

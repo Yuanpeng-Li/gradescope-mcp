@@ -506,35 +506,111 @@ def get_answer_group_detail(
     return "\n".join(lines)
 
 
-def _save_many_grades_path(props: dict[str, Any]) -> tuple[str | None, str | None]:
-    """Derive the save_many_grades path from the page's save_grade URL.
+_SAVE_PATH_RE = re.compile(
+    r"^/courses/([^/?#]+)/questions/([^/?#]+)/submissions/([^/?#]+)"
+    r"/(save_grade|save_many_grades)$"
+)
 
-    The frontend swaps a trailing ``/save_grade`` for ``/save_many_grades`` in
-    group mode. Anything else is refused rather than guessed: posting the
-    group payload to a single-submission endpoint would grade one student
-    while reporting the whole group as graded.
+
+def _page_group_id(props: dict[str, Any]) -> Any:
+    """The answer group a grade page is for (``answer_group``), or None."""
+    page_group = props.get("answer_group")
+    if isinstance(page_group, dict):
+        page_group = page_group.get("id")
+    return page_group
+
+
+def _group_mode_problem(
+    save_url: str,
+    props: dict[str, Any],
+    course_id: str,
+    question_id: str,
+    group_id: str,
+    submissions: list[Any],
+) -> str | None:
+    """Why a ``/save_many_grades`` save URL can't be trusted for this group.
+
+    Gradescope serves the group grade page by redirecting to the group's
+    representative submission in group mode
+    (``/submissions/{sid}/grade?group_mode=true``), whose save URL already
+    ends in ``/save_many_grades``. Such a URL is used only when the page is
+    in group mode for ``group_id``, the URL is in this course and question,
+    and its submission is the page's own submission and a confirmed member
+    of the group.
+    """
+    if props.get("group_mode") is not True:
+        return "the page is not in group mode"
+    page_group = _page_group_id(props)
+    if page_group is None:
+        return "the page does not name its answer group"
+    if str(page_group) != str(group_id):
+        return f"the page names answer group `{page_group}`, not `{group_id}`"
+    match = _SAVE_PATH_RE.match(save_url)
+    if match is None:
+        return "it is not a submission's save_many_grades path"
+    save_course, save_question, save_sid, _ = match.groups()
+    if (save_course, save_question) != (str(course_id), str(question_id)):
+        return f"it is not in course `{course_id}`, question `{question_id}`"
+    page_sub = props.get("submission")
+    page_sid = page_sub.get("id") if isinstance(page_sub, dict) else None
+    if page_sid is None or _canonical_id(page_sid) != _canonical_id(save_sid):
+        return f"its submission `{save_sid}` is not the page's submission (`{page_sid}`)"
+    listed = next(
+        (
+            s for s in submissions
+            if isinstance(s, dict) and _canonical_id(s.get("id")) == _canonical_id(save_sid)
+        ),
+        None,
+    )
+    if listed is None or str(listed.get("confirmed_group_id")) != str(group_id):
+        return (
+            f"its submission `{save_sid}` is not a confirmed member of answer "
+            f"group `{group_id}`"
+        )
+    return None
+
+
+def _save_many_grades_path(
+    props: dict[str, Any],
+    course_id: str,
+    question_id: str,
+    group_id: str,
+    submissions: list[Any],
+) -> tuple[str | None, str | None]:
+    """Find the save_many_grades path on the group grade page.
+
+    A save URL ending in ``/save_grade`` is rewritten: the frontend swaps
+    that suffix for ``/save_many_grades`` in group mode. A save URL that
+    already ends in ``/save_many_grades`` (the group-mode page Gradescope
+    redirects to) is used as is after the checks in ``_group_mode_problem``.
+    Anything else is refused rather than guessed: posting the group payload
+    to a single-submission endpoint would grade one student while reporting
+    the whole group as graded.
 
     Returns ``(path, None)`` on success or ``(None, error_message)``.
     """
     save_url = (props.get("urls") or {}).get("save_grade")
     if not save_url or not isinstance(save_url, str):
         return None, "save_grade URL not found in group grading context."
-    if (
-        not save_url.startswith("/")
-        or save_url.startswith("//")
-        or not save_url.endswith("/save_grade")
-    ):
-        return None, (
-            f"unexpected save URL `{save_url}` on the group grade page "
-            "(expected a path ending in /save_grade). Refusing to guess the "
-            "save_many_grades endpoint."
-        )
-    return save_url[: -len("/save_grade")] + "/save_many_grades", None
-
-
-_SAVE_GRADE_PATH_RE = re.compile(
-    r"^/courses/([^/?#]+)/questions/([^/?#]+)/submissions/([^/?#]+)/save_grade$"
-)
+    if save_url.startswith("/") and not save_url.startswith("//"):
+        if save_url.endswith("/save_grade"):
+            return save_url[: -len("/save_grade")] + "/save_many_grades", None
+        if save_url.endswith("/save_many_grades"):
+            problem = _group_mode_problem(
+                save_url, props, course_id, question_id, group_id, submissions
+            )
+            if problem is None:
+                return save_url, None
+            return None, (
+                f"the group grade page saves to `{save_url}`, but {problem}. "
+                "Refusing to post the batch grade there."
+            )
+    return None, (
+        f"unexpected save URL `{save_url}` on the group grade page "
+        "(expected a path ending in /save_grade, or /save_many_grades on "
+        "this group's group-mode page). Refusing to guess the "
+        "save_many_grades endpoint."
+    )
 
 
 def _group_page_problem(
@@ -556,9 +632,7 @@ def _group_page_problem(
     ``group_id``, and a save URL outside this course and question or through
     a submission known to sit outside the group.
     """
-    page_group = props.get("answer_group")
-    if isinstance(page_group, dict):
-        page_group = page_group.get("id")
+    page_group = _page_group_id(props)
     final_url = getattr(resp, "url", None)
     if isinstance(final_url, str) and final_url:
         landed = urlsplit(final_url).path.rstrip("/")
@@ -578,10 +652,10 @@ def _group_page_problem(
             f"answer group `{page_group}`"
         )
     save_url = (props.get("urls") or {}).get("save_grade")
-    match = _SAVE_GRADE_PATH_RE.match(save_url) if isinstance(save_url, str) else None
+    match = _SAVE_PATH_RE.match(save_url) if isinstance(save_url, str) else None
     if match is None:
         return None
-    save_course, save_question, save_sid = match.groups()
+    save_course, save_question, save_sid, _ = match.groups()
     if (save_course, save_question) != (str(course_id), str(question_id)):
         return (
             f"the group grade page's save URL `{save_url}` is not in course "
@@ -625,6 +699,47 @@ def _format_points(value: float | None) -> str:
     return f"{value:g}"
 
 
+def _no_confirmed_members_error(group_id: str, inferred_subs: list[dict[str, Any]]) -> str:
+    """Refusal for a group that has no confirmed members (nothing is fetched)."""
+    text = (
+        f"Error: answer group `{group_id}` has 0 confirmed members "
+        f"({len(inferred_subs)} inferred). Gradescope offers no group grading "
+        "page for a group without confirmed members (its grade page redirects "
+        "to the answer-grouping overview), so it can't be batch-graded. "
+        "Nothing was sent. Confirm the group's members in Gradescope's "
+        "answer-grouping UI and run this again, or grade the submissions "
+        "individually (tool_apply_grade / tool_apply_grade_batch)."
+    )
+    if inferred_subs:
+        ids = [_canonical_id(s.get("id")) for s in inferred_subs]
+        text += (
+            " Inferred members (Gradescope's unconfirmed suggestions for this "
+            f"group): {_format_id_list(ids)}."
+        )
+    return text
+
+
+_GROUPING_OVERVIEW_RE = re.compile(r"^/courses/([^/]+)/questions/([^/]+)/answer_groups$")
+
+
+def _grouping_overview_path(
+    resp: Any, soup: BeautifulSoup, course_id: str, question_id: str
+) -> str | None:
+    """The path of the answer-grouping overview the grade page landed on, if so.
+
+    Gradescope redirects a group grade URL it can't serve to the question's
+    ``/answer_groups`` overview (an ``AnswerGrouper`` page). Returns ``None``
+    for any other page.
+    """
+    final_url = getattr(resp, "url", None)
+    landed = urlsplit(final_url).path.rstrip("/") if isinstance(final_url, str) else ""
+    if _GROUPING_OVERVIEW_RE.match(landed):
+        return landed
+    if soup.find(attrs={"data-react-class": "AnswerGrouper"}) is not None:
+        return landed or f"/courses/{course_id}/questions/{question_id}/answer_groups"
+    return None
+
+
 def grade_answer_group(
     course_id: str,
     question_id: str,
@@ -648,12 +763,17 @@ def grade_answer_group(
     members.
 
     Everything is validated before the preview: the rubric IDs must exist in
-    the question's current rubric, the group must have confirmed members, and
-    the page must carry a CSRF token and a recognisable save URL. The grade
-    page must also be this group's: a redirect to another group's page (or
-    to a page that does not name ``group_id``), an ``answer_group`` other
-    than ``group_id``, or a save URL in another course/question or through a
-    submission known to be outside the group refuses the write.
+    the question's current rubric, the group must have confirmed members
+    (checked before the grade page is fetched: Gradescope redirects a group
+    without any to the grouping overview), and the page must carry a CSRF
+    token and a recognisable save URL. The grade page must also be this
+    group's: a redirect to another group's page (or to a page that does not
+    name ``group_id``), an ``answer_group`` other than ``group_id``, or a
+    save URL in another course/question or through a submission known to be
+    outside the group refuses the write. Gradescope serves the group grade
+    page as the group's representative submission in group mode, with a
+    save URL already ending in ``/save_many_grades``; that URL is used only
+    under the checks in ``_group_mode_problem``.
 
     Overwrite approval is tied to the members the preview listed as graded:
     a write over graded members needs ``overwrite_graded=True`` together
@@ -742,6 +862,10 @@ def grade_answer_group(
         confirmed_subs, inferred_subs = _partition_group_submissions(
             ag_data.get("submissions") or [], group_id
         )
+        # Gradescope has no grading page for such a group (its grade URL
+        # redirects to the grouping overview), so don't fetch one.
+        if not confirmed_subs:
+            return _no_confirmed_members_error(group_id, inferred_subs)
 
         # Access the group grading page to get save_many_grades URL + CSRF
         group_grade_url = (
@@ -758,6 +882,18 @@ def grade_answer_group(
 
         grader = soup.find(attrs={"data-react-class": "SubmissionGrader"})
         if not grader:
+            overview = _grouping_overview_path(resp, soup, course_id, question_id)
+            if overview is not None:
+                return (
+                    f"Error: the grade page for answer group `{group_id}` "
+                    f"redirected to the answer-grouping overview (`{overview}`) "
+                    "instead of a grading page, so Gradescope offers no group "
+                    "grading page for this group right now (it does this for a "
+                    "group without confirmed members). Nothing was sent. Check "
+                    "the group with tool_get_answer_group_detail; confirm its "
+                    "members in Gradescope's answer-grouping UI, or grade the "
+                    "submissions individually."
+                )
             return "Error: SubmissionGrader component not found on group grade page."
 
         props = json.loads(grader.get("data-react-props") or "{}")
@@ -776,30 +912,26 @@ def grade_answer_group(
     i_stats = _member_stats(inferred_subs)
     member_count = c_stats["count"] + i_stats["count"]
 
-    if c_stats["count"] == 0:
-        return (
-            f"Error: answer group `{group_id}` has 0 confirmed members "
-            f"({i_stats['count']} inferred). Refusing to batch-grade a group "
-            "with no confirmed members; confirm the group in Gradescope or "
-            "grade the submissions individually."
-        )
-
     if not csrf_token:
         return (
             "Error: CSRF token not found on the group grade page; refusing to "
             "send the batch grade. The session may have expired."
         )
 
-    save_many_path, url_error = _save_many_grades_path(props)
-    if url_error:
-        return f"Error: {url_error}"
-
+    # Whose page this is comes first: a page of another group must be
+    # reported as such, not as an unusable save URL.
     page_problem = _group_page_problem(
         resp, group_grade_url, props, course_id, question_id, group_id,
         ag_data.get("submissions") or [],
     )
     if page_problem:
         return f"Error: {page_problem}. Refusing to batch-grade; nothing was sent."
+
+    save_many_path, url_error = _save_many_grades_path(
+        props, course_id, question_id, group_id, ag_data.get("submissions") or []
+    )
+    if url_error:
+        return f"Error: {url_error}"
 
     rubric_items = _resolve_rubric(props)
     if not rubric_items:

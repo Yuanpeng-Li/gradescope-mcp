@@ -379,6 +379,7 @@ Current test files:
 - `tests/test_extensions_and_answer_key.py`
 - `tests/test_grading_ops_fixes.py`
 - `tests/test_grading_workflow.py`
+- `tests/test_live_fixes.py`
 - `tests/test_p0_fixes.py`
 - `tests/test_page_selection.py`
 - `tests/test_read_side_fixes.py`

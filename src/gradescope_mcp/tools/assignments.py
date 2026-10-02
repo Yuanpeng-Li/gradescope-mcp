@@ -2,11 +2,18 @@
 
 import contextlib
 import datetime
+import json
 import re
 import threading
 
 import requests
 from bs4 import BeautifulSoup
+from gradescopeapi.classes._helpers._assignment_helpers import (
+    NotAuthorized,
+    check_page_auth,
+    get_assignments_instructor_view,
+    get_assignments_student_view,
+)
 from gradescopeapi.classes.assignments import (
     AssignmentUpdateError,
     InvalidTitleName,
@@ -15,6 +22,7 @@ from gradescopeapi.classes.assignments import (
 )
 
 from gradescope_mcp.auth import get_connection, AuthError
+from gradescope_mcp.tools.common import sanitize_inline
 from gradescope_mcp.tools.safety import write_confirmation_required
 
 
@@ -206,10 +214,84 @@ def check_date_order(
     return None
 
 
+_CONTAINER_URL_RE = re.compile(r"/assignment_containers/([^/?#]+)/?$")
+
+
+def _assignment_containers(soup: BeautifulSoup) -> list[dict]:
+    """Assignment containers listed in the staff AssignmentsTable props.
+
+    gradescopeapi keeps only ``table_data`` rows of type ``assignment``, so
+    a container (e.g. a bubble sheet exam, linking to
+    ``/courses/{cid}/assignment_containers/{id}``) silently disappears from
+    its listing. Returns ``id``, ``title`` and ``url`` per container.
+    """
+    element = soup.find("div", {"data-react-class": "AssignmentsTable"})
+    if element is None:
+        return []
+    try:
+        rows = json.loads(element.get("data-react-props") or "").get("table_data")
+    except (ValueError, AttributeError):
+        return []
+    containers = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or row.get("type") != "assignment_container":
+            continue
+        url = row.get("url") if isinstance(row.get("url"), str) else ""
+        match = _CONTAINER_URL_RE.search(url)
+        containers.append({
+            "id": match.group(1) if match else str(row.get("id") or "?"),
+            "title": _short_text(row.get("title"), 120) or "(untitled)",
+            "url": url,
+        })
+    return containers
+
+
+def _fetch_assignment_listing(conn, course_id: str) -> tuple[list, list[dict]]:
+    """Fetch a course's assignments and its assignment containers.
+
+    Same requests and parsing as gradescopeapi's ``Account.get_assignments``
+    (the staff assignments page, or the course page for a student), but the
+    page is kept so the containers its parser drops can be listed too
+    without another request.
+    """
+    base = f"{conn.gradescope_base_url}/courses/{course_id}"
+    try:
+        resp = check_page_auth(conn.session, f"{base}/assignments")
+    except NotAuthorized:
+        resp = check_page_auth(conn.session, base)
+    if resp is None:
+        raise ValueError(
+            "Gradescope answered the course's assignments page with an "
+            "unexpected status. Check the course ID and your access."
+        )
+    soup = BeautifulSoup(resp.text, "html.parser")
+    found = get_assignments_instructor_view(soup) or get_assignments_student_view(soup)
+    return found, _assignment_containers(soup)
+
+
+def _containers_note(containers: list[dict]) -> list[str]:
+    if not containers:
+        return []
+    lines = [
+        f"\n**Assignment containers (not listed or counted above):** "
+        f"{len(containers)}. Gradescope lists these next to the assignments; "
+        "a container is not an assignment, and its ID can't be used as an "
+        "assignment_id."
+    ]
+    lines += [
+        f"- {sanitize_inline(c['title'])}: container `{c['id']}`"
+        + (f" (`{c['url']}`)" if c["url"] else "")
+        for c in containers
+    ]
+    return lines
+
+
 def get_assignments(course_id: str) -> str:
     """Get all assignments for a specific course.
 
-    Dates Gradescope reports with a UTC offset are shown with it.
+    Dates Gradescope reports with a UTC offset are shown with it. Assignment
+    containers on the staff assignments page are not assignments; they are
+    listed in a note below the table.
 
     Args:
         course_id: The Gradescope course ID.
@@ -219,14 +301,16 @@ def get_assignments(course_id: str) -> str:
 
     try:
         conn = get_connection()
-        assignments = conn.account.get_assignments(course_id)
+        assignments, containers = _fetch_assignment_listing(conn, course_id)
     except AuthError as e:
         return f"Authentication error: {e}"
     except Exception as e:
         return f"Error fetching assignments: {e}"
 
     if not assignments:
-        return f"No assignments found for course `{course_id}`."
+        return "\n".join(
+            [f"No assignments found for course `{course_id}`."] + _containers_note(containers)
+        )
 
     lines = [f"## Assignments for Course {course_id}\n"]
     lines.append("| # | Name | ID | Release Date | Due Date | Late Due | Status | Grade |")
@@ -249,6 +333,7 @@ def get_assignments(course_id: str) -> str:
     lines.append(f"\n**Total assignments:** {len(assignments)}")
     if any(_has_offset(a.release_date, a.due_date, a.late_due_date) for a in assignments):
         lines.append(_DATE_OFFSET_NOTE)
+    lines += _containers_note(containers)
     return "\n".join(lines)
 
 
@@ -308,6 +393,13 @@ _DATE_FORM_FIELDS = (
     ("late", "late_due_date", "assignment[hard_due_date_string]"),
 )
 _ALLOW_LATE_FIELD = "assignment[allow_late_submissions]"
+# Gradescope renders the date inputs client-side. The server HTML carries the
+# current values in this component's data-react-props instead: course-local
+# ``YYYY-MM-DDTHH:MM`` strings, the late due date as hardDueDateEnabled /
+# hardDueDate, the LMS sync flag and the course timezone.
+_DUE_DATE_COMPONENT = "SetupDueDateFormGroup"
+_DUE_DATE_PROPS = (("release", "release_date", "releaseDate"), ("due", "due_date", "dueDate"))
+_DATE_KEYS = ("release", "due", "late", "allow_late")
 # Markup Gradescope (Rails) uses when it re-renders a form with errors.
 _FORM_ERROR_SELECTORS = (
     ".form--requiredFieldStar.error",
@@ -316,7 +408,7 @@ _FORM_ERROR_SELECTORS = (
 )
 _COURSE_LOCAL_NOTE = (
     "Times are course-local wall-clock times: Gradescope interprets them in "
-    "the course's timezone."
+    "the course's timezone{zone}."
 )
 
 
@@ -330,29 +422,20 @@ def _assignment_urls(conn, course_id: str, assignment_id: str) -> tuple[str, str
     return f"{base}/edit", base
 
 
-def _read_date_form(conn, course_id: str, assignment_id: str) -> dict:
-    """Read the current dates and late-submission flag from the settings form.
+def _form_date(raw: str, label: str, where: str) -> tuple[str | None, str | None]:
+    """Normalize a stored date to ``YYYY-MM-DDTHH:MM``: (value, problem)."""
+    try:
+        parsed = parse_date_input(raw, label, allow_offset=False)
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        return None, f"the current {label} {where} has an unrecognized format ({raw!r})"
+    return parsed.strftime(_FORM_DATE_FORMAT), None
 
-    Returns ``token`` (the form's authenticity token); ``release``, ``due``
-    and ``late`` as ``YYYY-MM-DDTHH:MM`` strings (``""`` when blank, ``None``
-    when unreadable); ``allow_late`` (``None`` when the checkbox is missing);
-    and ``problems``, which says why a field is ``None``.
-    """
-    edit_url, _ = _assignment_urls(conn, course_id, assignment_id)
-    resp = conn.session.get(edit_url)
-    if resp.status_code != 200:
-        raise _DateFormError(
-            f"the assignment settings page returned HTTP {resp.status_code}"
-        )
-    soup = BeautifulSoup(resp.text, "html.parser")
-    token = soup.select_one('input[name="authenticity_token"]')
-    if token is None or not token.get("value"):
-        raise _DateFormError(
-            "the assignment settings page has no edit form (unexpected page; "
-            "check the IDs and that you have instructor access)"
-        )
 
-    state: dict = {"token": token["value"], "problems": {}}
+def _dates_from_inputs(soup: BeautifulSoup) -> dict:
+    """Current settings from server-rendered form inputs (the fallback)."""
+    state: dict = {"problems": {}}
     for key, label, name in _DATE_FORM_FIELDS:
         field = soup.find("input", attrs={"name": name})
         if field is None:
@@ -363,23 +446,168 @@ def _read_date_form(conn, course_id: str, assignment_id: str) -> dict:
         if not raw:
             state[key] = ""
             continue
-        try:
-            parsed = parse_date_input(raw, label, allow_offset=False)
-        except ValueError:
-            state[key] = None
-            state["problems"][key] = (
-                f"the current {label} on the settings page has an "
-                f"unrecognized format ({raw!r})"
-            )
-            continue
-        state[key] = parsed.strftime(_FORM_DATE_FORMAT)
+        state[key], problem = _form_date(raw, label, "on the settings page")
+        if problem:
+            state["problems"][key] = problem
 
     state["allow_late"] = None
     for box in soup.find_all("input", attrs={"name": _ALLOW_LATE_FIELD}):
         if (box.get("type") or "").lower() == "checkbox":
             state["allow_late"] = box.has_attr("checked")
             break
+    if state["allow_late"] is None:
+        state["problems"]["allow_late"] = (
+            "the settings page has no allow_late_submissions checkbox, so it "
+            "is unknown whether late submissions are on"
+        )
     return state
+
+
+def _short_text(value, limit: int = 80) -> str | None:
+    """Single-line, length-capped text for a page-provided string."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())[:limit]
+    return text or None
+
+
+def _dates_from_props(soup: BeautifulSoup) -> dict | None:
+    """Current settings from the due-date component's React props.
+
+    Returns ``None`` when the page has no such component. Missing, null or
+    unparseable values come back as ``None`` with a reason in ``problems``;
+    the late due date is ``""`` while late submissions are off and the props
+    carry none.
+    """
+    element = soup.find(attrs={"data-react-class": _DUE_DATE_COMPONENT})
+    if element is None:
+        return None
+    state: dict = {key: None for key in _DATE_KEYS}
+    state.update(problems={}, timezone=None, lms_sync=None)
+    try:
+        props = json.loads(element.get("data-react-props") or "")
+    except ValueError:
+        props = None
+    if not isinstance(props, dict):
+        for key in _DATE_KEYS:
+            state["problems"][key] = (
+                "the due-date settings on the settings page could not be parsed"
+            )
+        return state
+
+    where = "in the settings page's due-date settings"
+    for key, label, prop in _DUE_DATE_PROPS:
+        raw = props.get(prop)
+        if not isinstance(raw, str) or not raw.strip():
+            state["problems"][key] = f"the settings page's due-date settings have no {label}"
+            continue
+        state[key], problem = _form_date(raw.strip(), label, where)
+        if problem:
+            state["problems"][key] = problem
+
+    enabled = props.get("hardDueDateEnabled")
+    if isinstance(enabled, bool):
+        state["allow_late"] = enabled
+    else:
+        state["problems"]["allow_late"] = (
+            "the settings page's due-date settings don't say whether late "
+            "submissions are on (no hardDueDateEnabled)"
+        )
+    raw_late = props.get("hardDueDate")
+    if isinstance(raw_late, str) and raw_late.strip():
+        state["late"], problem = _form_date(raw_late.strip(), "late_due_date", where)
+        if problem:
+            state["problems"]["late"] = problem
+    elif enabled is False:
+        state["late"] = ""
+    else:
+        state["problems"]["late"] = (
+            "the settings page's due-date settings have no late_due_date"
+        )
+
+    zone = props.get("timezone")
+    if isinstance(zone, dict):
+        state["timezone"] = {
+            name: _short_text(zone.get(name)) for name in ("identifier", "abbr", "zone")
+        }
+    if isinstance(props.get("syncLmsDueDate"), bool):
+        state["lms_sync"] = props["syncLmsDueDate"]
+    return state
+
+
+def _read_date_form(conn, course_id: str, assignment_id: str) -> dict:
+    """Read the current dates and late-submission flag from the settings page.
+
+    The values come from the ``SetupDueDateFormGroup`` React props, which is
+    where Gradescope's settings page keeps them; form inputs with the field
+    names the write sends are the fallback for a value the props don't give.
+
+    Returns ``token`` (the form's authenticity token); ``release``, ``due``
+    and ``late`` as ``YYYY-MM-DDTHH:MM`` strings (``""`` when blank, ``None``
+    when unreadable); ``allow_late`` (``None`` when unknown); ``problems``,
+    which says why a value is ``None``; ``timezone`` (``identifier``,
+    ``abbr`` and ``zone`` from the page, or ``None``); and ``lms_sync``
+    (whether the due date is synced from an LMS, ``None`` when not stated).
+    """
+    edit_url, _ = _assignment_urls(conn, course_id, assignment_id)
+    resp = conn.session.get(edit_url)
+    if resp.status_code != 200:
+        raise _DateFormError(
+            f"the assignment settings page returned HTTP {resp.status_code}"
+        )
+    soup = BeautifulSoup(resp.text, "html.parser")
+    token = soup.select_one(
+        '#assignment_form input[name="authenticity_token"]'
+    ) or soup.select_one('input[name="authenticity_token"]')
+    if token is None or not token.get("value"):
+        raise _DateFormError(
+            "the assignment settings page has no edit form (unexpected page; "
+            "check the IDs and that you have instructor access)"
+        )
+
+    from_inputs = _dates_from_inputs(soup)
+    from_props = _dates_from_props(soup)
+    sources = [from_inputs] if from_props is None else [from_props, from_inputs]
+    state: dict = {
+        "token": token["value"],
+        "problems": {},
+        "timezone": None if from_props is None else from_props["timezone"],
+        "lms_sync": None if from_props is None else from_props["lms_sync"],
+    }
+    for key in _DATE_KEYS:
+        state[key] = next((s[key] for s in sources if s[key] is not None), None)
+        if state[key] is None:
+            # The preferred source's reason: with the props present, "the
+            # page has no input" would only describe the fallback.
+            state["problems"][key] = next(
+                s["problems"][key] for s in sources if key in s["problems"]
+            )
+    return state
+
+
+def _timezone_text(zone: dict | None) -> str | None:
+    """``America/Los_Angeles (PDT)`` from the page's timezone, if it has one."""
+    if not zone:
+        return None
+    name = zone.get("identifier") or zone.get("zone")
+    if not name:
+        return None
+    abbr = zone.get("abbr")
+    return f"{name} ({abbr})" if abbr and abbr != name else name
+
+
+def _date_notes(current: dict) -> list[str]:
+    """The course-local note (naming the course timezone when the page gives
+    it) and, for an LMS-synced due date, a warning."""
+    zone = _timezone_text(current.get("timezone"))
+    notes = [_COURSE_LOCAL_NOTE.format(zone=f", {zone}" if zone else "")]
+    if current.get("lms_sync"):
+        notes.append(
+            "⚠️ This assignment's due date is synced from the LMS "
+            "(syncLmsDueDate is on): a later LMS sync may overwrite the due "
+            "date set here."
+        )
+    return notes
 
 
 def _plan_date_update(current: dict, requested: dict) -> dict:
@@ -407,11 +635,10 @@ def _plan_date_update(current: dict, requested: dict) -> dict:
         plan["allow_late"] = True
         plan["late"] = requested["late"].strftime(_FORM_DATE_FORMAT)
     elif current["allow_late"] is None:
-        raise _DateFormError(
-            "the settings page has no allow_late_submissions checkbox, so it "
-            "is unknown whether late submissions are on; pass late_due_date "
-            "explicitly"
+        reason = current["problems"].get(
+            "allow_late", "it is unknown whether late submissions are on"
         )
+        raise _DateFormError(f"{reason}; pass late_due_date explicitly")
     else:
         plan["allow_late"] = current["allow_late"]
         if plan["allow_late"]:
@@ -568,8 +795,10 @@ def modify_assignment_dates(
     so the current settings are read first and every omitted value is sent
     back unchanged. Supplying ``late_due_date`` turns late submissions on.
     The preview lists every value that will be sent next to the current one
-    (so it fails when the settings can't be read); after writing, the
-    settings are read back and compared. Confirmed changes to the same
+    (so it fails when the settings can't be read), the course timezone the
+    settings page reports, and a warning when the due date is synced from
+    an LMS; after writing, the settings are read back the same way and
+    compared. Confirmed changes to the same
     assignment run one at a time, so concurrent calls can't revert each
     other.
 
@@ -648,9 +877,9 @@ def _change_assignment_dates(
             "values, so pass the conflicting one as well. Nothing was changed."
         )
 
+    notes = _date_notes(current)
     if not confirm_write:
-        details = header + _describe_plan(plan, current, "currently", requested_keys) + [
-            _COURSE_LOCAL_NOTE,
+        details = header + _describe_plan(plan, current, "currently", requested_keys) + notes + [
             "All four settings above are sent together; values marked "
             "unchanged are re-sent as they are.",
         ]
@@ -682,7 +911,7 @@ def _change_assignment_dates(
         f"- {line}"
         for line in _describe_plan(
             plan, current, "was", requested_keys, "already set before this write"
-        )
+        ) + notes
     )
     if _already_set(plan, current, requested_keys):
         # E.g. a call re-run after its first write went through: the dates

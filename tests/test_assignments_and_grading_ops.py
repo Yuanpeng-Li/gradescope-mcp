@@ -28,10 +28,11 @@ def test_get_assignments_formats_rows(monkeypatch) -> None:
             max_grade=None,
         ),
     ]
-    fake_conn = SimpleNamespace(
-        account=SimpleNamespace(get_assignments=lambda _course_id: sample_assignments)
+    monkeypatch.setattr(assignments, "get_connection", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        assignments, "_fetch_assignment_listing",
+        lambda _conn, _course_id: (sample_assignments, []),
     )
-    monkeypatch.setattr(assignments, "get_connection", lambda: fake_conn)
 
     result = assignments.get_assignments("123")
 

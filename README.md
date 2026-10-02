@@ -734,6 +734,7 @@ gradescope-mcp/
     ├── test_extensions_and_answer_key.py
     ├── test_grading_ops_fixes.py
     ├── test_grading_workflow.py
+    ├── test_live_fixes.py
     ├── test_p0_fixes.py
     ├── test_page_selection.py
     ├── test_read_side_fixes.py
