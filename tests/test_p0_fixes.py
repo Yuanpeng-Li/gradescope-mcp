@@ -36,7 +36,8 @@ def test_upload_submission_passes_files_positionally(tmp_path, monkeypatch) -> N
         captured["assignment_id"] = assignment_id
         captured["file_count"] = len(files)
         captured["kwargs"] = kwargs
-        return "https://example.com/submissions/42"
+        # The new submission's page (R2-11: nothing else counts as success).
+        return "https://x/courses/1/assignments/2/submissions/42"
 
     monkeypatch.delenv(submissions.UPLOAD_ROOT_ENV, raising=False)
     monkeypatch.setattr(submissions, "upload_assignment", fake_upload)

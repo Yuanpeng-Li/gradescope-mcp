@@ -1330,3 +1330,148 @@ def test_naive_assignment_dates_are_unchanged_and_have_no_note(monkeypatch) -> N
 
     assert "- **Due Date:** 2026-10-01 23:59\n" in details
     assert "UTC" not in details
+
+
+# ---------------------------------------------------------------------------
+# R2-11: upload success requires the new submission's page
+# ---------------------------------------------------------------------------
+
+_COURSE_PAGE = '<html><head><meta name="csrf-token" content="CSRF"></head></html>'
+
+
+def _upload_session(final_url: str, page: str = "<html></html>") -> FakeSession:
+    """Serves gradescopeapi's real upload_assignment: course page, then the POST."""
+    return FakeSession([
+        ("GET", "/courses/1", FakeResponse(text=_COURSE_PAGE)),
+        ("POST", "/assignments/2/submissions", FakeResponse(text=page, url=final_url)),
+    ])
+
+
+@pytest.fixture
+def upload_file(tmp_path, monkeypatch):
+    monkeypatch.delenv(submissions.UPLOAD_ROOT_ENV, raising=False)
+    path = tmp_path / "hw.pdf"
+    path.write_bytes(b"%PDF-1.4 answer")
+    return path
+
+
+@pytest.mark.parametrize(
+    "final_url",
+    [
+        "https://www.gradescope.com/courses/1/assignments/2",
+        "https://www.gradescope.com/",
+        "https://www.gradescope.com/courses/1/assignments/3/submissions/77",
+        "https://www.gradescope.com/courses/1/assignments/2/submissions/new",
+    ],
+)
+def test_upload_redirect_elsewhere_is_not_reported_as_success(monkeypatch, upload_file, final_url) -> None:
+    flash = '<div class="alert alert-error" role="alert">This assignment is closed.</div>'
+    session = _upload_session(final_url, f"<html><body>{flash}</body></html>")
+    _use(monkeypatch, submissions, session)
+
+    text, is_error = _call_tool_flagged("tool_upload_submission", {
+        "course_id": "1", "assignment_id": "2", "file_paths": [str(upload_file)],
+        "confirm_write": True,
+    })
+
+    assert is_error
+    assert text.startswith("❌ Upload not confirmed")
+    assert f"- Final page: {final_url}" in text
+    assert "- Gradescope said: This assignment is closed." in text
+    assert "uploaded successfully" not in text
+    assert session.methods() == ["GET", "POST"]
+
+
+def test_upload_to_course_page_reports_final_page(monkeypatch, upload_file) -> None:
+    # gradescopeapi itself returns None here; the final URL still comes back.
+    session = _upload_session("https://www.gradescope.com/courses/1")
+    _use(monkeypatch, submissions, session)
+
+    text = submissions.upload_submission("1", "2", [str(upload_file)], confirm_write=True)
+
+    assert text.startswith("❌ Upload not confirmed")
+    assert "- Final page: https://www.gradescope.com/courses/1" in text
+
+
+@pytest.mark.parametrize(
+    "final_url",
+    [
+        "https://www.gradescope.com/courses/1/assignments/2/submissions/42",
+        "https://www.gradescope.com/courses/1/assignments/2/submissions/42/select_pages",
+        "https://www.gradescope.com/courses/1/assignments/2/submissions/42?view=files",
+    ],
+)
+def test_upload_to_submission_page_is_success(monkeypatch, upload_file, final_url) -> None:
+    session = _upload_session(final_url)
+    _use(monkeypatch, submissions, session)
+
+    text = submissions.upload_submission("1", "2", [str(upload_file)], confirm_write=True)
+
+    assert text.startswith("✅ Submission uploaded successfully!")
+    assert f"- **Submission URL:** {final_url}" in text
+
+
+# ---------------------------------------------------------------------------
+# R2-15: review_grades never reads a score from a guessed column
+# ---------------------------------------------------------------------------
+
+
+def _review_grades(headers: list[str], rows: list[list[str]]) -> FakeSession:
+    head = "".join(f"<th>{h}</th>" for h in headers)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows
+    )
+    page = f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+    return FakeSession([
+        ("GET", "/submissions.json", FakeResponse(404, "not found")),
+        ("GET", "/review_grades", FakeResponse(text=page)),
+    ])
+
+
+def _link(sid: int) -> str:
+    return f'<a href="/courses/1/assignments/2/submissions/{sid}">view</a>'
+
+
+def test_review_grades_score_header_with_suffix_is_used(monkeypatch) -> None:
+    """A submission count in cells[4] used to be read as the score."""
+    session = _review_grades(
+        ["#", "Name", "Email", "Submitted At", "Submission Count", "Score (out of 10)"],
+        [["1", _link(501), "a@x", "Oct 1", "2", "--"],
+         ["2", _link(502), "b@x", "Oct 1", "1", "7.5"]],
+    )
+    _use(monkeypatch, submissions, session)
+
+    text, _ = _call_tool_flagged("tool_get_assignment_submissions", {"course_id": "1", "assignment_id": "2"})
+
+    assert "**Graded:** 1/2" in text
+    assert "| 1 | `501` | -- | — |" in text
+    assert "| 2 | `502` | 7.5 | ✅ |" in text
+
+
+def test_review_grades_without_score_or_graded_column_is_unknown(monkeypatch) -> None:
+    session = _review_grades(
+        ["#", "Name", "Email", "Submitted At", "Submission Count"],
+        [["1", _link(501), "a@x", "Oct 1", "2"], ["2", _link(502), "b@x", "Oct 1", "1"]],
+    )
+    _use(monkeypatch, submissions, session)
+
+    text = submissions.get_assignment_submissions("1", "2")
+
+    assert "**Graded:** unknown" in text
+    assert "no recognizable Score or Graded column" in text
+    assert "| 1 | `501` |  | ? |" in text
+    assert "✅" not in text
+
+
+def test_review_grades_unrecognized_flag_without_score_column_is_unknown(monkeypatch) -> None:
+    session = _review_grades(
+        ["#", "Name", "Graded?"],
+        [["1", _link(501), "Yes"], ["2", _link(502), "partially"]],
+    )
+    _use(monkeypatch, submissions, session)
+
+    text = submissions.get_assignment_submissions("1", "2")
+
+    assert "**Graded:** at least 1/2 (1 unknown)" in text
+    assert "| 1 | `501` |  | ✅ |" in text
+    assert "| 2 | `502` |  | ? |" in text

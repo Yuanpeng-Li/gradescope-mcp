@@ -5,6 +5,7 @@ import hashlib
 import os
 import pathlib
 import re
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 from gradescopeapi.classes.upload import upload_assignment
@@ -125,6 +126,64 @@ def _describe_upload(path: pathlib.Path, size: int, digest: str) -> str:
     return f"`{path.name}` ({size:,} bytes, sha256 {digest})"
 
 
+class _UploadRecorder:
+    """Session stand-in that keeps the final response of the upload POST.
+
+    gradescopeapi's ``upload_assignment`` returns only a URL; the response is
+    kept to report where Gradescope sent the browser and what it said when
+    the upload did not create a submission.
+    """
+
+    def __init__(self, session):
+        self._session = session
+        self.post_response = None
+
+    def get(self, *args, **kwargs):
+        return self._session.get(*args, **kwargs)
+
+    def post(self, *args, **kwargs):
+        self.post_response = self._session.post(*args, **kwargs)
+        return self.post_response
+
+
+# Gradescope's flash messages and other alerts on the page after an upload.
+_FLASH_SELECTORS = (".alert", ".flash", "#flash", "[role=alert]")
+
+
+def _is_submission_url(url: str | None, course_id: str, assignment_id: str) -> bool:
+    """Whether ``url`` is the page of one submission of this assignment.
+
+    A successful upload redirects to /courses/<cid>/assignments/<aid>/
+    submissions/<id> (or a page below it, such as the PDF page-selection
+    step); any other page (the assignment, the course, the home page after
+    a lost session) means no submission was confirmed.
+    """
+    if not url:
+        return False
+    pattern = (
+        rf"/courses/{re.escape(str(course_id))}/assignments/"
+        rf"{re.escape(str(assignment_id))}/submissions/\d+(?:/[A-Za-z0-9_-]+)*/?"
+    )
+    return re.fullmatch(pattern, urlsplit(str(url)).path) is not None
+
+
+def _flash_text(response) -> str | None:
+    """Alert or flash messages on a response page, if any (at most 300 characters)."""
+    try:
+        text = response.text
+    except Exception:
+        return None
+    if not isinstance(text, str) or not text:
+        return None
+    soup = BeautifulSoup(text, "html.parser")
+    messages: list[str] = []
+    for element in soup.select(", ".join(_FLASH_SELECTORS)):
+        message = " ".join(element.get_text(" ", strip=True).split())
+        if message and message not in messages:
+            messages.append(message)
+    return "; ".join(messages)[:300] or None
+
+
 def upload_submission(
     course_id: str,
     assignment_id: str,
@@ -140,7 +199,9 @@ def upload_submission(
     directories are refused. When ``GRADESCOPE_MCP_UPLOAD_ROOT`` is set
     (``os.pathsep``-separated directories), files must resolve inside it;
     otherwise symbolic links are refused. The preview lists each file's size
-    and SHA-256.
+    and SHA-256. Success is reported only when Gradescope redirects to the
+    new submission's page; any other outcome is reported as not confirmed,
+    with the page Gradescope showed.
 
     Args:
         course_id: The Gradescope course ID.
@@ -199,6 +260,7 @@ def upload_submission(
 
     try:
         conn = get_connection()
+        recorder = _UploadRecorder(conn.session)
         # ExitStack guarantees every successfully-opened handle is closed even
         # if a later open() raises (EISDIR, EACCES, race-deleted file). The
         # earlier try/finally only protected handles after the loop completed.
@@ -210,7 +272,7 @@ def upload_submission(
                 stack.enter_context(open(path, "rb")) for path in validated_paths
             ]
             result_url = upload_assignment(
-                conn.session,
+                recorder,
                 course_id,
                 assignment_id,
                 *file_handles,
@@ -222,19 +284,35 @@ def upload_submission(
     except Exception as e:
         return f"Error uploading submission: {e}"
 
-    if result_url:
+    if _is_submission_url(result_url, course_id, assignment_id):
         return (
             f"✅ Submission uploaded successfully!\n"
             f"- **Files:** {', '.join(_describe_upload(*info) for info in validated)}\n"
             f"- **Submission URL:** {result_url}"
         )
-    else:
-        return (
-            "❌ Upload failed. Possible reasons:\n"
-            "- Assignment is past the due date\n"
-            "- You don't have permission to submit\n"
-            "- Invalid course or assignment ID"
-        )
+
+    # gradescopeapi returns None for the course page and ".../submissions";
+    # anything else that is not one submission's page is not a success either.
+    final = recorder.post_response
+    final_url = result_url or getattr(final, "url", None)
+    lines = [
+        f"❌ Upload not confirmed: Gradescope did not open a new submission of "
+        f"assignment `{assignment_id}`, so the submission was most likely not "
+        "created."
+    ]
+    if final_url:
+        lines.append(f"- Final page: {final_url}")
+    flash = _flash_text(final) if final is not None else None
+    if flash:
+        lines.append(f"- Gradescope said: {flash}")
+    lines += [
+        "- Possible reasons: the assignment is closed or past its due date, "
+        "you don't have permission to submit, the files were rejected, the "
+        "session was lost, or the course or assignment ID is wrong.",
+        "- Each upload creates a new submission: check the assignment on "
+        "Gradescope before uploading again.",
+    ]
+    return "\n".join(lines)
 
 
 def _json_body(resp):
@@ -364,15 +442,24 @@ def _row_cells(row) -> list:
     return row.find_all(["td", "th"], recursive=False)
 
 
+def _header_key(text: str) -> str:
+    """Normalize a header for matching: lowercase, single spaces, without a
+    trailing parenthetical or colon ("Score (out of 10)" -> "score")."""
+    key = " ".join((text or "").lower().split())
+    key = re.sub(r"\s*\([^()]*\)\s*$", "", key)
+    return key.rstrip(":").strip()
+
+
 def _get_submissions_from_review_grades(
     conn, course_id: str, assignment_id: str
 ) -> str:
     """Fallback: scrape submission list from the review_grades HTML table.
 
-    Used for online assignments where submissions.json returns 404. Uses
-    header-aware column resolution so that adding/removing the Sections column
-    (or any other layout shift) doesn't pull score/graded data from the wrong
-    cells, which used to silently corrupt the output.
+    Used for online assignments where submissions.json returns 404. Columns
+    are resolved by header only ("Score (out of 10)" counts as Score), so
+    adding/removing the Sections column (or any other layout shift) doesn't
+    pull score/graded data from the wrong cells. Without a Score or Graded
+    column, graded status is reported as unknown rather than guessed.
     """
     url = (
         f"{conn.gradescope_base_url}/courses/{course_id}"
@@ -395,13 +482,12 @@ def _get_submissions_from_review_grades(
     headers = _table_headers(table)
 
     def _col(*names: str) -> int | None:
-        wanted = {n.lower() for n in names}
         for idx, h in enumerate(headers):
-            if (h or "").strip().lower() in wanted:
+            if _header_key(h) in names:
                 return idx
         return None
 
-    score_idx = _col("score", "total score", "points")
+    score_idx = _col("score", "total score", "points", "total points")
     graded_idx = _col("graded?", "graded", "status")
 
     body = table.find("tbody") or table
@@ -425,17 +511,15 @@ def _get_submissions_from_review_grades(
         if not sub_id:
             continue
 
-        # Score: prefer the resolved column; fall back to the historical
-        # cells[4] only when the header lookup fails.
+        # Score: only from a column whose header says so.
         score_text = ""
         if score_idx is not None and score_idx < len(cell_text):
             score_text = cell_text[score_idx]
-        elif len(cell_text) > 4:
-            score_text = cell_text[4]
 
         # Graded: an affirmative or negative Graded? flag decides; otherwise
         # (empty, placeholder or unrecognized flag) the Score cell decides.
-        # ``--`` and other placeholders never count as a score.
+        # ``--`` and other placeholders never count as a score. With neither
+        # column the status is unknown (None).
         flag = ""
         if graded_idx is not None and graded_idx < len(cell_text):
             flag = cell_text[graded_idx].strip().lower()
@@ -443,6 +527,8 @@ def _get_submissions_from_review_grades(
             graded = True
         elif flag in _REVIEW_GRADES_NEGATIVE:
             graded = False
+        elif score_idx is None:
+            graded = None
         else:
             cleaned = score_text.strip()
             graded = (
@@ -458,16 +544,32 @@ def _get_submissions_from_review_grades(
 
     total = len(submissions)
     graded = sum(1 for s in submissions if s["graded"])
+    unknown = sum(1 for s in submissions if s["graded"] is None)
 
     lines = [f"## Submissions for Assignment {assignment_id}\n"]
     lines.append(f"**Total submissions:** {total}")
-    lines.append(f"**Graded:** {graded}/{total}")
+    if unknown:
+        if graded_idx is None:
+            reason = (
+                "the review_grades table has no recognizable Score or Graded "
+                f"column (headers: {', '.join(repr(h) for h in headers) or 'none'}; "
+                "unrecognized page layout)"
+            )
+        else:
+            reason = (
+                f"{unknown} row(s) have no recognizable Graded value and the "
+                "table has no Score column"
+            )
+        count = "unknown" if unknown == total else f"at least {graded}/{total} ({unknown} unknown)"
+        lines.append(f"**Graded:** {count} — ⚠️ {reason}, so graded status is not guessed.")
+    else:
+        lines.append(f"**Graded:** {graded}/{total}")
     lines.append("_(Note: retrieved from review_grades fallback)_\n")
     lines.append("| # | Global Submission ID | Score | Graded |")
     lines.append("|---|---------------|-------|--------|")
 
     for i, sub in enumerate(submissions, 1):
-        is_graded = "✅" if sub["graded"] else "—"
+        is_graded = "?" if sub["graded"] is None else ("✅" if sub["graded"] else "—")
         lines.append(f"| {i} | `{sub['id']}` | {sub['score']} | {is_graded} |")
 
     return "\n".join(lines)
