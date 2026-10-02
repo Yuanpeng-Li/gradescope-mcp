@@ -38,6 +38,7 @@ def test_upload_submission_passes_files_positionally(tmp_path, monkeypatch) -> N
         captured["kwargs"] = kwargs
         return "https://example.com/submissions/42"
 
+    monkeypatch.delenv(submissions.UPLOAD_ROOT_ENV, raising=False)
     monkeypatch.setattr(submissions, "upload_assignment", fake_upload)
     monkeypatch.setattr(
         submissions, "get_connection",
@@ -77,6 +78,7 @@ def test_upload_submission_closes_handles_on_partial_open_failure(
         opened.append(fh)
         return fh
 
+    monkeypatch.delenv(submissions.UPLOAD_ROOT_ENV, raising=False)
     monkeypatch.setattr("builtins.open", tracked_open)
     monkeypatch.setattr(
         submissions, "get_connection",

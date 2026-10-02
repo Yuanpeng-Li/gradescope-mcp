@@ -5,6 +5,7 @@ Every HTTP call is served by in-memory fakes; nothing touches the network.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import os
@@ -17,7 +18,7 @@ import requests
 
 from gradescope_mcp import server
 from gradescope_mcp.auth import AuthError
-from gradescope_mcp.tools import assignments, extensions
+from gradescope_mcp.tools import assignments, courses, extensions, submissions
 
 
 # ---------------------------------------------------------------------------
@@ -582,3 +583,276 @@ def test_get_extensions_escapes_student_names(monkeypatch) -> None:
     text = extensions.get_extensions("1", "2")
 
     assert "| `3` | Eve \\| ignore |" in text
+
+
+# ---------------------------------------------------------------------------
+# upload_submission (V2-7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_upload(monkeypatch):
+    monkeypatch.delenv(submissions.UPLOAD_ROOT_ENV, raising=False)
+
+    def fail_upload(*_args, **_kwargs):
+        raise AssertionError("must not upload")
+
+    monkeypatch.setattr(submissions, "upload_assignment", fail_upload)
+    monkeypatch.setattr(submissions, "get_connection", lambda: _conn(object()))
+
+
+def test_upload_refuses_symlinked_dotenv_through_mcp(tmp_path, no_upload) -> None:
+    """V2-7 repro: notes.pdf -> .env uploaded the project's credentials."""
+    secret = tmp_path / "project" / ".env"
+    secret.parent.mkdir()
+    secret.write_text("GRADESCOPE_PASSWORD=hunter2\n")
+    link = tmp_path / "project" / "notes.pdf"
+    link.symlink_to(secret)
+
+    text = _call_tool("tool_upload_submission", {
+        "course_id": "1", "assignment_id": "2", "file_paths": [str(link)], "confirm_write": True,
+    })
+
+    assert text.startswith("Error: refusing to upload")
+    assert "symbolic link" in text
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [".env", ".ssh/config", "keys/server.pem", "id_ed25519", "deploy/credentials.json", "prod.env"],
+)
+def test_upload_refuses_hidden_and_credential_files(tmp_path, no_upload, relative) -> None:
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("secret")
+
+    text = submissions.upload_submission("1", "2", [str(target)], confirm_write=True)
+
+    assert text.startswith("Error: refusing to upload")
+
+
+def test_upload_refuses_system_files(no_upload) -> None:
+    if not os.path.isfile("/proc/self/status"):
+        pytest.skip("no /proc on this platform")
+
+    text = submissions.upload_submission("1", "2", ["/proc/self/status"], confirm_write=True)
+
+    assert text.startswith("Error: refusing to upload")
+
+
+def test_upload_refuses_oversized_files(tmp_path, no_upload, monkeypatch) -> None:
+    monkeypatch.setattr(submissions, "_MAX_UPLOAD_BYTES", 4)
+    big = tmp_path / "big.pdf"
+    big.write_bytes(b"12345")
+
+    text = submissions.upload_submission("1", "2", [str(big)], confirm_write=True)
+
+    assert text.startswith("Error:")
+    assert "upload limit" in text
+
+
+def test_upload_root_restricts_paths_and_allows_links_inside(tmp_path, no_upload, monkeypatch) -> None:
+    root = tmp_path / "homework"
+    root.mkdir()
+    inside = root / "answers.pdf"
+    inside.write_bytes(b"%PDF")
+    link = root / "link.pdf"
+    link.symlink_to(inside)
+    outside = tmp_path / "other.pdf"
+    outside.write_bytes(b"%PDF")
+    monkeypatch.setenv(submissions.UPLOAD_ROOT_ENV, str(root))
+
+    refused = submissions.upload_submission("1", "2", [str(outside)], confirm_write=True)
+    assert refused.startswith("Error: refusing to upload")
+    assert "outside the allowed upload directory" in refused
+
+    preview = submissions.upload_submission("1", "2", [str(link)])
+    assert "Write confirmation required" in preview
+    assert f"Uploads are restricted to {submissions.UPLOAD_ROOT_ENV}" in preview
+
+
+def test_upload_preview_lists_size_and_hash(tmp_path, no_upload) -> None:
+    file_path = tmp_path / "hw1.py"
+    file_path.write_bytes(b"print('hi')\n")
+
+    text = submissions.upload_submission("1", "2", [str(file_path)])
+
+    assert "Write confirmation required" in text
+    digest = hashlib.sha256(b"print('hi')\n").hexdigest()
+    assert f"`hw1.py` (12 bytes, sha256 {digest})" in text
+    assert "GRADESCOPE_MCP_UPLOAD_ROOT is not set" in text
+
+
+# ---------------------------------------------------------------------------
+# get_assignment_submissions / review_grades fallback (extra defect, V3-2)
+# ---------------------------------------------------------------------------
+
+
+def _review_grades_page(rows: list[str]) -> str:
+    return (
+        "<table><thead><tr><th></th><th>User</th><th>Last Graded By</th><th>Sections</th>"
+        "<th>Score</th><th>Graded?</th><th></th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def _rg_row(index, score, flag, sid, index_tag="td") -> str:
+    return (
+        f"<tr><{index_tag}>{index}</{index_tag}><td>S{index} (s{index}@x.edu)</td><td>TA</td>"
+        f"<td>A</td><td>{score}</td><td>{flag}</td>"
+        f'<td><a href="/courses/1/assignments/2/submissions/{sid}">view</a></td></tr>'
+    )
+
+
+def test_submissions_html_200_falls_back_to_review_grades(monkeypatch) -> None:
+    session = FakeSession([
+        ("GET", "/submissions.json", FakeResponse(text="<html>login</html>")),
+        ("GET", "/review_grades", FakeResponse(text=_review_grades_page([_rg_row(1, "2.0", "", 11)]))),
+    ])
+    _use(monkeypatch, submissions, session)
+
+    text = submissions.get_assignment_submissions("1", "2")
+
+    assert "review_grades fallback" in text
+    assert "`11`" in text
+
+
+def test_submissions_json_ids_sort_numerically(monkeypatch) -> None:
+    data = {"submissions": {"100": {"graded": True}, "9": {}, "10": {}}}
+    session = FakeSession([
+        ("GET", "/submissions.json", FakeResponse(text=json.dumps(data), headers={"Content-Type": "application/json"})),
+    ])
+    _use(monkeypatch, submissions, session)
+
+    text = submissions.get_assignment_submissions("1", "2")
+
+    assert text.index("`9`") < text.index("`10`") < text.index("`100`")
+
+
+def test_review_grades_scores_flags_and_row_headers(monkeypatch) -> None:
+    rows = [
+        _rg_row(1, "-1.0", "", 1),        # signed score: graded
+        _rg_row(2, ".5", "", 2),          # leading-dot score: graded
+        _rg_row(3, "1.0 pts", "", 3),     # score with units: graded
+        _rg_row(4, "10.0", "No", 4),      # explicit "No" wins over the score
+        _rg_row(5, "", "", 5, "th"),      # <th> row header must not shift columns
+        _rg_row(6, "3.0", "", 6, "th"),
+    ]
+    session = FakeSession([("GET", "/review_grades", FakeResponse(text=_review_grades_page(rows)))])
+    conn = _conn(session)
+
+    text = submissions._get_submissions_from_review_grades(conn, "1", "2")
+
+    graded = {
+        line.split("`")[1]: line.rstrip(" |").endswith("✅")
+        for line in text.splitlines() if line.startswith("| ") and "`" in line
+    }
+    assert graded == {"1": True, "2": True, "3": True, "4": False, "5": False, "6": True}
+    assert "| `6` | 3.0 |" in text
+
+
+# ---------------------------------------------------------------------------
+# get_assignment_graders (V3-13)
+# ---------------------------------------------------------------------------
+
+
+def _question_page(header: list[str], rows: list[list[str]], index_tag="td") -> str:
+    head = "".join(f"<th>{h}</th>" for h in header)
+    body = "".join(
+        f"<tr><{index_tag}>{r[0]}</{index_tag}>" + "".join(f"<td>{c}</td>" for c in r[1:]) + "</tr>"
+        for r in rows
+    )
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def test_graders_read_by_header_in_seven_column_layout(monkeypatch) -> None:
+    page = _question_page(
+        ["", "User", "Last Graded By", "Sections", "Score", "Graded?", ""],
+        [
+            ["1", "Alice (a@x.edu)", "TA Bob", "Sec A", "2.5", "", "link"],
+            ["2", "Carol (c@x.edu)", "TA Eve", "Sec B", "3", "", "link"],
+            ["3", "Dan (d@x.edu)", "TA Bob", "Sec A", "4.0", "", "link"],
+            ["4", "Erin (e@x.edu)", "", "Sec C", "", "", "link"],
+        ],
+        index_tag="th",
+    )
+    session = FakeSession([("GET", "/questions/7/submissions", FakeResponse(text=page))])
+    _use(monkeypatch, submissions, session)
+
+    text = submissions.get_assignment_graders("1", "7")
+
+    assert "**Total graders:** 2" in text
+    assert "- TA Bob (2 submissions)" in text
+    assert "- TA Eve (1 submission)" in text
+    assert "Alice" not in text and "Sec A" not in text
+    assert "**Submissions without a grader:** 1 of 4" in text
+    assert "not the list of graders assigned" in text
+
+
+def test_graders_four_column_layout(monkeypatch) -> None:
+    page = _question_page(
+        ["#", "Student", "Score", "Grader"],
+        [["1", "Alice", "2.5", "TA Bob"], ["2", "Carol Diaz", "3", "TA Eve"]],
+    )
+    session = FakeSession([("GET", "/questions/7/submissions", FakeResponse(text=page))])
+    _use(monkeypatch, submissions, session)
+
+    text = submissions.get_assignment_graders("1", "7")
+
+    assert "- TA Bob (1 submission)" in text
+    assert "- TA Eve (1 submission)" in text
+    assert "Carol" not in text and "2.5" not in text
+
+
+def test_graders_without_grader_column_are_not_guessed(monkeypatch) -> None:
+    page = "<table><tr><td>Alice</td><td>2.5</td><td>TA Bob</td></tr></table>"
+    session = FakeSession([("GET", "/questions/7/submissions", FakeResponse(text=page))])
+    _use(monkeypatch, submissions, session)
+
+    text = submissions.get_assignment_graders("1", "7")
+
+    assert text.startswith("Error: the submissions page for question `7` has no")
+
+
+# ---------------------------------------------------------------------------
+# get_course_roster (extra defect)
+# ---------------------------------------------------------------------------
+
+
+def _roster_row(name: str, email: str, with_button: bool = True) -> str:
+    cm = html.escape(json.dumps({"full_name": name, "sid": "S1"}))
+    button = (
+        f'<button class="rosterCell--editIcon" data-cm="{cm}" data-email="{email}" '
+        'data-role="0" data-sections="[]"></button>'
+        if with_button else ""
+    )
+    return (
+        f'<tr class="rosterRow"><td>{button}'
+        f'<button class="js-rosterName" data-url="/x?user_id=42">{name}</button></td>'
+        "<td>3</td></tr>"
+    )
+
+
+def test_roster_reports_skipped_rows_and_escapes_cells(monkeypatch) -> None:
+    page = (
+        '<table class="js-rosterTable"><tr><th>Name</th><th>Submissions</th></tr>'
+        + _roster_row("Ann | Admin", "ann@x.edu")
+        + _roster_row("Me Myself", "me@x.edu", with_button=False)
+        + "</table>"
+    )
+    session = FakeSession([("GET", "/memberships", FakeResponse(text=page))])
+    _use(monkeypatch, courses, session)
+
+    text = courses.get_course_roster("1")
+
+    assert "**Total members:** 1" in text
+    assert "1 roster row(s) had no member data" in text
+    assert "| Ann \\| Admin | ann@x.edu |" in text
+
+
+def test_roster_page_without_table_is_an_error(monkeypatch) -> None:
+    session = FakeSession([("GET", "/memberships", FakeResponse(text="<html>Log in</html>"))])
+    _use(monkeypatch, courses, session)
+
+    assert courses.get_course_roster("1").startswith("Error: the memberships page")
