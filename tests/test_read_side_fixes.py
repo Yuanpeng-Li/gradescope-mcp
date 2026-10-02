@@ -456,3 +456,274 @@ def test_grade_answer_group_via_mcp_refuses_unknown_ids(monkeypatch) -> None:
     )
     assert result.content[0].text.startswith("Error:")
     assert router.posts() == []
+
+
+# ---------------------------------------------------------------------------
+# V3-5 — grading progress numbering
+# ---------------------------------------------------------------------------
+
+PROGRESS_QUESTIONS = {
+    "101": {"id": 101, "title": "Warmup", "index": 1, "total_graded_count": 10, "total_count": 10, "graders": []},
+    "200": {"id": 200, "title": "Proofs", "index": 2, "question_group": True},
+    "201": {"id": 201, "title": "a", "index": 1, "parent_id": 200, "total_graded_count": 2, "total_count": 10, "graders": [{"name": "TA | One"}]},
+    "202": {"id": 202, "title": "b", "index": 2, "parent_id": 200, "total_graded_count": 0, "total_count": 10, "graders": []},
+    "301": {"id": 301, "title": "Bonus", "index": 3, "total_graded_count": 5, "total_count": 10, "graders": []},
+}
+
+
+def test_grading_progress_numbers_like_the_outline(monkeypatch) -> None:
+    router = Router()
+    router.add(
+        "GET", "/assignments/2/grade.json",
+        FakeResp(200, json_obj={"assignments": {"2": {"questions": PROGRESS_QUESTIONS}}}),
+    )
+    _install(monkeypatch, router, grading)
+
+    result = grading.get_grading_progress("1", "2")
+
+    rows = [ln for ln in result.splitlines() if ln.startswith("| ") and "Question" not in ln]
+    assert [r.split("|")[1].strip() for r in rows] == [
+        "Q1 Warmup (`101`)",
+        "**Q2 Proofs** (`200`)",
+        "Q2.1 a (`201`)",
+        "Q2.2 b (`202`)",
+        "Q3 Bonus (`301`)",
+    ]
+    assert "| **Q2 Proofs** (`200`) | group | 2 | 20 | 10% |" in result
+    assert "TA \\| One" in result
+    assert "**Overall progress:** 17/40 (42%)" in result
+
+
+def test_grading_progress_refuses_to_borrow_another_assignment(monkeypatch) -> None:
+    router = Router()
+    other = {"assignments": {"999": {"questions": {"5": {"id": 5, "title": "Other", "index": 1}}}}}
+    router.add("GET", "/assignments/2/grade.json", FakeResp(200, json_obj=other))
+    _install(monkeypatch, router, grading)
+
+    result = grading.get_grading_progress("1", "2")
+
+    assert result.startswith("Error: the grading dashboard (grade.json) has no entry for assignment `2`")
+    assert "Other" not in result
+
+
+# ---------------------------------------------------------------------------
+# V3-6 / NEW-V3 / V2-8 — tool_get_student_submission
+# ---------------------------------------------------------------------------
+
+CSV_HEADERS = {"content-type": "text/csv"}
+SCORES_CSV = (
+    "First Name,Last Name,SID,Email,Total Score,Max Points,Status,Submission ID\n"
+    "Alice,Smith,1,Alice.Smith@uni.edu,7.0,10.0,Graded,555\n"
+)
+
+
+def _viewer_page(props: dict) -> str:
+    return (
+        '<div data-react-class="AssignmentSubmissionViewer" '
+        f'data-react-props="{html.escape(json.dumps(props), quote=True)}"></div>'
+    )
+
+
+def test_student_submission_matches_email_case_insensitively_and_uses_csv_total(monkeypatch) -> None:
+    scanned = (
+        '<html><script>var x = {"rubric_items":[{"id":1,"score":"2.5"}],'
+        '"pages":[{"number":1,"width":10,"height":10,'
+        '"url":"https://production-gradescope-uploads/p1.jpg"}]};</script></html>'
+    )
+    router = Router()
+    router.add("GET", "/assignments/2/scores", FakeResp(200, SCORES_CSV, headers=CSV_HEADERS))
+    router.add("GET", "/assignments/2/submissions/555", FakeResp(200, scanned))
+    _install(monkeypatch, router, grading)
+
+    result = _call_tool(
+        "tool_get_student_submission",
+        {"course_id": "1", "assignment_id": "2", "student_email": " alice.smith@UNI.edu"},
+    ).content[0].text
+
+    assert "## Submission Content: Alice Smith (Alice.Smith@uni.edu)" in result
+    assert "**Total Score:** 7.0 / 10.0 (from the scores export)" in result
+    assert "2.5" not in result
+
+
+def test_scores_csv_rejects_html_and_decodes_utf8_with_bom(monkeypatch) -> None:
+    router = Router()
+    router.add(
+        "GET", "/assignments/2/scores",
+        FakeResp(200, "<!DOCTYPE html><title>Log In</title>", headers={"content-type": "text/html"}),
+    )
+    _install(monkeypatch, router, grading)
+    result = grading.get_student_submission_content("1", "2", "a@x.edu")
+    assert result.startswith("Error: Expected the scores CSV export but received an HTML page")
+
+    csv_bytes = (
+        "\ufeffFirst Name,Last Name,Email,Total Score,Max Points,Status,Submission ID\n"
+        "José,Núñez,jn@x.edu,9,10,Graded,77\n"
+    ).encode("utf-8")
+    router = Router()
+    router.add(
+        "GET", "/assignments/2/scores",
+        # requests would decode charset-less text/csv as ISO-8859-1.
+        FakeResp(200, csv_bytes.decode("latin-1"), headers=CSV_HEADERS, content=csv_bytes),
+    )
+    _install(monkeypatch, router, grading)
+    rows, fields = grading._fetch_assignment_scores_csv("1", "2")
+    assert fields[0] == "First Name"
+    assert rows[0]["First Name"] == "José" and rows[0]["Last Name"] == "Núñez"
+
+
+def _online_router(monkeypatch, props: dict) -> None:
+    router = Router()
+    csv_text = (
+        "First Name,Last Name,SID,Email,Total Score,Max Points,Status,Submission ID\n"
+        "Ann,Lee,1,ann@x.edu,0,10,Graded,555\n"
+    )
+    router.add("GET", "/assignments/2/scores", FakeResp(200, csv_text, headers=CSV_HEADERS))
+    router.add("GET", "/assignments/2/submissions/555", FakeResp(200, _viewer_page(props)))
+    _install(monkeypatch, router, grading)
+
+
+def test_online_submission_never_reports_an_uploaded_file_as_blank(monkeypatch) -> None:
+    answer = {"question_id": 11, "answers": {"0": [{"text_file_id": 77}]}, "score": None}
+    cases = {
+        "url at top level": (
+            {"text_files": [{"id": 77, "url": "//files/x.png"}], "question_submissions": [answer]},
+            "[Image/File URL: https://files/x.png]",
+        ),
+        "text_files omitted": (
+            {"question_submissions": [answer]},
+            "[Uploaded file ID: 77 — file URL not available",
+        ),
+        "str id in text_files": (
+            {"text_files": [{"id": "77", "file": {"url": "https://files/y.png"}}],
+             "question_submissions": [answer]},
+            "[Image/File URL: https://files/y.png]",
+        ),
+    }
+    for label, (props, expected) in cases.items():
+        _online_router(monkeypatch, props)
+        result = grading.get_student_submission_content("1", "2", "ann@x.edu")
+        assert "(No answer provided)" not in result, label
+        assert expected in result, label
+
+    _online_router(monkeypatch, {"question_submissions": [{"question_id": 12, "answers": {}}]})
+    assert "(No answer provided)" in grading.get_student_submission_content("1", "2", "ann@x.edu")
+
+
+def test_online_submission_typed_answers_are_untrusted_blocks(monkeypatch) -> None:
+    _online_router(
+        monkeypatch,
+        {"question_submissions": [{"question_id": 11, "answers": {"0": INJECTION}, "score": 1}]},
+    )
+
+    result = grading.get_student_submission_content("1", "2", "ann@x.edu")
+
+    assert "<<<BEGIN UNTRUSTED STUDENT ANSWER" in result
+    outside = _outside_untrusted(result)
+    assert "SYSTEM:" not in outside
+    assert "## New instructions" not in outside
+    assert "### Question `11` (Score: 1)" in outside
+
+
+# ---------------------------------------------------------------------------
+# V3-7 — tool_get_student_assignment_link
+# ---------------------------------------------------------------------------
+
+LINK_CSV = (
+    "First Name,Last Name,SID,Email,Total Score,Max Points,Status,Submission ID\n"
+    "Wei,Zhang,1,wz1@x.edu,7,10,Graded,111\n"
+    "Wei,Zhang,2,wz2@x.edu,8,10,Graded,222\n"
+    "Mary ,Smith,3,ms@x.edu,8,10,Graded,333\n"
+)
+
+
+def test_student_assignment_link_disambiguates_by_email_and_normalizes_whitespace(monkeypatch) -> None:
+    router = Router()
+    router.add("GET", "/assignments/2/scores", FakeResp(200, LINK_CSV, headers=CSV_HEADERS))
+    _install(monkeypatch, router, grading)
+    base = "https://gs.test/courses/1/assignments/2/submissions/"
+
+    dup = grading.get_student_assignment_link("1", "2", "Wei Zhang")
+    assert dup.startswith("Error: multiple students named `Wei Zhang`")
+    assert f"- wz1@x.edu: {base}111" in dup and f"- wz2@x.edu: {base}222" in dup
+
+    assert grading.get_student_assignment_link("1", "2", "Wei Zhang", "WZ2@x.edu ") == f"{base}222"
+    assert grading.get_student_assignment_link("1", "2", "", "wz1@x.edu") == f"{base}111"
+    assert grading.get_student_assignment_link("1", "2", "Mary  Smith") == f"{base}333"
+    assert grading.get_student_assignment_link("1", "2", "Nobody", "nobody@x.edu").startswith("Error:")
+
+
+# ---------------------------------------------------------------------------
+# V3-8 — export_assignment_scores summary
+# ---------------------------------------------------------------------------
+
+EXPORT_CSV = (
+    "First Name,Last Name,SID,Email,Q1 (10.0 pts),Total Score,Max Points,Status,"
+    "Submission ID,Submission Time,Lateness (H:M:S)\n"
+    "A,One,1,a@x,10,10,10.0,Graded,11,t,0\n"
+    "B,Two,2,b@x,0,0,10.0,Graded,12,t,0\n"
+    "C,Three,3,c@x,,,,Missing,,,\n"
+    "D,Four,4,d@x,3,3,10.0,Ungraded,14,t,0\n"
+)
+
+
+def test_export_labels_score_basis_and_ignores_blank_max_points(monkeypatch) -> None:
+    router = Router()
+    router.add("GET", "/assignments/2/scores", FakeResp(200, EXPORT_CSV, headers=CSV_HEADERS))
+    _install(monkeypatch, router, grading)
+
+    md = grading.export_assignment_scores("1", "2")
+    assert "**Max points:** 10.0" in md
+    assert (
+        "**Score statistics:** over 2 fully graded submission(s) (Status 'Graded'); "
+        "excludes 1 missing and 1 not yet graded"
+    ) in md
+    assert "| C Three | c@x | — | Missing |" in md
+    assert "/N/A" not in md
+
+    summary = json.loads(grading.export_assignment_scores("1", "2", "json"))["summary"]
+    assert summary["max_points"] == "10.0"
+    assert summary["scores_counted"] == 2
+
+
+def test_export_json_summary_keys_are_stable_for_empty_results(monkeypatch) -> None:
+    router = Router()
+    router.add("GET", "/assignments/2/scores", FakeResp(200, EXPORT_CSV, headers=CSV_HEADERS))
+    _install(monkeypatch, router, grading)
+    full = json.loads(grading.export_assignment_scores("1", "2", "json"))["summary"]
+
+    router = Router()
+    router.add("GET", "/assignments/2/scores", FakeResp(200, "First Name,Last Name\n", headers=CSV_HEADERS))
+    _install(monkeypatch, router, grading)
+    empty = json.loads(grading.export_assignment_scores("1", "2", "json"))["summary"]
+
+    assert set(empty) == set(full)
+    assert empty["total_students"] == 0 and empty["average_score"] is None
+
+
+# ---------------------------------------------------------------------------
+# Outline — deeper nesting
+# ---------------------------------------------------------------------------
+
+def test_outline_renders_nested_subparts(monkeypatch) -> None:
+    questions = {
+        "1": {"id": 1, "title": "Group", "index": 1, "weight": 6, "parent_id": None},
+        "2": {"id": 2, "title": "Part a", "index": 1, "weight": 4, "parent_id": 1, "type": "FreeResponseQuestion",
+              "content": [{"type": "text", "value": "Prove it"}]},
+        "3": {"id": 3, "title": "Sub i", "index": 2, "weight": 2, "parent_id": "2", "type": "FreeResponseQuestion",
+              "content": [{"type": "text", "value": "Second"}]},
+        "4": {"id": 4, "title": "Sub ii", "index": 1, "weight": 2, "parent_id": 2, "type": "FreeResponseQuestion",
+              "content": [{"type": "text", "value": "First"}]},
+    }
+    monkeypatch.setattr(grading, "_get_outline_data", lambda *_a: {"questions": questions})
+
+    result = grading.get_assignment_outline("1", "2")
+
+    assert "| 1.1 | `2` |" in result
+    assert "| 1.1.1 | `4` | 2 | FreeResponseQuestion | First |" in result
+    assert "| 1.1.2 | `3` | 2 | FreeResponseQuestion | Second |" in result
+
+    # Shape stays what grading_ops / grading_workflow expect.
+    tree = grading._build_question_tree(questions)
+    assert [n["id"] for n in tree] == [1]
+    assert [n["id"] for n in tree[0]["children"]] == [2]
+    assert [n["id"] for n in tree[0]["children"][0]["children"]] == [4, 3]
