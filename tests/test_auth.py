@@ -125,10 +125,13 @@ class FakeGradescope:
 def _clean_auth_state(monkeypatch):
     monkeypatch.setattr(auth, "_connection", None)
     monkeypatch.setattr(auth, "_failed_login", None)
+    monkeypatch.setattr(auth, "_dead_cookie", None)
     auth._local.expired = None
     monkeypatch.setenv("GRADESCOPE_EMAIL", EMAIL)
     monkeypatch.setenv("GRADESCOPE_PASSWORD", PASSWORD)
     monkeypatch.delenv(auth.HTTP_TIMEOUT_ENV, raising=False)
+    monkeypatch.delenv(auth.COOKIE_HEADER_ENV, raising=False)
+    monkeypatch.delenv(auth.SESSION_COOKIE_ENV, raising=False)
     yield
     auth._local.expired = None
 
@@ -898,6 +901,11 @@ def _start_with_dotenv(monkeypatch, tmp_path, dotenv_text, **client_env) -> Path
     monkeypatch.setattr(envfiles, "_refresh", None)
     monkeypatch.delenv("GRADESCOPE_EMAIL")
     monkeypatch.delenv("GRADESCOPE_PASSWORD")
+    for key in (auth.COOKIE_HEADER_ENV, auth.SESSION_COOKIE_ENV):
+        # Register the variables with monkeypatch, so the ones load_dotenv
+        # sets are removed again after the test.
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
     for key, value in client_env.items():
         monkeypatch.setenv(key, value)
     entry.load_env_files(cwd=tmp_path / "work", package_dir=package, remember_credentials=True)
@@ -980,3 +988,296 @@ def test_refresh_ignores_a_dotenv_that_became_world_writable(monkeypatch, tmp_pa
 
     assert sorted(envfiles.refresh_credentials()) == ["GRADESCOPE_EMAIL", "GRADESCOPE_PASSWORD"]
     assert "GRADESCOPE_PASSWORD" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# SSO: browser-session cookies instead of a password
+# ---------------------------------------------------------------------------
+
+SESSION_VALUE = "c2Vzc2lvbi12YWx1ZQ%3D%3D--0123abcd"
+
+
+class CookieGradescope(FakeGradescope):
+    """``/account`` answers only a request carrying the known session cookie."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.valid_session = SESSION_VALUE
+        self.account_status: int | None = None
+        self.account_cookies: list[str] = []
+
+    def handle(self, request, timeout):
+        path = urlsplit(request.url).path or "/"
+        if path.startswith("/courses/"):
+            # A logged-in page, as long as the session cookie is still valid.
+            with self._lock:
+                self.sent.append((request.method, request.url, "", timeout))
+            if self._has_valid_session(request):
+                return make_response(request, 200, "<html>course</html>")
+            return make_response(request, 302, "", {"Location": BASE + "/login"})
+        if path != "/account":
+            return super().handle(request, timeout)
+        with self._lock:
+            self.sent.append((request.method, request.url, "", timeout))
+        cookie = request.headers.get("Cookie") or ""
+        self.account_cookies.append(cookie)
+        if self.account_status is not None:
+            return make_response(request, self.account_status, "<html>error</html>")
+        if self._has_valid_session(request):
+            return make_response(request, 200, _account_page("COOKIE-CSRF"))
+        return make_response(request, 302, "", {"Location": BASE + "/login"})
+
+    def _has_valid_session(self, request) -> bool:
+        if self.logins:  # a password login (the fake does not track its cookie)
+            return True
+        cookie = request.headers.get("Cookie") or ""
+        return f"_gradescope_session={self.valid_session}" in cookie.split("; ")
+
+    def account_checks(self) -> int:
+        return sum(1 for _, url, *_ in self.sent if urlsplit(url).path == "/account")
+
+
+@pytest.fixture
+def cookie_gs(monkeypatch) -> CookieGradescope:
+    fake = CookieGradescope()
+
+    def send(adapter, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        return fake.handle(request, timeout)
+
+    monkeypatch.setattr(HTTPAdapter, "send", send)
+    return fake
+
+
+def test_parse_cookie_header_keeps_values_simplecookie_would_drop() -> None:
+    header = (
+        'Cookie: _gradescope_session=abc%3D%3D--ff; signed_token=a=b=c; '
+        'prefs={"x":[1,2]}; flag; empty='
+    )
+
+    assert auth.parse_cookie_header(header) == {
+        "_gradescope_session": "abc%3D%3D--ff",
+        "signed_token": "a=b=c",
+        "prefs": '{"x":[1,2]}',
+        "empty": "",
+    }
+
+
+def test_cookie_header_logs_in_without_a_password_post(monkeypatch, cookie_gs) -> None:
+    monkeypatch.setenv(
+        auth.COOKIE_HEADER_ENV, f"_gradescope_session={SESSION_VALUE}; other_cookie=abc"
+    )
+    monkeypatch.delenv("GRADESCOPE_EMAIL")
+    monkeypatch.delenv("GRADESCOPE_PASSWORD")
+
+    conn = auth.get_connection()
+
+    assert conn.logged_in
+    assert isinstance(conn.account, Account)
+    assert conn.session.headers["X-CSRF-Token"] == "COOKIE-CSRF"
+    assert conn.session.cookies.get("_gradescope_session") == SESSION_VALUE
+    assert conn.session.cookies.get("other_cookie") == "abc"
+    assert _login_posts(cookie_gs) == 0
+    assert auth.get_connection() is conn
+
+
+def test_session_cookie_alone_is_enough(monkeypatch, cookie_gs) -> None:
+    monkeypatch.setenv(auth.SESSION_COOKIE_ENV, SESSION_VALUE)
+
+    conn = auth.get_connection()
+
+    assert conn.logged_in
+    assert conn.session.headers["X-CSRF-Token"] == "COOKIE-CSRF"
+    assert _login_posts(cookie_gs) == 0
+
+
+def test_cookie_wins_over_email_and_password(monkeypatch, cookie_gs) -> None:
+    monkeypatch.setenv(auth.COOKIE_HEADER_ENV, f"_gradescope_session={SESSION_VALUE}")
+
+    assert auth.get_connection().logged_in
+    assert _login_posts(cookie_gs) == 0
+
+
+def test_cookie_header_without_the_session_cookie_is_refused(monkeypatch, cookie_gs) -> None:
+    monkeypatch.setenv(auth.COOKIE_HEADER_ENV, "other_cookie=secret-value-123")
+
+    with pytest.raises(auth.AuthError) as info:
+        auth.get_connection()
+
+    assert "has no _gradescope_session cookie" in str(info.value)
+    assert "secret-value-123" not in str(info.value)
+    assert cookie_gs.sent == []
+
+
+def test_rejected_cookie_says_to_export_a_fresh_one(monkeypatch, cookie_gs, caplog) -> None:
+    monkeypatch.setenv(auth.SESSION_COOKIE_ENV, "stale-session-value")
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(auth.AuthError) as info:
+            auth.get_connection()
+
+    assert str(info.value) == auth.COOKIE_EXPIRED_MESSAGE
+    assert auth._connection is None
+    assert "stale-session-value" not in caplog.text
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_cookie_login_reports_throttling_without_blaming_the_cookie(
+    monkeypatch, cookie_gs, status
+) -> None:
+    monkeypatch.setenv(auth.SESSION_COOKIE_ENV, SESSION_VALUE)
+    cookie_gs.account_status = status
+
+    with pytest.raises(auth.AuthError) as info:
+        auth.get_connection()
+
+    assert f"HTTP {status}" in str(info.value)
+    assert str(info.value) != auth.COOKIE_EXPIRED_MESSAGE
+
+
+def test_cookie_network_errors_are_scrubbed(monkeypatch, caplog) -> None:
+    monkeypatch.setenv(auth.SESSION_COOKIE_ENV, SESSION_VALUE)
+
+    def send(adapter, request, **kwargs):
+        raise requests.ConnectionError(f"failed with Cookie: {request.headers.get('Cookie')}")
+
+    monkeypatch.setattr(HTTPAdapter, "send", send)
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(auth.AuthError) as info:
+            auth.get_connection()
+
+    assert "network error" in str(info.value)
+    assert SESSION_VALUE not in str(info.value)
+    assert "[REDACTED]" in str(info.value)
+    assert SESSION_VALUE not in caplog.text
+
+
+def test_cookie_session_gets_the_expiry_hook(monkeypatch, cookie_gs) -> None:
+    monkeypatch.setenv(auth.SESSION_COOKIE_ENV, SESSION_VALUE)
+    conn = auth.get_connection()
+    cookie_gs.valid_session = "rotated-elsewhere"
+
+    with pytest.raises(auth.SessionExpiredError):
+        conn.session.get(BASE + "/account")
+    assert auth._local.expired is conn
+
+
+def test_missing_credentials_mention_the_sso_cookie(monkeypatch) -> None:
+    monkeypatch.delenv("GRADESCOPE_EMAIL")
+    monkeypatch.delenv("GRADESCOPE_PASSWORD")
+
+    with pytest.raises(auth.AuthError) as info:
+        auth.get_connection()
+
+    assert str(info.value).startswith("Missing Gradescope credentials.")
+    assert auth.COOKIE_HEADER_ENV in str(info.value)
+
+
+# --- Issue #14 review: expiry, refresh from .env, precedence, logout --------
+
+
+def test_a_rejected_cookie_is_not_tried_again_until_it_changes(monkeypatch, cookie_gs) -> None:
+    monkeypatch.setenv(auth.SESSION_COOKIE_ENV, "stale-session-value")
+    with pytest.raises(auth.AuthError):
+        auth.get_connection()
+    assert cookie_gs.account_checks() == 1
+
+    with pytest.raises(auth.AuthError) as again:
+        auth.get_connection()
+    assert str(again.value) == auth.COOKIE_EXPIRED_MESSAGE
+    assert cookie_gs.account_checks() == 1  # Gradescope was not contacted
+
+    monkeypatch.setenv(auth.SESSION_COOKIE_ENV, SESSION_VALUE)
+    assert auth.get_connection().logged_in
+    assert auth._dead_cookie is None
+
+
+def _course_tool():
+    @auth.with_session_recovery
+    def tool() -> str:
+        try:
+            auth.get_connection().session.get(BASE + "/courses/1")
+        except auth.AuthError as e:
+            return f"Authentication error: {e}"
+        return "ok"
+
+    return tool
+
+
+def test_an_expired_cookie_session_reports_export_a_fresh_one_without_looping(
+    monkeypatch, cookie_gs
+) -> None:
+    monkeypatch.setenv(auth.SESSION_COOKIE_ENV, SESSION_VALUE)
+    tool = _course_tool()
+    assert tool() == "ok"
+    assert cookie_gs.account_checks() == 1
+
+    cookie_gs.valid_session = "logged-out-elsewhere"  # the session ends server-side
+
+    assert tool() == f"Authentication error: {auth.COOKIE_EXPIRED_MESSAGE}"
+    # The re-run did not log in again with the dead cookie, and later calls
+    # fail the same way without contacting Gradescope.
+    assert cookie_gs.account_checks() == 1
+    sent = len(cookie_gs.sent)
+    assert tool() == f"Authentication error: {auth.COOKIE_EXPIRED_MESSAGE}"
+    assert len(cookie_gs.sent) == sent
+    assert _login_posts(cookie_gs) == 0
+
+
+def test_reset_connection_never_logs_a_cookie_session_out(monkeypatch, cookie_gs) -> None:
+    monkeypatch.setenv(auth.SESSION_COOKIE_ENV, SESSION_VALUE)
+    auth.get_connection()
+
+    auth.reset_connection()
+
+    assert auth._connection is None
+    assert not any(urlsplit(url).path == "/logout" for _, url, *_ in cookie_gs.sent)
+    assert auth._dead_cookie is None  # a plain reset does not condemn the cookie
+    assert auth.get_connection().logged_in
+
+
+def test_a_fresh_cookie_exported_into_dotenv_is_used_on_the_next_call(
+    monkeypatch, tmp_path, cookie_gs
+) -> None:
+    dotenv = _start_with_dotenv(
+        monkeypatch, tmp_path, f"{auth.COOKIE_HEADER_ENV}=_gradescope_session={SESSION_VALUE}\n"
+    )
+    tool = _course_tool()
+    assert tool() == "ok"
+
+    cookie_gs.valid_session = "fresh-session-value"
+    assert tool() == f"Authentication error: {auth.COOKIE_EXPIRED_MESSAGE}"
+
+    # The user re-exports the cookie while the server keeps running.
+    _write(dotenv, f'{auth.COOKIE_HEADER_ENV}="_gradescope_session=fresh-session-value; x=1"\n')
+    assert tool() == "ok"
+    assert os.environ[auth.COOKIE_HEADER_ENV] == "_gradescope_session=fresh-session-value; x=1"
+
+
+def test_a_cookie_removed_from_dotenv_falls_back_to_the_password(
+    monkeypatch, tmp_path, cookie_gs
+) -> None:
+    dotenv = _start_with_dotenv(
+        monkeypatch, tmp_path,
+        f"GRADESCOPE_EMAIL={EMAIL}\nGRADESCOPE_PASSWORD='{PASSWORD}'\n"
+        f"{auth.SESSION_COOKIE_ENV}=stale-session-value\n",
+    )
+    with pytest.raises(auth.AuthError):
+        auth.get_connection()
+
+    _write(dotenv, f"GRADESCOPE_EMAIL={EMAIL}\nGRADESCOPE_PASSWORD='{PASSWORD}'\n")
+    assert auth.get_connection().logged_in
+    assert _login_posts(cookie_gs) == 1
+    assert auth.SESSION_COOKIE_ENV not in os.environ
+
+
+def test_client_env_cookie_wins_over_a_refreshed_dotenv(monkeypatch, tmp_path, cookie_gs) -> None:
+    dotenv = _start_with_dotenv(
+        monkeypatch, tmp_path,
+        f"{auth.SESSION_COOKIE_ENV}=from-dotenv\n",
+        GRADESCOPE_SESSION_COOKIE=SESSION_VALUE,
+    )
+    _write(dotenv, f"{auth.SESSION_COOKIE_ENV}=edited-later\n")
+
+    assert envfiles.refresh_credentials() == []
+    assert auth.get_connection().logged_in
+    assert os.environ[auth.SESSION_COOKIE_ENV] == SESSION_VALUE

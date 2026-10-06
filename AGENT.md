@@ -40,8 +40,14 @@ simple CRUD wrappers.
   file owned by another non-root user or writable by everyone is skipped.
   `main()` passes `remember_credentials=True`; `refresh_credentials()`
   (called by `auth.get_connection()` before every login attempt) then
-  re-reads `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` from the same files,
-  touching only the credential variables that came from `.env`.
+  re-reads `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` and the SSO cookie
+  variables (`envfiles.CREDENTIAL_KEYS`) from the same files, touching only
+  the credential variables that came from `.env`.
+
+- `scripts/export_sso_cookie.py`
+  Optional local helper (not part of the server) that opens Chrome for a
+  school SSO login and writes `GRADESCOPE_COOKIE_HEADER` to `.env` after
+  manual confirmation.
 
 ### Server registration
 - `src/gradescope_mcp/server.py`
@@ -303,7 +309,15 @@ All tools are `openWorldHint=true`.
 ## Operating Assumptions
 
 ### Authentication
-- Credentials must come from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`
+- Credentials must come from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`,
+  or for SSO accounts from `GRADESCOPE_COOKIE_HEADER` /
+  `GRADESCOPE_SESSION_COOKIE` (a browser-session cookie; when set, no
+  password login happens and `/account` is fetched to verify it). A cookie
+  Gradescope rejected or that expired is remembered by fingerprint
+  (`auth._dead_cookie`): until the cookie changes, `get_connection()` raises
+  `COOKIE_EXPIRED_MESSAGE` without contacting Gradescope, so the recovery
+  re-run does not loop. `reset_connection()` never logs a cookie session
+  out. Cookie values go through `_scrub` like the password
 - Never hardcode credentials
 - `python -m gradescope_mcp` loads `.env` from the working directory, then
   from the source checkout (never from parent directories); variables
@@ -402,6 +416,7 @@ Current test files:
 - `tests/test_common.py`
 - `tests/test_dates_extensions_submissions.py`
 - `tests/test_docs_consistency.py`
+- `tests/test_export_sso_cookie.py`
 - `tests/test_extensions_and_answer_key.py`
 - `tests/test_grading_ops_fixes.py`
 - `tests/test_grading_workflow.py`
