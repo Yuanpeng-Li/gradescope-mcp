@@ -531,7 +531,8 @@ the `.env`, or pass the variables through the client configuration.
 
   A `Retry-After` wait is capped at 15 minutes. Network errors start no
   cooldown. Before every login attempt the server re-reads
-  `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` from the `.env` files it loaded
+  `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` (and the SSO cookie variables)
+  from the `.env` files it loaded
   at startup, so after fixing them in `.env` the next call logs in with the
   new credentials (no cooldown applies to changed credentials) — no restart
   needed. Credentials set in the MCP client's `env` block take precedence
@@ -575,12 +576,27 @@ Give the server a browser-session cookie instead:
   cookie.
 
 `python3 scripts/export_sso_cookie.py` opens a browser for the SSO login
-and writes `GRADESCOPE_COOKIE_HEADER` to `.env` for you. With a cookie set,
-no password login happens: the server fetches `/account` with the cookie to
-check that Gradescope accepts it and to read the CSRF token. A rejected
-cookie gives `Authentication error: Gradescope login failed: Gradescope did
-not accept the session cookie ...`; export a fresh one. Cookie values never
-appear in errors or logs. Never put your school password in `.env`.
+and writes `GRADESCOPE_COOKIE_HEADER` to `.env` for you (mode 0600, replacing
+any earlier cookie line). With a cookie set, no password login happens, and
+the email and password are not used: the server fetches `/account` with the
+cookie to check that Gradescope accepts it and to read the CSRF token.
+
+- **Expiry.** A cookie-only session cannot log in again by itself. When
+  Gradescope rejects the cookie (at login, or because the session expired
+  during a call), the result is `Authentication error: Gradescope session
+  cookie expired: ... Export a fresh one ...`. The server remembers the dead
+  cookie, so later calls fail the same way at once, without contacting
+  Gradescope or retrying, until the configured cookie changes.
+- **Refresh.** The cookie variables are re-read from the startup `.env`
+  files before every login attempt, like the password, so a freshly
+  exported cookie is used on the next call without a restart. A cookie set
+  in the MCP client's `env` block wins over `.env` and needs a restart to
+  change. Removing the cookie from `.env` falls back to the email and
+  password.
+- **Logout.** The server never logs a cookie session out (the session
+  belongs to the browser the cookie came from).
+- Cookie values never appear in errors or logs. Never put your school
+  password in `.env`.
 
 ## Architecture
 

@@ -40,8 +40,9 @@ simple CRUD wrappers.
   file owned by another non-root user or writable by everyone is skipped.
   `main()` passes `remember_credentials=True`; `refresh_credentials()`
   (called by `auth.get_connection()` before every login attempt) then
-  re-reads `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` from the same files,
-  touching only the credential variables that came from `.env`.
+  re-reads `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` and the SSO cookie
+  variables (`envfiles.CREDENTIAL_KEYS`) from the same files, touching only
+  the credential variables that came from `.env`.
 
 - `scripts/export_sso_cookie.py`
   Optional local helper (not part of the server) that opens Chrome for a
@@ -311,7 +312,12 @@ All tools are `openWorldHint=true`.
 - Credentials must come from `GRADESCOPE_EMAIL` and `GRADESCOPE_PASSWORD`,
   or for SSO accounts from `GRADESCOPE_COOKIE_HEADER` /
   `GRADESCOPE_SESSION_COOKIE` (a browser-session cookie; when set, no
-  password login happens and `/account` is fetched to verify it)
+  password login happens and `/account` is fetched to verify it). A cookie
+  Gradescope rejected or that expired is remembered by fingerprint
+  (`auth._dead_cookie`): until the cookie changes, `get_connection()` raises
+  `COOKIE_EXPIRED_MESSAGE` without contacting Gradescope, so the recovery
+  re-run does not loop. `reset_connection()` never logs a cookie session
+  out. Cookie values go through `_scrub` like the password
 - Never hardcode credentials
 - `python -m gradescope_mcp` loads `.env` from the working directory, then
   from the source checkout (never from parent directories); variables

@@ -9,10 +9,14 @@ authenticated Gradescope cookie header to `.env` without printing it.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -148,21 +152,44 @@ def quote_dotenv(value: str) -> str:
     return json.dumps(value)
 
 
+# An existing cookie assignment, with or without a leading ``export``.
+_COOKIE_LINE_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:GRADESCOPE_COOKIE_HEADER|GRADESCOPE_SESSION_COOKIE)\s*="
+)
+
+
 def write_env(env_path: Path, header: str) -> None:
+    """Set ``GRADESCOPE_COOKIE_HEADER`` in ``env_path``, keeping its other lines.
+
+    Any earlier ``GRADESCOPE_COOKIE_HEADER`` / ``GRADESCOPE_SESSION_COOKIE``
+    line is dropped. The new file is written to a temporary file created with
+    mode 0600 in the same directory and then moved into place, so the cookie
+    is never readable by other users, not even briefly, and an interrupted
+    write cannot leave a truncated ``.env``. (The server skips a ``.env``
+    that other users can write.)
+    """
     lines = []
     if env_path.exists():
         lines = env_path.read_text(encoding="utf-8").splitlines()
 
-    kept = [
-        line
-        for line in lines
-        if not line.startswith("GRADESCOPE_COOKIE_HEADER=")
-        and not line.startswith("GRADESCOPE_SESSION_COOKIE=")
-    ]
+    kept = [line for line in lines if not _COOKIE_LINE_RE.match(line)]
+    while kept and not kept[-1].strip():
+        kept.pop()
     kept.append(f"GRADESCOPE_COOKIE_HEADER={quote_dotenv(header)}")
+    text = "\n".join(kept) + "\n"
 
-    env_path.write_text("\n".join(kept).rstrip() + "\n", encoding="utf-8")
-    env_path.chmod(0o600)
+    fd, tmp_name = tempfile.mkstemp(prefix=".env.", dir=env_path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(text)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, env_path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+        raise
 
 
 def main() -> int:
@@ -220,7 +247,11 @@ def main() -> int:
         context.close()
 
     print(f"Saved Gradescope cookie header to {env_path}")
-    print("Restart the MCP client after updating .env.")
+    print(
+        "The server uses it on its next tool call; no restart is needed unless "
+        "GRADESCOPE_COOKIE_HEADER is also set in the MCP client's env block, "
+        "which wins over .env."
+    )
     return 0
 
 

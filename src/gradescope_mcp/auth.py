@@ -32,8 +32,15 @@ what an error may say:
   ``GRADESCOPE_SESSION_COOKIE`` (just the ``_gradescope_session`` value) is
   set, no password login happens: the cookies are attached to the session and
   ``/account`` is fetched to confirm that Gradescope accepts them and to read
-  the CSRF token. Cookie values are scrubbed from errors and logs like the
-  password.
+  the CSRF token. A cookie-only session cannot log in again by itself, so a
+  cookie Gradescope rejected (at login, or by expiring later) is remembered
+  by fingerprint: until the configured cookie changes, calls fail at once
+  with ``COOKIE_EXPIRED_MESSAGE`` ("export a fresh one") without contacting
+  Gradescope. The cookie variables are re-read from ``.env`` like the
+  password, so a freshly exported cookie applies on the next call. Cookie
+  values are scrubbed from errors and logs like the password, and
+  ``reset_connection`` never logs a cookie session out (that would end the
+  browser's session too).
 - **Default timeouts.** The session's adapters apply a timeout (connect 10 s,
   read 60 s) to every request that does not pass its own, including the
   requests gradescopeapi helpers make on the same session.
@@ -105,6 +112,10 @@ _connection: GSConnection | None = None
 _connection_lock = threading.Lock()
 # The last failed login and its cooldown; cleared by the next successful login.
 _failed_login: _LoginFailure | None = None
+# Fingerprint of the browser-session cookie Gradescope last rejected (at login
+# or by expiring); cleared when a cookie logs in. A dead cookie stays dead, so
+# unlike ``_failed_login`` this has no cooldown: only a new cookie helps.
+_dead_cookie: str | None = None
 # Per-thread state of the current call: ``expired`` is the connection whose
 # session expired (set by the response hook); ``writes`` counts same-site
 # write requests (methods other than GET/HEAD/OPTIONS/TRACE) that Gradescope
@@ -130,11 +141,16 @@ CREDENTIALS_HINT = (
     "the next call; values set in the MCP client's env block need a server "
     "restart."
 )
-COOKIE_REJECTED_MESSAGE = (
-    "Gradescope login failed: Gradescope did not accept the session cookie in "
-    f"{COOKIE_HEADER_ENV} / {SESSION_COOKIE_ENV} (it expired or was logged "
-    "out). Export a fresh one from a logged-in browser, e.g. with "
-    "scripts/export_sso_cookie.py."
+# Where a browser-session cookie comes from, and how a new one takes effect.
+COOKIE_HINT = (
+    f"A new cookie in .env is used on the next call; {COOKIE_HEADER_ENV} / "
+    f"{SESSION_COOKIE_ENV} set in the MCP client's env block need a server restart."
+)
+COOKIE_EXPIRED_MESSAGE = (
+    "Gradescope session cookie expired: Gradescope no longer accepts the cookie "
+    f"in {COOKIE_HEADER_ENV} / {SESSION_COOKIE_ENV}, and a cookie-only session "
+    "cannot log in again by itself. Export a fresh one from a logged-in browser "
+    f"(e.g. python3 scripts/export_sso_cookie.py). {COOKIE_HINT}"
 )
 _RECOVERY_FAILED = "Gradescope session expired and re-login did not restore access."
 SESSION_RECOVERY_FAILED_MESSAGE = f"Authentication error: {_RECOVERY_FAILED}"
@@ -202,6 +218,11 @@ class _LoginRejected(Exception):
     def __init__(self, reason: str, cooldown: float) -> None:
         super().__init__(reason)
         self.cooldown = cooldown
+
+
+class _CookieRejected(AuthError):
+    """Gradescope does not accept the configured browser-session cookie."""
+    pass
 
 
 class _InvalidCredentials(_LoginRejected):
@@ -540,6 +561,11 @@ def _cookies_from_env() -> dict[str, str] | None:
     return None
 
 
+def _cookie_fingerprint(cookies: dict[str, str]) -> str:
+    joined = "\0".join(f"{name}={value}" for name, value in sorted(cookies.items()))
+    return hashlib.sha256(f"cookie\0{joined}".encode("utf-8")).hexdigest()
+
+
 def _cookie_login(conn: GSConnection, cookies: dict[str, str]) -> None:
     """Log ``conn`` in with browser-session cookies instead of a password.
 
@@ -549,8 +575,9 @@ def _cookie_login(conn: GSConnection, cookies: dict[str, str]) -> None:
     page, its logged-out page or a 401 means the cookie is no longer valid.
 
     Raises:
-        AuthError: the cookie was rejected (``COOKIE_REJECTED_MESSAGE``), or
-            Gradescope answered something else than the account page.
+        _CookieRejected: Gradescope sent the request to its login page, its
+            logged-out page or a 401.
+        AuthError: Gradescope answered something else than the account page.
         requests.RequestException: network failures; the caller scrubs them.
     """
     session = conn.session
@@ -571,7 +598,7 @@ def _cookie_login(conn: GSConnection, cookies: dict[str, str]) -> None:
         or _is_login_path(urlsplit(resp.url).path)
         or _is_logged_out_page(soup, resp.url)
     ):
-        raise AuthError(COOKIE_REJECTED_MESSAGE)
+        raise _CookieRejected(COOKIE_EXPIRED_MESSAGE)
     csrf = soup.select_one('meta[name="csrf-token"]')
     if status != 200 or csrf is None or not csrf.get("content"):
         raise AuthError(
@@ -809,9 +836,10 @@ def get_connection() -> GSConnection:
         if _connection is not None and _connection.logged_in:
             return _connection
 
-        # Pick up credentials fixed in .env since startup (issue #8). Changed
-        # credentials have a new fingerprint, so a cooldown from the old
-        # ones no longer applies.
+        # Pick up credentials (and browser-session cookies) fixed in .env
+        # since startup (issue #8). Changed credentials have a new
+        # fingerprint, so a cooldown or dead cookie from the old ones no
+        # longer applies.
         changed = envfiles.refresh_credentials()
         if changed:
             logger.info("Re-read %s from .env.", " and ".join(changed))
@@ -871,13 +899,26 @@ def get_connection() -> GSConnection:
 
 
 def _connect_with_cookies(cookies: dict[str, str]) -> GSConnection:
-    """Create the singleton from browser-session cookies (caller holds the lock)."""
-    global _connection, _failed_login
+    """Create the singleton from browser-session cookies (caller holds the lock).
+
+    A cookie Gradescope already rejected (``_dead_cookie``) fails with
+    ``COOKIE_EXPIRED_MESSAGE`` without contacting Gradescope, so a call
+    re-run after an expiry does not try the same dead cookie again.
+    """
+    global _connection, _failed_login, _dead_cookie
+
+    fingerprint = _cookie_fingerprint(cookies)
+    if fingerprint == _dead_cookie:
+        raise AuthError(COOKIE_EXPIRED_MESSAGE)
 
     secrets = tuple(cookies.values())
     conn = _new_connection()
     try:
         _cookie_login(conn, cookies)
+    except _CookieRejected as e:
+        _dead_cookie = fingerprint
+        logger.warning("%s", e)
+        raise AuthError(str(e)) from None
     except AuthError as e:
         message = _scrub(str(e), *secrets)
         logger.warning("%s", message)
@@ -893,8 +934,10 @@ def _connect_with_cookies(cookies: dict[str, str]) -> GSConnection:
         logger.warning("Gradescope cookie login failed: %s", reason)
         raise AuthError(f"Gradescope login failed: unexpected error ({reason}).") from None
 
+    conn._gradescope_cookie_fingerprint = fingerprint
     _install_expiry_hook(conn)
     _failed_login = None
+    _dead_cookie = None
     _connection = conn
     logger.info("Logged in to Gradescope with a browser-session cookie.")
     return conn
@@ -910,18 +953,29 @@ def reset_connection(expired: GSConnection | None = None) -> None:
             in again; that fresh connection is kept), and it is not logged
             out, since Gradescope already ended its session.
 
+    A connection made from a browser-session cookie whose session expired
+    marks that cookie dead (``_dead_cookie``), so the re-run reports
+    ``COOKIE_EXPIRED_MESSAGE`` instead of trying it again.
+
     Without ``expired``, the upstream ``logout`` is invoked on a best-effort
     basis (with the expiry hook detached, so its redirect is not mistaken for
     an expiry) to release the server-side session. Failures are logged and
-    otherwise ignored — the primary contract is local state cleanup.
+    otherwise ignored — the primary contract is local state cleanup. A
+    cookie session is never logged out: the session belongs to the browser
+    the cookie was exported from, and logging out would end it there too.
     """
-    global _connection
+    global _connection, _dead_cookie
     with _connection_lock:
         conn = _connection
         if conn is None or (expired is not None and conn is not expired):
             return
         _connection = None
+        cookie = getattr(conn, "_gradescope_cookie_fingerprint", None)
         if expired is not None:
+            if cookie is not None:
+                _dead_cookie = cookie
+            return
+        if cookie is not None:
             return
         _remove_expiry_hook(conn)
         try:
