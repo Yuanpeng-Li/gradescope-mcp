@@ -526,8 +526,12 @@ the `.env`, or pass the variables through the client configuration.
     after login, ...): 1 minute.
 
   A `Retry-After` wait is capped at 15 minutes. Network errors start no
-  cooldown. After fixing `.env` or the client configuration, restart the
-  server; the new credentials are tried at once.
+  cooldown. Before every login attempt the server re-reads
+  `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` from the `.env` files it loaded
+  at startup, so after fixing them in `.env` the next call logs in with the
+  new credentials (no cooldown applies to changed credentials) — no restart
+  needed. Credentials set in the MCP client's `env` block take precedence
+  over `.env` and still need a server restart to change.
 - Every request has a default timeout of 10 s to connect and 60 s to read
   (see `GRADESCOPE_MCP_HTTP_TIMEOUT`), so a stalled connection fails the
   call instead of hanging it.
@@ -584,6 +588,9 @@ the `.env`, or pass the variables through the client configuration.
   which re-runs a call once after an expiry unless a write was accepted.
 - `src/gradescope_mcp/cache.py`: the private per-user cache root and safe
   artifact writes.
+- `src/gradescope_mcp/envfiles.py`: which `.env` files are loaded, in what
+  precedence, and `refresh_credentials()`, which re-reads the credentials
+  from those files before each login attempt.
 
 ### Tool modules
 - `tools/courses.py`: course listing and roster parsing
@@ -732,6 +739,7 @@ gradescope-mcp/
 │       ├── __main__.py
 │       ├── auth.py
 │       ├── cache.py
+│       ├── envfiles.py
 │       ├── server.py
 │       └── tools/
 │           ├── __init__.py

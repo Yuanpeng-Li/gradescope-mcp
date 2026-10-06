@@ -129,7 +129,7 @@ def test_unavailable_cwd_skips_only_the_cwd_dotenv(tmp_path, monkeypatch) -> Non
     def gone():
         raise FileNotFoundError(2, "No such file or directory")
 
-    monkeypatch.setattr(entry.Path, "cwd", staticmethod(gone))
+    monkeypatch.setattr(Path, "cwd", staticmethod(gone))
 
     loaded, skipped = entry.load_env_files(package_dir=package)
 
@@ -213,7 +213,9 @@ def test_undecodable_dotenv_is_skipped_without_partial_load(tmp_path, monkeypatc
 
 
 def test_module_docstring_promises_startup_never_fails_on_dotenv() -> None:
-    doc = " ".join(entry.__doc__.split())
+    from gradescope_mcp import envfiles
+
+    doc = " ".join(envfiles.__doc__.split())
     assert "never stop the server from starting" in doc
 
 

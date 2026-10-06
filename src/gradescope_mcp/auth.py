@@ -15,7 +15,10 @@ what an error may say:
 - **Failed-login cooldown.** When Gradescope answers a login attempt without
   logging in, later calls with the same credentials raise the same
   ``AuthError`` without contacting Gradescope until a cooldown ends (or
-  ``GRADESCOPE_EMAIL`` / ``GRADESCOPE_PASSWORD`` change). Only a re-rendered
+  ``GRADESCOPE_EMAIL`` / ``GRADESCOPE_PASSWORD`` change). Before every login
+  attempt the credentials are re-read from the ``.env`` files loaded at
+  startup (``envfiles.refresh_credentials``), so a password fixed in ``.env``
+  is used on the next call without a restart. Only a re-rendered
   login form or an "invalid email/password" message counts as invalid
   credentials (10 minutes). HTTP 429 and 5xx answers wait for Gradescope's
   ``Retry-After`` (capped at 15 minutes; 1 minute without one); a "too many
@@ -73,6 +76,8 @@ from gradescopeapi.classes.account import Account
 from gradescopeapi.classes.connection import GSConnection
 from requests.adapters import HTTPAdapter
 
+from gradescope_mcp import envfiles
+
 logger = logging.getLogger(__name__)
 
 
@@ -108,6 +113,12 @@ HTTP_TIMEOUT_ENV = "GRADESCOPE_MCP_HTTP_TIMEOUT"
 DEFAULT_TIMEOUT: tuple[float, float] = (10.0, 60.0)  # (connect, read) seconds
 
 INVALID_CREDENTIALS_MESSAGE = "Gradescope login failed: invalid credentials."
+# Where credentials come from, and how a fix takes effect without a restart.
+CREDENTIALS_HINT = (
+    "Edits to GRADESCOPE_EMAIL / GRADESCOPE_PASSWORD in .env are picked up on "
+    "the next call; values set in the MCP client's env block need a server "
+    "restart."
+)
 _RECOVERY_FAILED = "Gradescope session expired and re-login did not restore access."
 SESSION_RECOVERY_FAILED_MESSAGE = f"Authentication error: {_RECOVERY_FAILED}"
 
@@ -181,7 +192,8 @@ class _InvalidCredentials(_LoginRejected):
 
     def __init__(self) -> None:
         super().__init__(
-            f"{INVALID_CREDENTIALS_MESSAGE} Check GRADESCOPE_EMAIL and GRADESCOPE_PASSWORD.",
+            f"{INVALID_CREDENTIALS_MESSAGE} Check GRADESCOPE_EMAIL and "
+            f"GRADESCOPE_PASSWORD. {CREDENTIALS_HINT}",
             INVALID_CREDENTIALS_COOLDOWN,
         )
 
@@ -694,13 +706,21 @@ def get_connection() -> GSConnection:
         if _connection is not None and _connection.logged_in:
             return _connection
 
+        # Pick up credentials fixed in .env since startup (issue #8). Changed
+        # credentials have a new fingerprint, so a cooldown from the old
+        # ones no longer applies.
+        changed = envfiles.refresh_credentials()
+        if changed:
+            logger.info("Re-read %s from .env.", " and ".join(changed))
+
         email = os.environ.get("GRADESCOPE_EMAIL")
         password = os.environ.get("GRADESCOPE_PASSWORD")
 
         if not email or not password:
             raise AuthError(
-                "Missing Gradescope credentials. "
-                "Set GRADESCOPE_EMAIL and GRADESCOPE_PASSWORD environment variables."
+                "Missing Gradescope credentials. Set GRADESCOPE_EMAIL and "
+                f"GRADESCOPE_PASSWORD (in .env or the MCP client's env block). "
+                f"{CREDENTIALS_HINT}"
             )
 
         fingerprint = _credential_fingerprint(email, password)

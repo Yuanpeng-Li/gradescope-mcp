@@ -26,15 +26,22 @@ simple CRUD wrappers.
 
 ### Runtime entry
 - `src/gradescope_mcp/__main__.py`
-  `main()` loads the `.env` files (`load_env_files`), calls
+  `main()` loads the `.env` files (`envfiles.load_env_files`, re-exported
+  here), calls
   `cache.configure_process_cache_env()` (an unsafe cache root is logged, not
   fatal), configures logging, logs the `.env` files loaded or skipped, and
-  starts the server. Nothing runs at import time. `dotenv_candidates` and
+  starts the server. Nothing runs at import time.
+- `src/gradescope_mcp/envfiles.py`
+  `.env` discovery and loading. `dotenv_candidates` and
   `source_checkout` define the search: `.env` in the working directory,
   then in the gradescope-mcp source checkout (`<checkout>/src/gradescope_mcp`
   with a `pyproject.toml` naming the project); parents are never searched,
   values already in the environment win (`override=False`), and on POSIX a
   file owned by another non-root user or writable by everyone is skipped.
+  `main()` passes `remember_credentials=True`; `refresh_credentials()`
+  (called by `auth.get_connection()` before every login attempt) then
+  re-reads `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` from the same files,
+  touching only the credential variables that came from `.env`.
 
 ### Server registration
 - `src/gradescope_mcp/server.py`
@@ -295,8 +302,10 @@ All tools are `openWorldHint=true`.
 - `python -m gradescope_mcp` loads `.env` from the working directory, then
   from the source checkout (never from parent directories); variables
   already in the environment win
-- A rejected login starts a cooldown (at most 15 min) stated in the error;
-  after fixing the credentials, restart the server
+- A rejected login starts a cooldown (at most 15 min) stated in the error.
+  Credentials are re-read from the startup `.env` files before every login
+  attempt (`envfiles.refresh_credentials`), so a fix in `.env` applies on the
+  next call; credentials from the client's `env` block need a restart
 
 ### Write safety
 - Every mutating tool is preview-first
