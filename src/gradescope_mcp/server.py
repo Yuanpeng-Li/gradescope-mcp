@@ -65,6 +65,7 @@ from gradescope_mcp.tools.grading import (
     get_grading_progress,
     get_student_assignment_link,
 )
+from gradescope_mcp.tools.lms_export import export_lms_gradebook
 from gradescope_mcp.tools.regrades import (
     get_regrade_requests,
     get_regrade_detail,
@@ -799,6 +800,59 @@ def tool_export_assignment_scores(
             ``"json"`` whenever you need every row or per-question scores.
     """
     return export_assignment_scores(course_id, assignment_id, output_format)
+
+
+@gs_tool(local_cache_write("Export scores as an LMS gradebook CSV"))
+def tool_export_lms_gradebook(
+    course_id: GradescopeID,
+    assignment_id: GradescopeID,
+    lms: Literal["canvas", "brightspace"] = "canvas",
+    column_name: str | None = None,
+    missing: Literal["blank", "zero"] = "blank",
+    include_ungraded: bool = False,
+    brightspace_key: Literal["orgdefinedid", "username"] = "orgdefinedid",
+    include_csv: bool = False,
+) -> str:
+    """Write an assignment's scores as a Canvas or Brightspace gradebook import CSV.
+
+    Reads the assignment's Gradescope scores export and writes a CSV in the
+    LMS's import format to the private runtime cache (the result prints the
+    path; upload that file in the LMS). Nothing is changed in Gradescope or
+    the LMS.
+
+    - Canvas: Student, ID (blank), SIS User ID (Gradescope SID), SIS Login ID
+      (email), Section, then the score column, plus a Points Possible row.
+      Canvas must match students by the SIS columns, so check its import
+      preview for unmatched students.
+    - Brightspace: OrgDefinedId (SID) or Username (email local part), the
+      "<column> Points Grade" column with the maximum points, and the
+      required End-of-Line Indicator column. Students without the key are
+      left out and listed.
+
+    Only fully graded submissions get a score by default; students with no
+    submission are left blank (or 0 with ``missing="zero"``), and
+    submissions that are not fully graded are left blank unless
+    ``include_ungraded=True``. Requires instructor/TA access.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID.
+        lms: ``"canvas"`` (default) or ``"brightspace"``.
+        column_name: Gradebook column / grade item name; defaults to the
+            Gradescope assignment title. Use the LMS's exact name to update
+            an existing column.
+        missing: ``"blank"`` (default) or ``"zero"`` for students without a
+            submission.
+        include_ungraded: Export the current partial total of submissions
+            that are not fully graded.
+        brightspace_key: ``"orgdefinedid"`` (default) or ``"username"``.
+        include_csv: Also return the CSV text (it contains every student's
+            name, ID and score).
+    """
+    return export_lms_gradebook(
+        course_id, assignment_id, lms, column_name, missing,
+        include_ungraded, brightspace_key, include_csv,
+    )
 
 
 @gs_tool(read_only("Get student submission link"))

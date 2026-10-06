@@ -40,6 +40,7 @@ GRADESCOPE_WRITES = {
 # Workflow tools that write only to the private local cache.
 LOCAL_CACHE_WRITES = {
     "tool_prepare_grading_artifact", "tool_cache_relevant_pages", "tool_prepare_answer_key",
+    "tool_export_lms_gradebook",
 }
 # Writes that create something new on every call. Everything else that writes
 # is idempotent in the MCP sense (a repeat has no additional effect), even when
@@ -68,7 +69,7 @@ def test_registers_expected_tools_resources_and_prompts() -> None:
 
     tools, resources, templates, prompts = anyio.run(inventory)
 
-    assert len(tools) == 38
+    assert len(tools) == 39
     assert [r.uri for r in resources] == ["gradescope://courses"]
     assert sorted(t.uri_template for t in templates) == [
         "gradescope://courses/{course_id}/assignments",
@@ -116,7 +117,7 @@ def test_write_tool_preview_through_mcp_layer() -> None:
 
 def test_every_tool_has_complete_annotations() -> None:
     tools = _tools()
-    assert len(tools) == 38
+    assert len(tools) == 39
     for name, tool in tools.items():
         ann = tool.annotations
         assert ann is not None, name

@@ -6,6 +6,38 @@
 
 ---
 
+## Session 15 — 2026-10-05: Issues #8 (credential refresh) and #7 (LMS gradebook CSV)
+
+### What was done
+
+1. **#8 — credentials fixed in `.env` apply without a restart.** `.env`
+   discovery/loading moved from `__main__` to a new `envfiles` module
+   (re-exported from `__main__`, behavior unchanged). `main()` loads with
+   `remember_credentials=True`; `auth.get_connection()` calls
+   `envfiles.refresh_credentials()` before every login attempt, which
+   re-reads `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` from the same files
+   (same trust checks). Only variables that came from `.env` are refreshed;
+   the MCP client's `env` block still wins. Changed credentials have a new
+   fingerprint, so an old cooldown no longer blocks them. Credential errors
+   now say where a fix takes effect.
+2. **#7 — `tool_export_lms_gradebook`** (new local-cache tool, 39 tools). It
+   writes a Canvas (`Student, ID, SIS User ID, SIS Login ID, Section,
+   <column>` + `Points Possible` row) or Brightspace (`OrgDefinedId` /
+   `Username`, `<column> Points Grade <Numeric MaxPoints:N>`,
+   `End-of-Line Indicator`) import CSV from the `/scores` export into the
+   private cache. Only fully graded scores are exported by default; missing
+   students are blank (or 0), partial totals are opt-in, students without a
+   matching key are listed, and spreadsheet formulas in names are
+   neutralized. Formats follow the Canvas and Brightspace import docs;
+   checked live on a demo course.
+
+### Current state
+
+- **39 tools** + **3 resources** + **7 prompts**
+- **941 automated tests** (`uv run pytest -q`), all passing
+
+---
+
 ## Session 14 — 2026-10-02: Fixes From a Live Read-Only Test (L1-L6)
 
 ### Why

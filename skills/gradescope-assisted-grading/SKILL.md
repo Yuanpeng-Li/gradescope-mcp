@@ -624,6 +624,7 @@ At the end:
 - Call `tool_get_assignment_statistics(course_id, assignment_id)`
 - Report graded counts, skipped submissions, and any low-scoring questions that may indicate rubric issues
 - For every skipped submission, include a direct grading link
+- If the user wants the scores in their LMS, call `tool_export_lms_gradebook(course_id, assignment_id, lms="canvas"|"brightspace")` and give them the file path it prints; only fully graded scores are exported unless they ask for partial totals (`include_ungraded=True`) or zeros for missing work (`missing="zero"`). Tell them to check the LMS import preview for unmatched students.
 
 ## Safety Rules
 

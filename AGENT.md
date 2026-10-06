@@ -13,7 +13,7 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 38 tools (24 read-only, 11 Gradescope writes, 3 local cache writes)
+- 39 tools (24 read-only, 11 Gradescope writes, 4 local cache writes)
 - 3 resources (1 static, 2 URI templates)
 - 7 prompts
 - Offline pytest suite (the current count is recorded in `DEVLOG.md`)
@@ -188,6 +188,11 @@ simple CRUD wrappers.
   Regrade list/detail scraping.
 - `src/gradescope_mcp/tools/statistics.py`
   Assignment statistics.
+- `src/gradescope_mcp/tools/lms_export.py`
+  `export_lms_gradebook`: builds a Canvas or Brightspace gradebook import CSV
+  from the assignment's `/scores` export and writes it to the private cache
+  (only fully graded scores by default; missing → blank or 0; partial totals
+  opt-in).
 - `src/gradescope_mcp/tools/common.py`
   Shared helpers: `normalize_rubric_ids`, `split_known_rubric_ids`,
   `format_untrusted` (fenced block whose BEGIN and END lines carry a random
@@ -261,6 +266,7 @@ write only to the private cache.
 36. `tool_prepare_grading_artifact`
 37. `tool_cache_relevant_pages`
 38. `tool_prepare_answer_key`
+39. `tool_export_lms_gradebook`
 
 All tools are `openWorldHint=true`.
 
@@ -400,6 +406,7 @@ Current test files:
 - `tests/test_grading_ops_fixes.py`
 - `tests/test_grading_workflow.py`
 - `tests/test_live_fixes.py`
+- `tests/test_lms_export.py`
 - `tests/test_p0_fixes.py`
 - `tests/test_page_selection.py`
 - `tests/test_read_side_fixes.py`
