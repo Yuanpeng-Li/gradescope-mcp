@@ -434,6 +434,45 @@ ends on an older submission is therefore not reported as a success. Check
 the assignment in Gradescope before uploading again, since every upload
 creates a new submission.
 
+### Uploads on behalf of a student
+`tool_upload_submission_for_student` lets an instructor or TA upload a
+student's submission (a scanned paper, a replacement file) through
+Gradescope's staff upload forms. The files are vetted, hashed and bound to
+the preview exactly as above (`expected_sha256`, `GRADESCOPE_MCP_UPLOAD_ROOT`,
+100 MB, no hidden or credential-like files).
+
+- **The student.** `user_id` must belong to a Student on the course roster
+  (`tool_get_course_roster`). The preview names the student (name, email,
+  user ID).
+- **New or replacement.** The student's current submission is read from the
+  assignment's scores export, and the preview says what happens:
+  - without `submission_id`, the upload creates the student's first
+    submission through Manage Submissions; if they already have one, the
+    call is refused and names it;
+  - with `submission_id`, which must be their current submission, the
+    upload goes through that submission's page and replaces it.
+
+  If the scores export can't be read, nothing is uploaded, because it would
+  be unknown whether a submission gets replaced.
+- **The form.** Staff upload forms differ by assignment type, so the form's
+  action, hidden fields, file field and student field are read from the
+  live page, and the fields are sent as a browser would (disabled controls
+  and unchecked boxes are left out). Only a POST form for this assignment on
+  this Gradescope site is used. The student field is a select offering the
+  user ID, else the first student-looking field, or `student_field_name`;
+  a student list without the student is an error.
+  `tool_inspect_submission_upload_form` (read-only) lists a page's forms and
+  fields and says which one would be used.
+- **Success** is reported only when Gradescope answers with a redirect to a
+  submission of this assignment that did not exist before (neither linked
+  from the form's page nor the student's current submission) and lands on
+  its page without an error message, as for `tool_upload_submission`. The
+  result names the student and what was replaced. Anything else is
+  `❌ Upload not confirmed`.
+
+The staff forms and their responses have not been verified against a live
+course yet; try it on a sandbox course with demo students first.
+
 ### Scoring direction
 - Gradescope questions use `positive` or `negative` scoring.
 - When Gradescope does not report it, `tool_get_question_rubric`, the
@@ -779,6 +818,7 @@ gradescope-mcp/
     ├── test_round3_runtime.py
     ├── test_server_mcp.py
     ├── test_session_recovery.py
+    ├── test_staff_upload.py
     ├── test_workflow_fixes.py
     └── test_write_safety.py
 ```

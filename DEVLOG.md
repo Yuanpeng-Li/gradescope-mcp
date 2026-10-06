@@ -6,6 +6,46 @@
 
 ---
 
+## Session 16 — 2026-10-06: Issue #13 (staff uploads on behalf of students)
+
+### What was done
+
+1. **`tool_inspect_submission_upload_form`** (read-only). Lists the file-upload
+   forms of Manage Submissions or one submission page: method, action,
+   whether the upload tool would use it, file inputs, candidate student
+   fields (with the size of a student list) and the number of other fields.
+2. **`tool_upload_submission_for_student`** (write, not idempotent). Reuses
+   the upload path from #18: `_validate_upload_path`, `_upload_roots`,
+   `expected_sha256`, read-once bytes, and `_upload_outcome` for the result,
+   so success needs a redirect to a new submission page without an error
+   message. The student must be a roster Student; the preview names them.
+   The student's current submission comes from the scores export:
+   without `submission_id` the upload creates a first submission (refused,
+   naming it, if one exists); with `submission_id`, which must be the
+   current one, it replaces it through the submission page. An unreadable
+   scores export uploads nothing. The form is read from the live page, only
+   POST forms under this assignment on this site are used, and its fields
+   are sent like a browser sends them (no disabled controls, no unchecked
+   boxes). Submission IDs linked from the form's page and the student's
+   current one count as existing for the success check.
+3. The multipart body is built by requests (`files=`) from the bytes read,
+   so no `requests-toolbelt` dependency is added.
+
+### Not verified live
+
+Only tested against offline fakes. What still needs a sandbox course with
+demo students: the real Manage Submissions and submission-page forms per
+assignment type (field names, whether replacement posts to the submission
+page), and where Gradescope redirects after a staff upload (a new
+submission ID is required for success).
+
+### Current state
+
+- **41 tools** + **3 resources** + **7 prompts**
+- **959 automated tests** (`uv run pytest -q`), all passing
+
+---
+
 ## Session 15 — 2026-10-05: Issues #8 (credential refresh) and #7 (LMS gradebook CSV)
 
 ### What was done

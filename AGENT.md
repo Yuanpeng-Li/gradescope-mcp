@@ -416,6 +416,7 @@ Current test files:
 - `tests/test_round3_runtime.py`
 - `tests/test_server_mcp.py`
 - `tests/test_session_recovery.py`
+- `tests/test_staff_upload.py`
 - `tests/test_workflow_fixes.py`
 - `tests/test_write_safety.py`
 
