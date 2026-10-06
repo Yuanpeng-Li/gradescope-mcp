@@ -54,6 +54,8 @@ from gradescope_mcp.tools.assignments import (
 )
 from gradescope_mcp.tools.submissions import (
     upload_submission,
+    upload_submission_for_student,
+    inspect_submission_upload_form,
     get_assignment_submissions,
     get_student_submission,
     get_assignment_graders,
@@ -503,6 +505,92 @@ def tool_upload_submission(
     """
     return upload_submission(
         course_id, assignment_id, file_paths, leaderboard_name, confirm_write,
+        expected_sha256=expected_sha256,
+    )
+
+
+@gs_tool(read_only("Inspect staff upload forms"))
+def tool_inspect_submission_upload_form(
+    course_id: GradescopeID,
+    assignment_id: GradescopeID,
+    submission_id: OptionalGradescopeID = None,
+) -> str:
+    """Inspect the staff file-upload forms of an assignment or one submission.
+
+    Reads Manage Submissions (or, with submission_id, that submission's page)
+    and lists each file-upload form: method, action, whether
+    tool_upload_submission_for_student would use it (a POST to this
+    assignment on this site), file inputs, candidate student fields (with the
+    number of choices of a student list) and the number of other fields.
+    Use it when tool_upload_submission_for_student cannot find the form or
+    the student field.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID.
+        submission_id: Optional assignment-level submission ID: inspect that
+            submission's page (its replace form) instead of Manage Submissions.
+    """
+    return inspect_submission_upload_form(course_id, assignment_id, submission_id)
+
+
+@gs_tool(gradescope_write("Upload submission for a student", idempotent=False))
+def tool_upload_submission_for_student(
+    course_id: GradescopeID,
+    assignment_id: GradescopeID,
+    user_id: GradescopeID,
+    file_paths: list[str],
+    submission_id: OptionalGradescopeID = None,
+    student_field_name: str | None = None,
+    confirm_write: bool = False,
+    expected_sha256: list[str] | None = None,
+) -> str:
+    """Upload files as one student's submission, through the staff upload form.
+
+    For instructors and TAs: uploads a scanned paper or replacement file on a
+    student's behalf. Files are vetted like tool_upload_submission's
+    (absolute paths, at most 100 MB, no hidden/credential/system files,
+    GRADESCOPE_MCP_UPLOAD_ROOT, expected_sha256). The student must be a
+    Student on the roster; the preview names them and says whether an
+    existing submission is replaced. Without submission_id the upload
+    creates the student's first submission through Manage Submissions, and
+    is refused (naming the submission) if they already have one; with
+    submission_id, which must be their current submission, it replaces that
+    submission through its page. The upload form's action, hidden fields,
+    file field and student field are read from the live page; only a POST
+    form for this assignment on this site is used. If the student's current
+    submission can't be read from the scores export, nothing is uploaded.
+
+    Success is reported only when Gradescope answers with a redirect to a
+    submission of this assignment that did not exist before and shows its
+    page without an error message; anything else is ``❌ Upload not
+    confirmed``. Check the assignment on Gradescope before uploading again.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The assignment ID.
+        user_id: The student's Gradescope user ID (from tool_get_course_roster).
+        file_paths: List of absolute file paths to upload.
+        submission_id: The student's current assignment-level submission ID,
+            to replace it; omit to create their first submission.
+        student_field_name: Exact name of the form field that takes the
+            student's user ID, if it is not detected
+            (see tool_inspect_submission_upload_form).
+        confirm_write: Must be True to perform the upload. The default
+            returns a preview and changes nothing. Setting it is not user
+            approval: show the preview to the user first.
+        expected_sha256: Optional SHA-256 hex digests from the preview, one
+            per file in file_paths and in the same order. When given, the
+            upload is refused if any file's content differs.
+    """
+    return upload_submission_for_student(
+        course_id,
+        assignment_id,
+        user_id,
+        file_paths,
+        submission_id,
+        student_field_name,
+        confirm_write,
         expected_sha256=expected_sha256,
     )
 

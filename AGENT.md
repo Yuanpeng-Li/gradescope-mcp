@@ -13,7 +13,7 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 39 tools (24 read-only, 11 Gradescope writes, 4 local cache writes)
+- 41 tools (25 read-only, 12 Gradescope writes, 4 local cache writes)
 - 3 resources (1 static, 2 URI templates)
 - 7 prompts
 - Offline pytest suite (the current count is recorded in `DEVLOG.md`)
@@ -150,7 +150,8 @@ simple CRUD wrappers.
   read, write and read-back of a confirmed write; waits up to 300 s, then
   `WriteInProgressError`), which `extensions.py` reuses.
 - `src/gradescope_mcp/tools/submissions.py`
-  Uploads (path vetting, `GRADESCOPE_MCP_UPLOAD_ROOT`), submission listing,
+  Uploads (path vetting, `GRADESCOPE_MCP_UPLOAD_ROOT`), staff upload-form
+  inspection and uploads on behalf of a student, submission listing,
   per-student submission reads, grader discovery.
 - `src/gradescope_mcp/tools/extensions.py`
   Extension reads (course-local time = UTC instant, other settings) and
@@ -220,26 +221,27 @@ Grouped by annotation class. `tests/test_server_mcp.py` pins these sets.
 6. `tool_get_assignment_submissions`
 7. `tool_get_student_submission`
 8. `tool_get_assignment_graders`
-9. `tool_get_assignment_outline`
-10. `tool_export_assignment_scores`
-11. `tool_get_student_assignment_link`
-12. `tool_get_grading_progress`
-13. `tool_get_regrade_requests`
-14. `tool_get_regrade_detail`
-15. `tool_get_assignment_statistics`
-16. `tool_get_submission_grading_context`
-17. `tool_get_question_rubric`
-18. `tool_list_question_submissions`
-19. `tool_get_student_submission_map`
-20. `tool_get_next_ungraded`
-21. `tool_get_answer_groups`
-22. `tool_get_answer_group_detail`
-23. `tool_assess_submission_readiness`
-24. `tool_smart_read_submission`
+9. `tool_inspect_submission_upload_form`
+10. `tool_get_assignment_outline`
+11. `tool_export_assignment_scores`
+12. `tool_get_student_assignment_link`
+13. `tool_get_grading_progress`
+14. `tool_get_regrade_requests`
+15. `tool_get_regrade_detail`
+16. `tool_get_assignment_statistics`
+17. `tool_get_submission_grading_context`
+18. `tool_get_question_rubric`
+19. `tool_list_question_submissions`
+20. `tool_get_student_submission_map`
+21. `tool_get_next_ungraded`
+22. `tool_get_answer_groups`
+23. `tool_get_answer_group_detail`
+24. `tool_assess_submission_readiness`
+25. `tool_smart_read_submission`
 
 ### Gradescope writes
 `destructiveHint=true`, exactly the tools with `confirm_write`.
-`idempotentHint=false` for upload and rubric-item creation, true otherwise.
+`idempotentHint=false` for the uploads and rubric-item creation, true otherwise.
 Idempotent follows the MCP definition (a repeat with the same arguments has
 no additional effect), not "returns the same result": a repeated delete
 reports the item missing, and a repeated group grade is refused because
@@ -247,26 +249,27 @@ the first call graded the members (without `overwrite_graded`, or with
 an `expected_graded_ids` that no longer matches the graded members);
 nothing is sent.
 
-25. `tool_upload_submission`
-26. `tool_set_extension`
-27. `tool_modify_assignment_dates`
-28. `tool_rename_assignment`
-29. `tool_update_autograder_image`
-30. `tool_apply_grade`
-31. `tool_apply_grade_batch`
-32. `tool_create_rubric_item`
-33. `tool_update_rubric_item`
-34. `tool_delete_rubric_item`
-35. `tool_grade_answer_group`
+26. `tool_upload_submission`
+27. `tool_upload_submission_for_student`
+28. `tool_set_extension`
+29. `tool_modify_assignment_dates`
+30. `tool_rename_assignment`
+31. `tool_update_autograder_image`
+32. `tool_apply_grade`
+33. `tool_apply_grade_batch`
+34. `tool_create_rubric_item`
+35. `tool_update_rubric_item`
+36. `tool_delete_rubric_item`
+37. `tool_grade_answer_group`
 
 ### Local cache writes
 `readOnlyHint=false`, `destructiveHint=false`: they read Gradescope and
 write only to the private cache.
 
-36. `tool_prepare_grading_artifact`
-37. `tool_cache_relevant_pages`
-38. `tool_prepare_answer_key`
-39. `tool_export_lms_gradebook`
+38. `tool_prepare_grading_artifact`
+39. `tool_cache_relevant_pages`
+40. `tool_prepare_answer_key`
+41. `tool_export_lms_gradebook`
 
 All tools are `openWorldHint=true`.
 
@@ -413,6 +416,7 @@ Current test files:
 - `tests/test_round3_runtime.py`
 - `tests/test_server_mcp.py`
 - `tests/test_session_recovery.py`
+- `tests/test_staff_upload.py`
 - `tests/test_workflow_fixes.py`
 - `tests/test_write_safety.py`
 
