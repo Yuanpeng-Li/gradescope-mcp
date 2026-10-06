@@ -36,8 +36,10 @@ def test_upload_submission_passes_files_positionally(tmp_path, monkeypatch) -> N
         captured["assignment_id"] = assignment_id
         captured["file_count"] = len(files)
         captured["kwargs"] = kwargs
-        return "https://example.com/submissions/42"
+        # The new submission's page (R2-11: nothing else counts as success).
+        return "https://x/courses/1/assignments/2/submissions/42"
 
+    monkeypatch.delenv(submissions.UPLOAD_ROOT_ENV, raising=False)
     monkeypatch.setattr(submissions, "upload_assignment", fake_upload)
     monkeypatch.setattr(
         submissions, "get_connection",
@@ -77,6 +79,7 @@ def test_upload_submission_closes_handles_on_partial_open_failure(
         opened.append(fh)
         return fh
 
+    monkeypatch.delenv(submissions.UPLOAD_ROOT_ENV, raising=False)
     monkeypatch.setattr("builtins.open", tracked_open)
     monkeypatch.setattr(
         submissions, "get_connection",
@@ -152,10 +155,8 @@ def test_get_assignments_renders_zero_grade_as_zero(monkeypatch) -> None:
             max_grade=10.0,
         ),
     ]
-    monkeypatch.setattr(
-        assignments, "get_connection",
-        lambda: SimpleNamespace(account=SimpleNamespace(get_assignments=lambda *_: sample)),
-    )
+    monkeypatch.setattr(assignments, "get_connection", lambda: SimpleNamespace())
+    monkeypatch.setattr(assignments, "_fetch_assignment_listing", lambda *_: (sample, []))
 
     result = assignments.get_assignments("1")
     assert "0.0/10.0" in result

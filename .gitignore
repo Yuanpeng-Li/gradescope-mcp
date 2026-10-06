@@ -30,8 +30,6 @@ tea_debug.log
 .DS_Store
 Thumbs.db
 
-# Operations logs (contains sensitive test data)
+# Local log of real-account write tests (contains sensitive data; never
+# committed)
 OPERATIONS_LOGS/
-
-# Temporary grading artifacts
-/tmp/gradescope-*

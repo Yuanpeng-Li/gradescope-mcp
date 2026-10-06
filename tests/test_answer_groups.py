@@ -49,13 +49,12 @@ def test_grade_answer_group_requires_confirm(monkeypatch) -> None:
         lambda *_args, **_kwargs: {
             "groups": [{"id": 3, "title": "test group"}],
             "submissions": [
-                {"confirmed_group_id": 3, "graded": False},
-                {"confirmed_group_id": 3, "graded": True},
+                {"id": 101, "confirmed_group_id": 3, "graded": False},
+                {"id": 102, "confirmed_group_id": 3, "graded": True},
             ],
         },
     )
     # Mock get_connection for the group grade page request
-    import types
 
     class _FakeResp:
         status_code = 200
@@ -71,14 +70,26 @@ def test_grade_answer_group_requires_confirm(monkeypatch) -> None:
 
     monkeypatch.setattr(answer_groups, "get_connection", lambda: _FakeConn())
 
-    result = answer_groups.grade_answer_group(
+    # One member is already graded, so overwriting must be opted into before
+    # a preview is even shown.
+    refused = answer_groups.grade_answer_group(
         "1", "2", "3",
         rubric_item_ids=["10"],
         comment="test",
     )
+    assert refused.startswith("Error:")
+    assert "overwrite_graded=True" in refused
+
+    result = answer_groups.grade_answer_group(
+        "1", "2", "3",
+        rubric_item_ids=["10"],
+        comment="test",
+        overwrite_graded=True,
+    )
     assert "Write confirmation required" in result
     assert "grade_answer_group" in result
-    assert "group_size=2 confirmed submissions" in result
+    assert "group_size=2 confirmed submissions (1 already graded" in result
+    assert "`102`" in result
     assert "confirm_write=True" in result
 
 
@@ -159,6 +170,10 @@ def test_grade_answer_group_omits_existing_eval_when_not_explicitly_provided(
 
     payload = captured["kwargs"]["json"]["question_submission_evaluation"]
     assert payload == {}
+    assert captured["url"] == (
+        "https://example.com/courses/1/questions/2/submissions/100/save_many_grades"
+    )
+    assert captured["kwargs"]["allow_redirects"] is False
 
 
 def test_grade_answer_group_rejects_none_rubric_ids() -> None:

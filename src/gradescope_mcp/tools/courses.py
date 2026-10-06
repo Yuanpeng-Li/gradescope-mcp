@@ -1,10 +1,26 @@
 """Course-related MCP tools."""
 
 import json
+import re
 
 from bs4 import BeautifulSoup
 
 from gradescope_mcp.auth import get_connection, AuthError
+from gradescope_mcp.tools.common import escape_md_cell
+
+
+# gradescopeapi reads the course box's assignment count with ``.text``, which
+# glues the count to a child element: "1 assignmentNo Published Grades".
+_GLUED_COUNT_RE = re.compile(r"^(\d+\s+assignments?)(?![a-z])\s*(\S.*)$")
+
+
+def _assignment_count_text(value) -> str:
+    """The course box's assignment count, e.g. "1 assignment · No Published Grades"."""
+    text = " ".join(str(value or "").split())
+    match = _GLUED_COUNT_RE.match(text)
+    if match:
+        return f"{match.group(1)} · {match.group(2)}"
+    return text or "N/A"
 
 
 def list_courses() -> str:
@@ -30,7 +46,7 @@ def list_courses() -> str:
                 f"- **{course.name}** ({course.full_name})\n"
                 f"  - ID: `{course_id}`\n"
                 f"  - Semester: {course.semester} {course.year}\n"
-                f"  - Assignments: {course.num_assignments}"
+                f"  - Assignments: {_assignment_count_text(course.num_assignments)}"
             )
 
     student_courses = courses.get("student", {})
@@ -41,7 +57,7 @@ def list_courses() -> str:
                 f"- **{course.name}** ({course.full_name})\n"
                 f"  - ID: `{course_id}`\n"
                 f"  - Semester: {course.semester} {course.year}\n"
-                f"  - Assignments: {course.num_assignments}"
+                f"  - Assignments: {_assignment_count_text(course.num_assignments)}"
             )
 
     if not lines:
@@ -50,14 +66,22 @@ def list_courses() -> str:
     return "\n".join(lines)
 
 
-def _parse_roster(soup: BeautifulSoup, course_id: str) -> list[dict]:
+def _parse_roster(
+    soup: BeautifulSoup, course_id: str, stats: dict | None = None
+) -> list[dict]:
     """Parse course roster from the memberships page HTML.
 
     This is a custom parser that replaces the buggy gradescopeapi
     get_course_members function, which miscounts table columns when
     sections are present.
+
+    If ``stats`` is given it receives ``table_found`` and ``skipped_rows``
+    (roster rows without the member-edit button this parser reads them from).
     """
     table = soup.find("table", class_="js-rosterTable")
+    if stats is not None:
+        stats["table_found"] = table is not None
+        stats["skipped_rows"] = 0
     if table is None:
         return []
 
@@ -82,6 +106,8 @@ def _parse_roster(soup: BeautifulSoup, course_id: str) -> list[dict]:
         cell0 = cells[0]
         edit_btn = cell0.find("button", class_="rosterCell--editIcon")
         if edit_btn is None:
+            if stats is not None:
+                stats["skipped_rows"] += 1
             continue
 
         # Parse member data from the edit button
@@ -164,13 +190,27 @@ def get_course_roster(course_id: str) -> str:
             return f"Error: Unable to access roster (status {resp.status_code}). Check your permissions."
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        members = _parse_roster(soup, course_id)
+        stats: dict = {}
+        members = _parse_roster(soup, course_id, stats)
     except AuthError as e:
         return f"Authentication error: {e}"
     except Exception as e:
         return f"Error fetching roster: {e}"
 
+    skipped = stats.get("skipped_rows", 0)
+    if not stats.get("table_found"):
+        return (
+            f"Error: the memberships page for course `{course_id}` has no roster "
+            "table (unexpected page). Check the course ID and that you have "
+            "instructor or TA access."
+        )
     if not members:
+        if skipped:
+            return (
+                f"Error: the roster for course `{course_id}` has {skipped} "
+                "row(s), but none carries the member data this tool reads (the "
+                "member edit button), so no members can be listed."
+            )
         return f"No members found for course `{course_id}`, or you don't have permission to view the roster."
 
     # Group by role
@@ -181,6 +221,14 @@ def get_course_roster(course_id: str) -> str:
 
     lines = [f"## Course Roster (Course {course_id})\n"]
     lines.append(f"**Total members:** {len(members)}\n")
+    if skipped:
+        lines.append(
+            f"⚠️ {skipped} roster row(s) had no member data (no edit button) and "
+            "are neither listed nor counted above.\n"
+        )
+
+    def cell(value) -> str:
+        return escape_md_cell(value) if value else "N/A"
 
     for role, role_members in sorted(by_role.items()):
         lines.append(f"### {role} ({len(role_members)})\n")
@@ -188,9 +236,9 @@ def get_course_roster(course_id: str) -> str:
         lines.append("|------|-------|-----|---------|-------------|----------|")
         for m in sorted(role_members, key=lambda x: x["full_name"] or ""):
             lines.append(
-                f"| {m['full_name'] or 'N/A'} | {m['email'] or 'N/A'} | "
-                f"{m['sid'] or 'N/A'} | {m['user_id'] or 'N/A'} | "
-                f"{m['num_submissions']} | {m['sections'] or 'N/A'} |"
+                f"| {cell(m['full_name'])} | {cell(m['email'])} | "
+                f"{cell(m['sid'])} | {cell(m['user_id'])} | "
+                f"{m['num_submissions']} | {cell(m['sections'])} |"
             )
         lines.append("")
 
