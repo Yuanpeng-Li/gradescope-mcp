@@ -15,7 +15,7 @@ workflows.
 
 ## Current Status
 
-- 38 MCP tools (24 read-only, 11 that write to Gradescope, 3 that only write
+- 39 MCP tools (24 read-only, 11 that write to Gradescope, 4 that only write
   to the private local cache)
 - 3 MCP resources (1 static resource, 2 URI templates)
 - 7 MCP prompts
@@ -107,6 +107,7 @@ the private local cache).
 | `tool_assess_submission_readiness` | read-only | Report pre-read context (prompt, reference, rubric, crop, located student work); not grading confidence |
 | `tool_cache_relevant_pages` | local cache | Download a submission's page images (all pages by default; `include_all_pages=False` for crop pages and neighbours) and print the directory |
 | `tool_prepare_answer_key` | local cache | Write an assignment-wide grading basis (prompts, instructor reference answers) and print its path |
+| `tool_export_lms_gradebook` | local cache | Write the assignment's scores as a Canvas or Brightspace gradebook import CSV (fully graded scores only by default) and print its path |
 | `tool_smart_read_submission` | read-only | Crop-first reading plan: crop page, adjacent pages, other pages; typed answers for online questions |
 
 ### Answer Groups
@@ -526,8 +527,12 @@ the `.env`, or pass the variables through the client configuration.
     after login, ...): 1 minute.
 
   A `Retry-After` wait is capped at 15 minutes. Network errors start no
-  cooldown. After fixing `.env` or the client configuration, restart the
-  server; the new credentials are tried at once.
+  cooldown. Before every login attempt the server re-reads
+  `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` from the `.env` files it loaded
+  at startup, so after fixing them in `.env` the next call logs in with the
+  new credentials (no cooldown applies to changed credentials) — no restart
+  needed. Credentials set in the MCP client's `env` block take precedence
+  over `.env` and still need a server restart to change.
 - Every request has a default timeout of 10 s to connect and 60 s to read
   (see `GRADESCOPE_MCP_HTTP_TIMEOUT`), so a stalled connection fails the
   call instead of hanging it.
@@ -584,6 +589,9 @@ the `.env`, or pass the variables through the client configuration.
   which re-runs a call once after an expiry unless a write was accepted.
 - `src/gradescope_mcp/cache.py`: the private per-user cache root and safe
   artifact writes.
+- `src/gradescope_mcp/envfiles.py`: which `.env` files are loaded, in what
+  precedence, and `refresh_credentials()`, which re-reads the credentials
+  from those files before each login attempt.
 
 ### Tool modules
 - `tools/courses.py`: course listing and roster parsing
@@ -601,6 +609,7 @@ the `.env`, or pass the variables through the client configuration.
 - `tools/answer_groups.py`: answer-group inspection and batch writes
 - `tools/regrades.py`: regrade listing and detail
 - `tools/statistics.py`: assignment statistics
+- `tools/lms_export.py`: Canvas / Brightspace gradebook import CSV export
 - `tools/common.py`: shared helpers (rubric-ID normalization, untrusted-text
   blocks, markdown escaping, one-line display names, page selection)
 - `tools/safety.py`: the standard write-preview message
@@ -732,6 +741,7 @@ gradescope-mcp/
 │       ├── __main__.py
 │       ├── auth.py
 │       ├── cache.py
+│       ├── envfiles.py
 │       ├── server.py
 │       └── tools/
 │           ├── __init__.py
@@ -743,6 +753,7 @@ gradescope-mcp/
 │           ├── grading.py
 │           ├── grading_ops.py
 │           ├── grading_workflow.py
+│           ├── lms_export.py
 │           ├── regrades.py
 │           ├── safety.py
 │           ├── statistics.py
@@ -759,6 +770,7 @@ gradescope-mcp/
     ├── test_grading_ops_fixes.py
     ├── test_grading_workflow.py
     ├── test_live_fixes.py
+    ├── test_lms_export.py
     ├── test_p0_fixes.py
     ├── test_page_selection.py
     ├── test_read_side_fixes.py

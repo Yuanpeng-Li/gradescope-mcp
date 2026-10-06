@@ -36,7 +36,7 @@ from requests.structures import CaseInsensitiveDict
 
 import gradescope_mcp
 from gradescope_mcp import __main__ as entry
-from gradescope_mcp import auth, server
+from gradescope_mcp import auth, envfiles, server
 
 BASE = "https://www.gradescope.com"
 EMAIL = "prof@example.edu"
@@ -237,7 +237,7 @@ def test_invalid_credentials_wait_for_the_cooldown_or_changed_env(
         auth.get_connection()
     assert str(first.value) == (
         "Gradescope login failed: invalid credentials. Check GRADESCOPE_EMAIL and "
-        "GRADESCOPE_PASSWORD. Not trying to log in again for 10 min."
+        f"GRADESCOPE_PASSWORD. {auth.CREDENTIALS_HINT} Not trying to log in again for 10 min."
     )
     assert str(first.value).startswith(auth.INVALID_CREDENTIALS_MESSAGE)
     attempts = len(fake_gs.sent)
@@ -429,7 +429,7 @@ def test_invalid_credentials_are_recognized(monkeypatch, fake_gs, clock, answer)
         auth.get_connection()
     assert str(info.value) == (
         "Gradescope login failed: invalid credentials. Check GRADESCOPE_EMAIL and "
-        "GRADESCOPE_PASSWORD. Not trying to log in again for 10 min."
+        f"GRADESCOPE_PASSWORD. {auth.CREDENTIALS_HINT} Not trying to log in again for 10 min."
     )
 
 
@@ -879,3 +879,104 @@ def test_installed_server_ignores_ancestor_dotenv(tmp_path) -> None:
     }
     assert f"Loaded environment defaults from {work / '.env'}" in proc.stderr
     assert "parent-of-install" not in proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Issue #8: credentials fixed in .env apply without a restart
+# ---------------------------------------------------------------------------
+
+
+def _start_with_dotenv(monkeypatch, tmp_path, dotenv_text, **client_env) -> Path:
+    """Load a checkout ``.env`` the way ``main()`` does; returns its path.
+
+    ``client_env`` holds variables already in the process environment (an MCP
+    client's ``env`` block); the credentials not given there come from
+    ``.env``.
+    """
+    package = _checkout(tmp_path / "checkout")
+    dotenv = _write(tmp_path / "checkout" / ".env", dotenv_text)
+    monkeypatch.setattr(envfiles, "_refresh", None)
+    monkeypatch.delenv("GRADESCOPE_EMAIL")
+    monkeypatch.delenv("GRADESCOPE_PASSWORD")
+    for key, value in client_env.items():
+        monkeypatch.setenv(key, value)
+    entry.load_env_files(cwd=tmp_path / "work", package_dir=package, remember_credentials=True)
+    return dotenv
+
+
+def test_password_fixed_in_dotenv_is_used_on_the_next_call(
+    monkeypatch, tmp_path, fake_gs, clock
+) -> None:
+    dotenv = _start_with_dotenv(
+        monkeypatch, tmp_path,
+        f"GRADESCOPE_EMAIL={EMAIL}\nGRADESCOPE_PASSWORD=wrong-password\n",
+    )
+
+    with pytest.raises(auth.AuthError) as first:
+        auth.get_connection()
+    assert str(first.value).startswith(auth.INVALID_CREDENTIALS_MESSAGE)
+    assert auth.CREDENTIALS_HINT in str(first.value)
+
+    # The user fixes .env while the server keeps running: no restart and no
+    # cooldown wait, because the credentials changed.
+    _write(dotenv, f"GRADESCOPE_EMAIL={EMAIL}\nGRADESCOPE_PASSWORD='{PASSWORD}'\n")
+    conn = auth.get_connection()
+
+    assert conn.logged_in
+    assert _login_posts(fake_gs) == 2
+    assert os.environ["GRADESCOPE_PASSWORD"] == PASSWORD
+
+
+def test_client_env_credentials_win_over_a_refreshed_dotenv(
+    monkeypatch, tmp_path, fake_gs
+) -> None:
+    dotenv = _start_with_dotenv(
+        monkeypatch, tmp_path,
+        f"GRADESCOPE_EMAIL={EMAIL}\nGRADESCOPE_PASSWORD=from-dotenv\n",
+        GRADESCOPE_PASSWORD=PASSWORD,
+    )
+    _write(dotenv, f"GRADESCOPE_EMAIL={EMAIL}\nGRADESCOPE_PASSWORD=edited-later\n")
+
+    assert envfiles.refresh_credentials() == []
+    assert auth.get_connection().logged_in
+    assert os.environ["GRADESCOPE_PASSWORD"] == PASSWORD
+
+
+def test_password_removed_from_dotenv_is_reported_missing_with_the_hint(
+    monkeypatch, tmp_path
+) -> None:
+    dotenv = _start_with_dotenv(
+        monkeypatch, tmp_path, f"GRADESCOPE_EMAIL={EMAIL}\nGRADESCOPE_PASSWORD=x\n"
+    )
+    _write(dotenv, f"GRADESCOPE_EMAIL={EMAIL}\n")
+
+    with pytest.raises(auth.AuthError) as info:
+        auth.get_connection()
+
+    assert str(info.value).startswith("Missing Gradescope credentials.")
+    assert auth.CREDENTIALS_HINT in str(info.value)
+    assert "GRADESCOPE_PASSWORD" not in os.environ
+
+
+def test_refresh_is_a_noop_unless_startup_asked_for_it(monkeypatch, tmp_path) -> None:
+    package = _checkout(tmp_path / "checkout")
+    dotenv = _write(tmp_path / "checkout" / ".env", "GRADESCOPE_PASSWORD=from-dotenv\n")
+    monkeypatch.setattr(envfiles, "_refresh", None)
+    monkeypatch.delenv("GRADESCOPE_PASSWORD")
+
+    entry.load_env_files(cwd=tmp_path / "work", package_dir=package)
+    _write(dotenv, "GRADESCOPE_PASSWORD=edited\n")
+
+    assert envfiles.refresh_credentials() == []
+    assert os.environ["GRADESCOPE_PASSWORD"] == "from-dotenv"
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX permissions")
+def test_refresh_ignores_a_dotenv_that_became_world_writable(monkeypatch, tmp_path) -> None:
+    dotenv = _start_with_dotenv(
+        monkeypatch, tmp_path, f"GRADESCOPE_EMAIL={EMAIL}\nGRADESCOPE_PASSWORD=x\n"
+    )
+    _write(dotenv, f"GRADESCOPE_EMAIL={EMAIL}\nGRADESCOPE_PASSWORD=planted\n", mode=0o666)
+
+    assert sorted(envfiles.refresh_credentials()) == ["GRADESCOPE_EMAIL", "GRADESCOPE_PASSWORD"]
+    assert "GRADESCOPE_PASSWORD" not in os.environ
