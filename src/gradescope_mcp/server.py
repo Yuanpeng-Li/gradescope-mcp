@@ -66,6 +66,7 @@ from gradescope_mcp.tools.grading import (
     get_student_assignment_link,
 )
 from gradescope_mcp.tools.lms_export import export_lms_gradebook
+from gradescope_mcp.tools.outline import update_assignment_outline
 from gradescope_mcp.tools.regrades import (
     get_regrade_requests,
     get_regrade_detail,
@@ -212,6 +213,38 @@ class GradeRow(TypedDict, total=False):
     comment: str | None
     confidence: Number | None
     overwrite: StrictOptionalBool
+
+
+@with_config(ConfigDict(extra="forbid"))
+class OutlineRegion(TypedDict):
+    """A crop region: page percentages (0-100) on a 1-based template page."""
+
+    x1: Number
+    x2: Number
+    y1: Number
+    y2: Number
+    page_number: int
+
+
+@with_config(ConfigDict(extra="forbid"))
+class OutlineSubquestion(TypedDict, total=False):
+    """A sub-question; omit ``question_id`` to create it."""
+
+    question_id: GradescopeID
+    title: str
+    weight: Required[Number]
+    crop_rect_list: Required[list[OutlineRegion]]
+
+
+@with_config(ConfigDict(extra="forbid"))
+class OutlineQuestion(TypedDict, total=False):
+    """A top-level question or group; omit ``question_id`` to create it."""
+
+    question_id: GradescopeID
+    title: str
+    weight: Number
+    crop_rect_list: list[OutlineRegion]
+    children: list[OutlineSubquestion]
 
 
 # At most MAX_BATCH_ROWS rows. The schema advertises the cap (``maxItems``)
@@ -686,6 +719,47 @@ def tool_update_autograder_image(
     """
     return update_autograder_image(
         course_id, assignment_id, image_name, confirm_write
+    )
+
+
+@gs_tool(gradescope_write("Update assignment outline", idempotent=True))
+def tool_update_assignment_outline(
+    course_id: GradescopeID,
+    assignment_id: GradescopeID,
+    questions: list[OutlineQuestion],
+    expected_fingerprint: str | None = None,
+    allow_removals: bool = False,
+    confirm_write: bool = False,
+) -> str:
+    """Replace a scanned-PDF assignment's outline: questions, points, regions.
+
+    Sends what the outline editor's Save sends, so ``questions`` is the
+    complete new outline in order; the name and SID regions are kept.
+    Requires instructor access.
+
+    Args:
+        course_id: The Gradescope course ID.
+        assignment_id: The PDF/exam assignment ID.
+        questions: Every question, in order. ``question_id`` keeps an existing
+            question (omit it to create one); ``title``; ``weight`` in
+            points; ``crop_rect_list`` regions with ``x1``/``x2``/``y1``/
+            ``y2`` as page percentages (0-100, top-left origin) and a
+            1-based ``page_number``; ``children`` for one level of
+            sub-questions (a group's weight and regions default to its
+            children's sum and the first child's regions).
+        expected_fingerprint: The fingerprint the preview printed. Required
+            with ``confirm_write=True``; if the outline was saved since the
+            preview (e.g. in the browser), nothing is sent.
+        allow_removals: An existing question left out of ``questions`` is
+            deleted with its rubric and grades; that is refused unless this
+            is True. Set it only with the user's approval.
+        confirm_write: Must be True to save. The default returns a preview
+            (new outline beside the current one) and changes nothing.
+            Setting it is not user approval: show the preview first.
+    """
+    return update_assignment_outline(
+        course_id, assignment_id, questions, expected_fingerprint,
+        allow_removals, confirm_write,
     )
 
 

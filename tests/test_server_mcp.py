@@ -35,7 +35,7 @@ GRADESCOPE_WRITES = {
     "tool_upload_submission", "tool_set_extension", "tool_modify_assignment_dates",
     "tool_rename_assignment", "tool_update_autograder_image", "tool_apply_grade",
     "tool_apply_grade_batch", "tool_create_rubric_item", "tool_update_rubric_item",
-    "tool_delete_rubric_item", "tool_grade_answer_group",
+    "tool_delete_rubric_item", "tool_grade_answer_group", "tool_update_assignment_outline",
 }
 # Workflow tools that write only to the private local cache.
 LOCAL_CACHE_WRITES = {
@@ -69,7 +69,7 @@ def test_registers_expected_tools_resources_and_prompts() -> None:
 
     tools, resources, templates, prompts = anyio.run(inventory)
 
-    assert len(tools) == 39
+    assert len(tools) == 40
     assert [r.uri for r in resources] == ["gradescope://courses"]
     assert sorted(t.uri_template for t in templates) == [
         "gradescope://courses/{course_id}/assignments",
@@ -117,7 +117,7 @@ def test_write_tool_preview_through_mcp_layer() -> None:
 
 def test_every_tool_has_complete_annotations() -> None:
     tools = _tools()
-    assert len(tools) == 39
+    assert len(tools) == 40
     for name, tool in tools.items():
         ann = tool.annotations
         assert ann is not None, name
@@ -576,6 +576,14 @@ def _sample(prop: str, schema: dict, defs: dict, counter: list[int]):
         return 4, 4
     if kind == "array":
         items = schema["items"]
+        if items.get("$ref") == "#/$defs/OutlineQuestion":
+            region = {"x1": 0, "x2": 100, "y1": 10, "y2": 20.5, "page_number": 2}
+            return (
+                [{"question_id": 7, "title": "Q1", "weight": 5, "crop_rect_list": [region]}],
+                [{"question_id": "7", "title": "Q1", "weight": 5.0, "crop_rect_list": [
+                    {**region, "x1": 0.0, "x2": 100.0, "y1": 10.0}
+                ]}],
+            )
         if "$ref" in items:
             return (
                 [{"submission_id": 7, "rubric_item_ids": [8], "comment": "c"}],
