@@ -222,6 +222,20 @@ def _validate_questions(
     return [q for q in result if q is not None], errors
 
 
+def _payload_question(q: dict) -> dict:
+    """A validated question as the editor sends it: existing IDs as integers.
+
+    Gradescope matches ``id`` against its integer question IDs; a string ID
+    is not matched, so the question would be deleted and created anew.
+    """
+    out = {k: v for k, v in q.items() if k != "children"}
+    if "id" in out:
+        out["id"] = int(out["id"])
+    if q.get("children"):
+        out["children"] = [_payload_question(c) for c in q["children"]]
+    return out
+
+
 def _all_ids(questions: list[dict]) -> dict[str, dict]:
     found: dict[str, dict] = {}
     for q in questions:
@@ -379,7 +393,7 @@ def update_assignment_outline(
         "assignment": {
             "identification_regions": {"name": snapshot["name"], "sid": snapshot["sid"]},
         },
-        "question_data": new_questions,
+        "question_data": [_payload_question(q) for q in new_questions],
     }
     conn = editor["conn"]
     try:
@@ -421,6 +435,11 @@ def _readback_mismatches(sent: list[dict], saved: list[dict]) -> list[str]:
         return [f"⚠️ Read-back: Gradescope saved {len(b)} question(s) in a different shape than the {len(a)} sent."]
     problems = []
     for (num, s), (_n, g) in zip(a, b):
+        if "id" in s and s["id"] != g["id"]:
+            problems.append(
+                f"⚠️ Read-back: Q{num} was recreated as `{g['id']}` instead of keeping "
+                f"`{s['id']}`; its rubric and any grades did not carry over"
+            )
         for label, key in (("title", "title"), ("points", "weight"), ("regions", "crop_rect_list")):
             if s[key] != g[key]:
                 problems.append(f"⚠️ Read-back: Q{num} {label} is {g[key]!r} on Gradescope (sent {s[key]!r})")

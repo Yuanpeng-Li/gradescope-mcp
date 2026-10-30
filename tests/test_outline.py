@@ -42,7 +42,8 @@ class FakeSession:
         next_id = [100]
 
         def to_props(q):
-            if "id" in q:
+            # Like Gradescope: only an integer id matches an existing question.
+            if isinstance(q.get("id"), int) and not self.gs.recreate:
                 qid = q["id"]
             else:
                 next_id[0] += 1
@@ -63,6 +64,7 @@ class FakeGradescope:
         self.props = copy.deepcopy(props or PROPS)
         self.sent = []
         self.status = status
+        self.recreate = False
         conn = type("Conn", (), {"gradescope_base_url": "https://gs", "session": FakeSession(self)})()
         monkeypatch.setattr(
             outline, "_load_outline_editor",
@@ -112,11 +114,11 @@ def test_confirm_sends_the_editor_payload_and_reads_back(monkeypatch) -> None:
     body = call["json"]
     assert body["assignment"]["identification_regions"]["name"] == _rect(1, 37.7, 40.9, 17.1, 88.2)
     data = body["question_data"]
-    assert [q.get("id") for q in data] == ["11", "12", None]
+    assert [q.get("id") for q in data] == [11, 12, None]  # integers, like the editor
     assert "id" not in data[2]
     assert data[2]["crop_rect_list"] == [_rect(2, 7.8, 36.1)]  # rounded to 0.1 like the editor
     assert data[1]["weight"] == 12
-    assert [c["id"] for c in data[1]["children"]] == ["13", "14"]
+    assert [c["id"] for c in data[1]["children"]] == [13, 14]
 
 
 def test_confirm_requires_a_matching_fingerprint(monkeypatch) -> None:
@@ -190,3 +192,14 @@ def test_rejected_save_is_reported(monkeypatch) -> None:
     result = outline.update_assignment_outline("1", "2", FULL, fp, confirm_write=True)
 
     assert result.startswith("Error: Gradescope rejected the outline (status 422)")
+
+
+def test_read_back_reports_questions_gradescope_recreated(monkeypatch) -> None:
+    gs = FakeGradescope(monkeypatch)
+    gs.recreate = True
+    fp = outline.outline_fingerprint(PROPS)
+
+    result = outline.update_assignment_outline("1", "2", FULL, fp, confirm_write=True)
+
+    assert "Q1 was recreated as `101` instead of keeping `11`" in result
+    assert "Q2.1 was recreated" in result
