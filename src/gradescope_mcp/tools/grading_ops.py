@@ -603,14 +603,64 @@ def get_submission_grading_context(
     return "\n".join(lines)
 
 
+def _rubric_editor_props(
+    session, base_url: str, course_id: str, question_id: str, listing_html: str,
+) -> tuple[dict, str] | None:
+    """Read one question's rubric from its assignment's rubric editor.
+
+    Before any submission exists there is no grading page, but the
+    assignment's ``/rubric/edit`` page (linked from the question's
+    submissions page) holds every question's scoring settings and rubric
+    items. Returns ``(props, csrf_token)`` shaped like SubmissionGrader
+    props (``question`` and ``rubric_items``), or ``None`` when the page or
+    the question is not found.
+    """
+    match = re.search(
+        rf"/courses/{re.escape(str(course_id))}/assignments/(\d+)/rubric/edit",
+        listing_html,
+    )
+    if not match:
+        return None
+    page = session.get(f"{base_url}{match.group(0)}")
+    if page.status_code != 200:
+        return None
+    soup = BeautifulSoup(page.text, "html.parser")
+    tag = soup.find(attrs={"data-react-class": "AssignmentRubric"})
+    if tag is None:
+        return None
+    try:
+        editor = json.loads(tag.get("data-react-props", "{}"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(editor, dict):
+        return None
+    questions = editor.get("questions") or []
+    if isinstance(questions, dict):
+        questions = list(questions.values())
+    question = next(
+        (q for q in questions if isinstance(q, dict) and str(q.get("id")) == str(question_id)),
+        None,
+    )
+    if question is None:
+        return None
+    items = [
+        ri for ri in editor.get("rubric_items") or []
+        if isinstance(ri, dict) and str(ri.get("question_id")) == str(question_id)
+    ]
+    items.sort(key=lambda ri: ri["position"] if isinstance(ri.get("position"), (int, float)) else 0)
+    return {"question": question, "rubric_items": items}, _csrf_from_soup(soup)
+
+
 def _load_question_rubric_context(course_id: str, question_id: str) -> dict:
     """Load the grading page of some submission of a question.
 
     A question's rubric, scoring type and a CSRF token all live on a
     submission's SubmissionGrader page. Returns the same keys as
-    ``_get_grading_context`` plus ``submission_id``. ``props`` is ``None``
-    when no grading page could be found (e.g. no submissions yet); the
-    ``csrf_token`` then comes from the question's submissions page.
+    ``_get_grading_context`` plus ``submission_id``. With no submissions
+    yet, ``props`` comes from the assignment's rubric editor instead (same
+    ``question`` / ``rubric_items`` shape, ``submission_id`` ``None``).
+    ``props`` is ``None`` when neither could be read; the ``csrf_token``
+    then comes from the question's submissions page.
 
     Raises AuthError, or ValueError when the question pages are unreachable.
     """
@@ -663,6 +713,21 @@ def _load_question_rubric_context(course_id: str, question_id: str) -> dict:
             f"Cannot access question `{question_id}` "
             f"(status {listing.status_code} / {grade_page.status_code})."
         )
+
+    # Path 3: no submissions yet; the rubric editor has the rubric.
+    if listing.status_code == 200:
+        editor = _rubric_editor_props(
+            conn.session, base_url, course_id, question_id, listing.text
+        )
+        if editor is not None:
+            props, editor_csrf = editor
+            return {
+                "props": props,
+                "csrf_token": editor_csrf or csrf_token,
+                "session": conn.session,
+                "base_url": base_url,
+                "submission_id": None,
+            }
 
     return {
         "props": None,

@@ -2462,3 +2462,75 @@ def test_group_expected_graded_ids_schema_takes_ids_only() -> None:
         anyio.run(server.mcp.call_tool, "tool_grade_answer_group", {
             **GROUP_OVERWRITE, "expected_graded_ids": ["abc"],
         })
+
+
+# ------------------------------------------------------------------
+# Rubric before any submission: read from the assignment's rubric editor
+# ------------------------------------------------------------------
+
+
+def _rubric_editor_conn(monkeypatch, *, link=True, scoring="negative"):
+    """A course whose question 2 has no submissions yet."""
+    calls = []
+    editor_props = {
+        "questions": [
+            {"id": 2, "title": "Product vision", "weight": "2.0",
+             "scoring_type": scoring, "floor": True, "ceiling": True},
+            {"id": 3, "title": "Other", "weight": "5.0", "scoring_type": "positive"},
+        ],
+        "rubric_items": [
+            {"id": 21, "question_id": 2, "description": "Incorrect", "weight": "2.0", "position": 1},
+            {"id": 20, "question_id": 2, "description": "Correct", "weight": "0.0", "position": 0},
+            {"id": 30, "question_id": 3, "description": "Elsewhere", "weight": "5.0", "position": 0},
+        ],
+    }
+    sidebar = f'<a href="/courses/{C}/assignments/8/rubric/edit">Create Rubric</a>' if link else ""
+
+    def get(url, **_kwargs):
+        calls.append(url)
+        if url.endswith(f"/questions/{Q}/submissions"):
+            text = f'<meta name="csrf-token" content="LISTING">{sidebar}No submissions yet'
+            return SimpleNamespace(status_code=200, text=text, url=url)
+        if url.endswith(f"/courses/{C}/assignments/8/rubric/edit"):
+            props = html.escape(json.dumps(editor_props), quote=True)
+            text = (
+                '<meta name="csrf-token" content="EDITOR">'
+                f'<div data-react-class="AssignmentRubric" data-react-props="{props}"></div>'
+            )
+            return SimpleNamespace(status_code=200, text=text, url=url)
+        return SimpleNamespace(status_code=404, text="", url=url)
+
+    conn = SimpleNamespace(gradescope_base_url=BASE, session=SimpleNamespace(get=get))
+    monkeypatch.setattr(grading_ops, "get_connection", lambda: conn)
+    return calls
+
+
+def test_question_rubric_without_submissions_comes_from_the_rubric_editor(monkeypatch) -> None:
+    _rubric_editor_conn(monkeypatch)
+
+    result = grading_ops.get_question_rubric(C, Q)
+
+    assert "**Scoring:** negative" in result
+    assert "**Weight:** 2.0 pts" in result
+    rows = [line for line in result.splitlines() if line.startswith("| `")]
+    assert rows == ["| `20` | Correct | 0.0 |", "| `21` | Incorrect | 2.0 |"]
+
+
+def test_rubric_item_preview_knows_the_scoring_type_without_submissions(monkeypatch) -> None:
+    _rubric_editor_conn(monkeypatch)
+
+    preview = grading_ops.create_rubric_item(C, Q, "Missing reason", 1.0)
+    duplicate = grading_ops.create_rubric_item(C, Q, "incorrect", 2.0)
+
+    assert "scoring_type unknown" not in preview
+    assert "applying this item will DEDUCT 1 point(s) (negative scoring)" in preview
+    assert "already exists" in duplicate
+
+
+def test_rubric_context_without_submissions_or_editor_link_is_still_none(monkeypatch) -> None:
+    calls = _rubric_editor_conn(monkeypatch, link=False)
+
+    result = grading_ops.get_question_rubric(C, Q)
+
+    assert result.startswith(f"No submissions found for question `{Q}`.")
+    assert not any("/rubric/edit" in url for url in calls)
