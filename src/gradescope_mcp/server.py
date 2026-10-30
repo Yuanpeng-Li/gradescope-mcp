@@ -66,6 +66,7 @@ from gradescope_mcp.tools.grading import (
     get_student_assignment_link,
 )
 from gradescope_mcp.tools.lms_export import export_lms_gradebook
+from gradescope_mcp.tools.question_settings import set_question_scoring
 from gradescope_mcp.tools.regrades import (
     get_regrade_requests,
     get_regrade_detail,
@@ -1362,6 +1363,42 @@ def tool_delete_rubric_item(
     """
     return delete_rubric_item(
         course_id, question_id, rubric_item_id, confirm_write
+    )
+
+
+@gs_tool(gradescope_write("Set question scoring", idempotent=True))
+def tool_set_question_scoring(
+    course_id: GradescopeID,
+    question_id: GradescopeID,
+    scoring_type: Literal["positive", "negative"] | None = None,
+    ceiling: StrictOptionalBool = None,
+    floor: StrictOptionalBool = None,
+    confirm_write: bool = False,
+) -> str:
+    """Change a question's scoring type, ceiling and/or floor.
+
+    Sends what the rubric editor's scoring settings send. Works before any
+    submission exists. Requires instructor access (or rubric edit rights).
+
+    A 0-point bonus question needs ``scoring_type="positive"`` and
+    ``ceiling=false``, or the points it awards are capped at 0. Switching
+    the scoring type flips what every existing rubric item does (deduct ↔
+    add) and recomputes graded scores; the preview lists those items.
+
+    Args:
+        course_id: The Gradescope course ID.
+        question_id: The question ID.
+        scoring_type: "positive" or "negative"; None keeps the current one.
+        ceiling: true caps the score at the question's points; false lets
+            it exceed them; None keeps the current setting.
+        floor: true keeps the score at 0 or more; None keeps the current
+            setting.
+        confirm_write: Must be True to save. The default returns a preview
+            (current → new settings) and changes nothing. Setting it is not
+            user approval: show the preview to the user first.
+    """
+    return set_question_scoring(
+        course_id, question_id, scoring_type, ceiling, floor, confirm_write
     )
 
 
