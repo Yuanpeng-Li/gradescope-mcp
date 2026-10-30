@@ -15,7 +15,7 @@ workflows.
 
 ## Current Status
 
-- 39 MCP tools (24 read-only, 11 that write to Gradescope, 4 that only write
+- 40 MCP tools (24 read-only, 12 that write to Gradescope, 4 that only write
   to the private local cache)
 - 3 MCP resources (1 static resource, 2 URI templates)
 - 7 MCP prompts
@@ -99,6 +99,7 @@ the private local cache).
 | `tool_create_rubric_item` | write | Create a rubric item (positive weight; ADD/DEDUCT shown in the preview) |
 | `tool_update_rubric_item` | write | Update an existing rubric item's description or weight |
 | `tool_delete_rubric_item` | write | Delete a rubric item (removes it from every submission) |
+| `tool_set_question_scoring` | write | Set a question's scoring type (positive / negative), ceiling and floor; works before any submission exists |
 
 ### AI-Assisted / Workflow Helpers
 | Tool | Kind | Description |
@@ -610,6 +611,7 @@ the `.env`, or pass the variables through the client configuration.
 - `tools/regrades.py`: regrade listing and detail
 - `tools/statistics.py`: assignment statistics
 - `tools/lms_export.py`: Canvas / Brightspace gradebook import CSV export
+- `tools/question_settings.py`: a question's scoring type, ceiling and floor
 - `tools/common.py`: shared helpers (rubric-ID normalization, untrusted-text
   blocks, markdown escaping, one-line display names, page selection)
 - `tools/safety.py`: the standard write-preview message
@@ -754,6 +756,7 @@ gradescope-mcp/
 │           ├── grading_ops.py
 │           ├── grading_workflow.py
 │           ├── lms_export.py
+│           ├── question_settings.py
 │           ├── regrades.py
 │           ├── safety.py
 │           ├── statistics.py
@@ -772,6 +775,7 @@ gradescope-mcp/
     ├── test_live_fixes.py
     ├── test_lms_export.py
     ├── test_p0_fixes.py
+    ├── test_question_settings.py
     ├── test_page_selection.py
     ├── test_read_side_fixes.py
     ├── test_round3_runtime.py
