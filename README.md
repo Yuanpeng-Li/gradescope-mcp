@@ -15,7 +15,7 @@ workflows.
 
 ## Current Status
 
-- 39 MCP tools (24 read-only, 11 that write to Gradescope, 4 that only write
+- 40 MCP tools (24 read-only, 12 that write to Gradescope, 4 that only write
   to the private local cache)
 - 3 MCP resources (1 static resource, 2 URI templates)
 - 7 MCP prompts
@@ -74,6 +74,7 @@ the private local cache).
 | `tool_modify_assignment_dates` | write | Change release / due / late-due dates; omitted dates are kept |
 | `tool_rename_assignment` | write | Rename an assignment |
 | `tool_update_autograder_image` | write | Change a programming assignment's autograder Docker Hub image |
+| `tool_update_assignment_outline` | write | Replace a PDF/exam assignment's outline (questions, points, regions); refuses if the outline changed since the preview |
 | `tool_get_assignment_submissions` | read-only | Global Submission IDs with graded status, progress and late flag |
 | `tool_get_student_submission` | read-only | One student's typed answers (untrusted blocks), file and page links, per-question and total scores |
 | `tool_get_assignment_graders` | read-only | Staff who last graded a question's submissions, with counts (not the assigned graders) |
@@ -181,8 +182,9 @@ submission is already graded) and repeats that call with
 
 ### Numbers
 - The number arguments (`point_adjustment`, `confidence`, `weight`,
-  `expected_member_count`, and `point_adjustment` / `confidence` in batch
-  rows) accept JSON numbers and numeric strings. `true` and `false` are
+  `expected_member_count`, `point_adjustment` / `confidence` in batch
+  rows, and the outline region coordinates `x1`, `x2`, `y1`, `y2` with
+  their `page_number`) accept JSON numbers and numeric strings. `true` and `false` are
   rejected (`must be a number, not a boolean`) instead of being read as 1
   and 0. `expected_member_count` must be a whole number of at least 0.
 - A batch row's `overwrite` accepts only JSON `true`, `false` or `null`.
@@ -610,6 +612,7 @@ the `.env`, or pass the variables through the client configuration.
 - `tools/regrades.py`: regrade listing and detail
 - `tools/statistics.py`: assignment statistics
 - `tools/lms_export.py`: Canvas / Brightspace gradebook import CSV export
+- `tools/outline.py`: PDF/exam outline writes (questions, points, regions)
 - `tools/common.py`: shared helpers (rubric-ID normalization, untrusted-text
   blocks, markdown escaping, one-line display names, page selection)
 - `tools/safety.py`: the standard write-preview message
@@ -754,6 +757,7 @@ gradescope-mcp/
 │           ├── grading_ops.py
 │           ├── grading_workflow.py
 │           ├── lms_export.py
+│           ├── outline.py
 │           ├── regrades.py
 │           ├── safety.py
 │           ├── statistics.py
@@ -771,6 +775,7 @@ gradescope-mcp/
     ├── test_grading_workflow.py
     ├── test_live_fixes.py
     ├── test_lms_export.py
+    ├── test_outline.py
     ├── test_p0_fixes.py
     ├── test_page_selection.py
     ├── test_read_side_fixes.py

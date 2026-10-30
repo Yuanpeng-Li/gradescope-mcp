@@ -13,7 +13,7 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 39 tools (24 read-only, 11 Gradescope writes, 4 local cache writes)
+- 40 tools (24 read-only, 12 Gradescope writes, 4 local cache writes)
 - 3 resources (1 static, 2 URI templates)
 - 7 prompts
 - Offline pytest suite (the current count is recorded in `DEVLOG.md`)
@@ -193,6 +193,13 @@ simple CRUD wrappers.
   from the assignment's `/scores` export and writes it to the private cache
   (only fully graded scores by default; missing → blank or 0; partial totals
   opt-in).
+- `src/gradescope_mcp/tools/outline.py`
+  `update_assignment_outline`: replaces a PDF/exam outline (questions,
+  points, crop regions) with the editor's `PATCH .../outline/` request.
+  The preview prints a fingerprint of the current outline; a confirmed
+  write needs it, so an outline saved in the browser since the preview is
+  never overwritten. Leaving out an existing question needs
+  `allow_removals=True`. The saved outline is read back and compared.
 - `src/gradescope_mcp/tools/common.py`
   Shared helpers: `normalize_rubric_ids`, `split_known_rubric_ids`,
   `format_untrusted` (fenced block whose BEGIN and END lines carry a random
@@ -252,21 +259,22 @@ nothing is sent.
 27. `tool_modify_assignment_dates`
 28. `tool_rename_assignment`
 29. `tool_update_autograder_image`
-30. `tool_apply_grade`
-31. `tool_apply_grade_batch`
-32. `tool_create_rubric_item`
-33. `tool_update_rubric_item`
-34. `tool_delete_rubric_item`
-35. `tool_grade_answer_group`
+30. `tool_update_assignment_outline`
+31. `tool_apply_grade`
+32. `tool_apply_grade_batch`
+33. `tool_create_rubric_item`
+34. `tool_update_rubric_item`
+35. `tool_delete_rubric_item`
+36. `tool_grade_answer_group`
 
 ### Local cache writes
 `readOnlyHint=false`, `destructiveHint=false`: they read Gradescope and
 write only to the private cache.
 
-36. `tool_prepare_grading_artifact`
-37. `tool_cache_relevant_pages`
-38. `tool_prepare_answer_key`
-39. `tool_export_lms_gradebook`
+37. `tool_prepare_grading_artifact`
+38. `tool_cache_relevant_pages`
+39. `tool_prepare_answer_key`
+40. `tool_export_lms_gradebook`
 
 All tools are `openWorldHint=true`.
 
@@ -407,6 +415,7 @@ Current test files:
 - `tests/test_grading_workflow.py`
 - `tests/test_live_fixes.py`
 - `tests/test_lms_export.py`
+- `tests/test_outline.py`
 - `tests/test_p0_fixes.py`
 - `tests/test_page_selection.py`
 - `tests/test_read_side_fixes.py`
