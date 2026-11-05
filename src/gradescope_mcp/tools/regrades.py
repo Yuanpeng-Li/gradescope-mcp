@@ -16,6 +16,7 @@ from bs4 import BeautifulSoup
 from gradescope_mcp.auth import get_connection, AuthError
 from gradescope_mcp.tools.common import (
     element_classes,
+    sanitize_inline,
     escape_md_cell,
     format_untrusted,
     is_hidden_element,
@@ -29,6 +30,7 @@ from gradescope_mcp.tools.grading_ops import (
     _get_grading_context,
     _resolve_rubric,
 )
+from gradescope_mcp.tools.safety import write_confirmation_required
 
 
 # Completion-cell values that positively mean "not completed yet". Truly
@@ -629,4 +631,104 @@ def get_regrade_detail(course_id: str, question_id: str, submission_id: str) -> 
                 "(`tool_smart_read_submission` lists every page)_"
             )
 
+    return "\n".join(lines)
+
+
+_RESPONSE_HEADERS = {
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+def respond_to_regrade_request(
+    course_id: str,
+    question_id: str,
+    submission_id: str,
+    response: str,
+    confirm_write: bool = False,
+) -> str:
+    """Post the staff response to a submission's open regrade request and close it.
+
+    Sends what the grader's "Close & Respond" button sends:
+    ``PUT {urls.regrade_request}/{open_request.id}`` with
+    ``{"regrade_request": {"id", "staff_comment"}}``. The grade itself is
+    not changed here; change it first with ``apply_grade``.
+    """
+    if not course_id or not question_id or not submission_id:
+        return "Error: course_id, question_id, and submission_id are required."
+    if not isinstance(response, str) or not response.strip():
+        return "Error: response must be non-empty text."
+
+    try:
+        ctx = _get_grading_context(course_id, question_id, submission_id)
+    except AuthError as e:
+        return f"Authentication error: {e}"
+    except ValueError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error fetching the regrade request: {e}"
+
+    props = ctx["props"]
+    open_req = props.get("open_request")
+    if not isinstance(open_req, dict) or not open_req.get("id"):
+        return (
+            f"Error: submission `{submission_id}` has no open regrade request; "
+            "nothing was sent. Check tool_get_regrade_detail for closed requests."
+        )
+    base_url = (props.get("urls") or {}).get("regrade_request")
+    if not base_url:
+        return "Error: the grading page did not include the regrade request URL; nothing was sent."
+
+    question = props.get("question") or {}
+    submission = props.get("submission") or {}
+    details = [
+        f"course_id=`{course_id}`",
+        f"question_id=`{question_id}` ({sanitize_inline(question.get('title') or 'untitled')})",
+        f"submission_id=`{submission_id}`",
+        f"student={sanitize_inline(submission.get('owner_names', 'Unknown'))}",
+        f"regrade_request_id=`{open_req.get('id')}` (opened {open_req.get('created_at', '?')})",
+        f"current_score={submission.get('score', '?')}/{question.get('weight', '?')} "
+        "(not changed by this tool)",
+        f"response:\n{_quote(response)}",
+        "this closes the request; the student sees the response",
+    ]
+    if not confirm_write:
+        return write_confirmation_required("respond_to_regrade_request", details)
+
+    try:
+        resp = ctx["session"].put(
+            f"{ctx['base_url']}{base_url}/{open_req['id']}",
+            json={"regrade_request": {"id": open_req["id"], "staff_comment": response}},
+            headers={"X-CSRF-Token": ctx["csrf_token"], **_RESPONSE_HEADERS},
+        )
+    except Exception as e:
+        return f"Error: sending the response failed: {e}"
+    if resp.status_code != 200:
+        return (
+            f"Error: Gradescope rejected the response (status {resp.status_code}): "
+            f"{sanitize_inline(resp.text[:300])}"
+        )
+
+    lines = [f"✅ Response sent to regrade request `{open_req['id']}`."]
+    try:
+        after = _get_grading_context(course_id, question_id, submission_id)["props"]
+    except Exception as e:
+        lines.append(f"⚠️ Read-back failed ({e}); check the request with tool_get_regrade_detail.")
+        return "\n".join(lines)
+    still_open = after.get("open_request")
+    closed = next(
+        (r for r in after.get("closed_requests") or []
+         if isinstance(r, dict) and r.get("id") == open_req["id"]),
+        None,
+    )
+    if isinstance(still_open, dict) and still_open.get("id") == open_req["id"]:
+        lines.append("⚠️ Read-back: the request is still open on Gradescope.")
+    elif closed is None:
+        lines.append("⚠️ Read-back: the request is not among the closed requests.")
+    elif (closed.get("staff_comment") or "").strip() != response.strip():
+        lines.append("⚠️ Read-back: the saved staff response differs from what was sent.")
+    else:
+        lines.append("**Now:** closed, with the staff response saved.")
+    after_sub = after.get("submission") or {}
+    lines.append(f"**Score:** {after_sub.get('score', '?')}/{question.get('weight', '?')}")
     return "\n".join(lines)

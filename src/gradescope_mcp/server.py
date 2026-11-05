@@ -69,6 +69,7 @@ from gradescope_mcp.tools.lms_export import export_lms_gradebook
 from gradescope_mcp.tools.regrades import (
     get_regrade_requests,
     get_regrade_detail,
+    respond_to_regrade_request,
 )
 from gradescope_mcp.tools.statistics import get_assignment_statistics
 from gradescope_mcp.tools.grading_ops import (
@@ -1365,6 +1366,38 @@ def tool_delete_rubric_item(
     )
 
 
+@gs_tool(gradescope_write("Respond to regrade request", idempotent=True))
+def tool_respond_to_regrade_request(
+    course_id: GradescopeID,
+    question_id: GradescopeID,
+    submission_id: GradescopeID,
+    response: str,
+    confirm_write: bool = False,
+) -> str:
+    """Reply to a submission's open regrade request and close it.
+
+    Sends what the grader's "Close & Respond" button sends: the staff
+    response is saved, the request is closed and the student can read the
+    response. The grade is not changed; change it first with
+    tool_apply_grade. Reads the request back to confirm it closed.
+    Requires instructor/TA access.
+
+    Args:
+        course_id: The Gradescope course ID.
+        question_id: The question ID (from tool_get_regrade_requests).
+        submission_id: The Question Submission ID (from
+            tool_get_regrade_requests).
+        response: The staff response the student will see.
+        confirm_write: Must be True to send. The default returns a preview
+            (request, current score and response) and changes nothing.
+            Setting it is not user approval: show the preview to the user
+            first.
+    """
+    return respond_to_regrade_request(
+        course_id, question_id, submission_id, response, confirm_write
+    )
+
+
 # ============================================================
 # Tools — answer groups
 # ============================================================
@@ -1918,8 +1951,12 @@ def review_regrade_requests(
         f"it would overwrite (a regraded submission is already graded, so the write "
         f"is refused without overwrite_graded=True). Only after my explicit approval "
         f"of that preview repeat the same call with confirm_write=True, then re-read "
-        f"with tool_get_regrade_detail to verify. Replying to or closing the regrade "
-        f"request itself is done in the Gradescope web UI."
+        f"with tool_get_regrade_detail to verify.\n"
+        f"7. For each request I have decided, preview the reply with "
+        f"tool_respond_to_regrade_request(course_id, question_id, submission_id, "
+        f"response=..., confirm_write=False). It closes the request, so send it "
+        f"only after any grade change is saved and only after I approve the "
+        f"preview; then repeat it with confirm_write=True."
     )
 
 

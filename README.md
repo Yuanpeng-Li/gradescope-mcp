@@ -15,7 +15,7 @@ workflows.
 
 ## Current Status
 
-- 39 MCP tools (24 read-only, 11 that write to Gradescope, 4 that only write
+- 40 MCP tools (24 read-only, 12 that write to Gradescope, 4 that only write
   to the private local cache)
 - 3 MCP resources (1 static resource, 2 URI templates)
 - 7 MCP prompts
@@ -99,6 +99,7 @@ the private local cache).
 | `tool_create_rubric_item` | write | Create a rubric item (positive weight; ADD/DEDUCT shown in the preview) |
 | `tool_update_rubric_item` | write | Update an existing rubric item's description or weight |
 | `tool_delete_rubric_item` | write | Delete a rubric item (removes it from every submission) |
+| `tool_respond_to_regrade_request` | write | Reply to an open regrade request and close it (the grader's "Close & Respond"); the grade is unchanged; reads the request back |
 
 ### AI-Assisted / Workflow Helpers
 | Tool | Kind | Description |
@@ -163,7 +164,9 @@ the batch is previewed again.
 `review_regrade_requests` likewise previews each approved change with
 `tool_apply_grade(overwrite_graded=True, confirm_write=False)` (a regraded
 submission is already graded) and repeats that call with
-`confirm_write=True` only after the user approves the preview.
+`confirm_write=True` only after the user approves the preview. It then
+replies to and closes each decided request with
+`tool_respond_to_regrade_request`, again preview first.
 
 ## How The Tools Behave
 
@@ -607,7 +610,7 @@ the `.env`, or pass the variables through the client configuration.
 - `tools/grading_workflow.py`: grading artifacts, answer keys, readiness,
   page caching, smart reading
 - `tools/answer_groups.py`: answer-group inspection and batch writes
-- `tools/regrades.py`: regrade listing and detail
+- `tools/regrades.py`: regrade listing, detail and responses
 - `tools/statistics.py`: assignment statistics
 - `tools/lms_export.py`: Canvas / Brightspace gradebook import CSV export
 - `tools/common.py`: shared helpers (rubric-ID normalization, untrusted-text
@@ -774,6 +777,7 @@ gradescope-mcp/
     ├── test_p0_fixes.py
     ├── test_page_selection.py
     ├── test_read_side_fixes.py
+    ├── test_regrade_response.py
     ├── test_round3_runtime.py
     ├── test_server_mcp.py
     ├── test_session_recovery.py
