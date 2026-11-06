@@ -56,7 +56,7 @@ This avoids maintaining a second executable capability list.
 | Outline | PDF and online trees, subquestions, points, crops, content | Deletion; live mutation validation; cross-process PDF compare-and-swap |
 | Extensions | Read and merged date writes | Remove override, edit all accommodation settings |
 | Submissions | Listing, detail, upload, grading evidence images | General attachment/ZIP download and bulk export |
-| Grading/rubric | Single/batch writes, rubric CRUD, existing answer groups | Creating/reorganizing AI answer groups, autograder reruns |
+| Grading/rubric | Single/batch writes, rubric CRUD, existing answer groups | Regrouping graded answers, resetting groups, autograder reruns |
 | Regrades | List and read requests | Reply, resolve, reopen |
 | Grade publication | Score exports | Publish/unpublish and student notifications |
 | LMS | Canvas/Brightspace CSV generation | Authenticated LTI roster/grade synchronization |
@@ -106,7 +106,7 @@ can still race. No real assignment was mutated during this audit.
 
 ## Current Status
 
-- 40 MCP tools (24 read-only, 12 that write to Gradescope, 4 that only write
+- 43 MCP tools (24 read-only, 15 that write to Gradescope, 4 that only write
   to the private local cache)
 - 3 MCP resources (1 static resource, 2 URI templates)
 - 7 MCP prompts
@@ -172,6 +172,9 @@ the private local cache).
 ### Grading Read
 | Tool | Kind | Description |
 |------|------|-------------|
+| `tool_set_question_scoring` | write | Positive/negative scoring, floor/ceiling; preserves zero weight |
+| `tool_set_question_grading_method` | write | Individual/manual or configured AI grouping; optional all assignment questions |
+| `tool_create_answer_group` | write | Create a manual group and confirm ungraded, ungrouped submissions |
 | `tool_update_assignment_outline` | write | Read editable JSON; preview and write PDF/online question trees, points, crops and content; requires revision |
 | `tool_get_assignment_outline` | read-only | Question hierarchy (nested subparts), IDs, types, weights, prompt text; no rubric items |
 | `tool_export_assignment_scores` | read-only | Score export summary; `output_format="json"` returns every student with per-question scores |
@@ -295,7 +298,7 @@ submission is already graded) and repeats that call with
   rather than read from a guessed column; unknown is not ungraded.
 
 ### Write safety
-- The tools with a `confirm_write` parameter (the `write` kind, 12 of
+- The tools with a `confirm_write` parameter (the `write` kind, 15 of
   them) are the only tools that change Gradescope data. With the default
   `confirm_write=False` they return a preview ("Write confirmation required
   ...") and change nothing.
@@ -919,3 +922,8 @@ gradescope-mcp/
    the write can still be overwritten.
 
 Outline weights returned as decimal strings (for example `"4.0"`) are normalized for preview/save and compared numerically on read-back, including subquestions. Existing saved crop proposals can be reused without changing their coordinates.
+
+- `tools/question_settings.py`: scoring options, grading-method selection and manual answer-group creation.
+- `tests/test_question_settings.py`: preview, zero-weight preservation, revisions and partial failures.
+
+Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type="positive", ceiling=False (floor omitted to preserve it); confirm only after explicit user approval with expected_revision. Weight is never sent and must remain unchanged on read-back. Use `tool_set_question_grading_method` with method="individual" for per-student batch grading or method="groups" for manual grouping. apply_to_all previews every leaf question in the assignment and writes sequentially, so partial completion is possible. AI methods require previously configured answer regions. `tool_create_answer_group` accepts only explicitly ungraded, ungrouped Question Submission IDs; creation and membership are separate steps, and partial failures report the created group ID. Inspect before retrying. These tools do not submit rubric items or grades, but question settings can change existing computed scores. Live mutation behavior has not been tested.

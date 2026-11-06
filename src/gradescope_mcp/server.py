@@ -59,6 +59,7 @@ from gradescope_mcp.tools.submissions import (
     get_assignment_graders,
 )
 from gradescope_mcp.tools.extensions import get_extensions, set_extension
+from gradescope_mcp.tools.question_settings import set_question_scoring, set_question_grading_method, create_answer_group
 from gradescope_mcp.tools.outline import update_assignment_outline
 from gradescope_mcp.tools.grading import (
     get_assignment_outline,
@@ -760,6 +761,58 @@ def tool_get_assignment_graders(
         question_id: The question ID within the assignment.
     """
     return get_assignment_graders(course_id, question_id)
+
+
+@gs_tool(gradescope_write("Set question scoring options", idempotent=True))
+def tool_set_question_scoring(
+    course_id: GradescopeID, question_id: GradescopeID,
+    scoring_type: Literal["positive", "negative"] | None = None,
+    ceiling: StrictOptionalBool = None, floor: StrictOptionalBool = None,
+    expected_revision: str = "", confirm_write: bool = False,
+) -> str:
+    """Preview/write question-wide scoring options, preserving weight (including zero).
+
+    For zero-point bonus questions use positive scoring and ceiling=False.
+    Omitted settings are preserved. Changes can affect existing grades.
+    Show preview and get explicit approval before confirm_write=True; the flag
+    is not user approval. Pass expected_revision from the preview. No rubric
+    or individual grades are submitted by this tool.
+    """
+    return set_question_scoring(course_id, question_id, scoring_type, ceiling, floor, expected_revision, confirm_write)
+
+
+@gs_tool(gradescope_write("Select question grading method", idempotent=True))
+def tool_set_question_grading_method(
+    course_id: GradescopeID, question_id: GradescopeID,
+    method: Literal["individual", "groups", "multiple_choice", "math", "text"],
+    apply_to_all: bool = False, expected_revision: str = "", confirm_write: bool = False,
+) -> str:
+    """Choose Grade Individually or Form Answer Groups First (groups = manual).
+
+    apply_to_all previews every leaf question of the same assignment and writes
+    them sequentially; failures may be partial. AI methods require existing
+    answer regions. No groups are reset or grades submitted. Review the preview
+    and obtain explicit approval; confirm_write is not user approval. Supply
+    expected_revision from the preview. Check results before retrying failures.
+    """
+    return set_question_grading_method(course_id, question_id, method, apply_to_all, expected_revision, confirm_write)
+
+
+@gs_tool(gradescope_write("Create manual answer group", idempotent=False))
+def tool_create_answer_group(
+    course_id: GradescopeID, question_id: GradescopeID, title: str,
+    submission_ids: list[GradescopeID], expected_revision: str = "", confirm_write: bool = False,
+) -> str:
+    """Create a group and confirm ungraded, ungrouped question submissions into it.
+
+    Select groups grading method first. IDs must be Question Submission IDs.
+    Does not regroup or overwrite graded answers. Creation and membership are
+    separate requests: on partial failure inspect the reported group before
+    retrying. Show the preview and get explicit approval; confirm_write is not
+    user approval. Supply expected_revision from the preview. Grade the verified
+    group separately with tool_grade_answer_group.
+    """
+    return create_answer_group(course_id, question_id, title, submission_ids, expected_revision, confirm_write)
 
 
 @gs_tool(gradescope_write("Update assignment outline", idempotent=False))

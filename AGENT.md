@@ -13,7 +13,7 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 40 tools (24 read-only, 12 Gradescope writes, 4 local cache writes)
+- 43 tools (24 read-only, 15 Gradescope writes, 4 local cache writes)
 - 3 resources (1 static, 2 URI templates)
 - 7 prompts
 - Offline pytest suite (the current count is recorded in `DEVLOG.md`)
@@ -245,7 +245,7 @@ Grouped by annotation class. `tests/test_server_mcp.py` pins these sets.
 
 ### Gradescope writes
 `destructiveHint=true`, exactly the tools with `confirm_write`.
-`idempotentHint=false` for upload, outline additions and rubric-item creation, true otherwise.
+`idempotentHint=false` for upload, outline additions, answer-group creation and rubric-item creation, true otherwise.
 Idempotent follows the MCP definition (a repeat with the same arguments has
 no additional effect), not "returns the same result": a repeated delete
 reports the item missing, and a repeated group grade is refused because
@@ -266,6 +266,10 @@ nothing is sent.
 35. `tool_grade_answer_group`
 
 36. `tool_update_assignment_outline`
+
+41. `tool_set_question_scoring`
+42. `tool_set_question_grading_method`
+43. `tool_create_answer_group`
 
 ### Local cache writes
 `readOnlyHint=false`, `destructiveHint=false`: they read Gradescope and
@@ -461,3 +465,8 @@ but not wording; check the prose against the code.
 For the architecture, upstream audit, capability gaps and outline payload examples, see README.md, “Architecture and capability audit”. Do not advertise unimplemented upstream methods as working tools. The `assignments.serialized_write` wrapper remains for compatibility; the lock registry lives in `tools/safety.py`.
 
 Outline weights returned as decimal strings (for example `"4.0"`) are normalized for preview/save and compared numerically on read-back, including subquestions. Existing saved crop proposals can be reused without changing their coordinates.
+
+- `tools/question_settings.py`: scoring options preserve weight; grouping method and manual group writes use previews and revisions.
+- `tests/test_question_settings.py`: question settings and manual grouping regressions.
+
+Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type="positive", ceiling=False (floor omitted to preserve it); confirm only after explicit user approval with expected_revision. Weight is never sent and must remain unchanged on read-back. Use `tool_set_question_grading_method` with method="individual" for per-student batch grading or method="groups" for manual grouping. apply_to_all previews every leaf question in the assignment and writes sequentially, so partial completion is possible. AI methods require previously configured answer regions. `tool_create_answer_group` accepts only explicitly ungraded, ungrouped Question Submission IDs; creation and membership are separate steps, and partial failures report the created group ID. Inspect before retrying. These tools do not submit rubric items or grades, but question settings can change existing computed scores. Live mutation behavior has not been tested.
