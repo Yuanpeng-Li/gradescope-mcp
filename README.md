@@ -47,27 +47,42 @@ This avoids maintaining a second executable capability list.
   mandatory steps for every submission. Prompts describe workflows; they do not
   repeat the implementation of grading tools.
 
-### Remaining gaps and boundaries
+### Lifecycle coverage and boundaries
 
-| Capability | Current status | What is still missing |
+| Stage | Available | Boundary |
 | --- | --- | --- |
-| Course/roster | Read | Course creation, enrollment and roster mutation |
-| Assignments | Read, rename, dates, autograder image, outline | Create/delete/duplicate assignments, template upload |
-| Outline | PDF and online trees, subquestions, points, crops, content | Deletion; live mutation validation; cross-process PDF compare-and-swap |
-| Extensions | Read and merged date writes | Remove override, edit all accommodation settings |
-| Submissions | Listing, detail, upload, grading evidence images | General attachment/ZIP download and bulk export |
-| Grading/rubric | Single/batch writes, rubric CRUD, existing answer groups | Regrouping graded answers, resetting groups, autograder reruns |
-| Regrades | List and read requests | Reply, resolve, reopen |
-| Grade publication | Score exports | Publish/unpublish and student notifications |
-| LMS | Canvas/Brightspace CSV generation | Authenticated LTI roster/grade synchronization |
-| Authentication | Native credentials and session recovery | Interactive institutional SSO |
-| Protocol | Text tool results with JSON where documented | Uniform structured output and persistent batch jobs/cancellation |
+| Assignment setup | Creation plans, editable settings, PDF template upload, composed assignment copy | Copy excludes student data, LMS links, autograder images and rubric group constraints |
+| Outline/rubric | Partial question patches, PDF crop overlays, identification regions, flat rubric export/import/copy | No automatic OCR-based region approval; review rendered pages |
+| Submissions | Scoped attachment/page downloads, ZIP, PDF count checks, reproducible sampling | Typed-only submissions may have no attachment; 25 MiB/file and 250 MiB/batch caps |
+| Grading | Local evidence-bound plans, calibration, snapshot checks, per-row journal, cancellation/resume | Cancellation does not undo in-flight writes; uncertain outcomes stop for review |
+| Grouping | Create, confirm, move/remove members, merge groups | Graded/unknown-state members are refused; no destructive reset |
+| Review | Progress, missing submissions, totals, bonus configuration, evidence/score archives | Mechanical checks are not proof of grading correctness |
+| Publication | Separate publish/unpublish and notification plans | Mail delivery is not proven by submission success |
+| Regrades/accommodations | Staff response/completion request, local override deletion/time limits | Reopening must be confirmed by backend read-back; inherited overrides are not edited here |
+| Autograder | Discovered configuration/build status/logs, ZIP plan, rerun form plan, result reads | No accessible programming assignment was available for live validation; a missing/ambiguous form is refused |
+| LMS | CSV exports plus posting to an already linked LMS resource and job polling | Does not create institutional LTI/SSO deployments or synchronize rosters |
+| Authentication | Native credentials and recovery | Interactive institutional SSO is not implemented |
 
-These are explicit unsupported features, not placeholder tools. New write
-endpoints need a verified request contract and tests before registration.
-The current refactor consolidates shared outline parsing and write locks;
-large grading modules remain domain modules rather than being mechanically
-split into files without changing their responsibilities.
+Start with assignment configuration, then prepare local plans, show their exact
+requests, obtain explicit approval and execute. Operation tokens and request
+digests bind execution to the reviewed plan. The operation journal distinguishes
+prepared, sending, verified/completed, accepted_unverified, unknown, stale,
+needs_review and cancelled states. Never interpret HTTP acceptance as completed
+mail delivery, a finished autograder run or a successful LMS job. Query journals
+and the corresponding read tool before retrying. No universal rollback is claimed.
+
+Plan preparation returns a new local operation each time and is marked
+non-idempotent. Keep and reuse its token instead of preparing duplicate operations.
+A grade plan can store per-submission evidence references; unknown outcomes are
+reconciled against current grades and never blindly resent. The old direct grading
+tools remain compatible; planned execution is preferred for long agent workflows.
+
+Question write locks coordinate threads and MCP processes sharing the same private
+cache root. They cannot coordinate a web user or another cache root. These writes
+now require an accessible private cache even when their result is returned as text.
+Archives record outline, rubric and scoring fingerprints; freshness checks do not
+claim that historical exported scores are current. Workflow answer-key markdown
+remains an explicit cache; use versioned archives/plans for source-bound grading.
 
 ### Upstream audit on 2026-11-06
 
@@ -106,7 +121,7 @@ can still race. No real assignment was mutated during this audit.
 
 ## Current Status
 
-- 48 MCP tools (26 read-only, 16 that write to Gradescope, 6 that only write
+- 74 MCP tools (34 read-only, 25 that write to Gradescope, 15 that only write
   to the private local cache)
 - 3 MCP resources (1 static resource, 2 URI templates)
 - 7 MCP prompts
@@ -177,6 +192,32 @@ the private local cache).
 | `tool_get_operation` | read-only | Inspect operation status and uncertain outcomes |
 | `tool_cancel_operation` | local cache | Cooperatively stop future operation rows |
 | `tool_calibrate_grade_plan` | read-only | Compare proposed scores to human references |
+| `tool_get_assignment_admin` | read-only | Settings, publication and form capabilities |
+| `tool_prepare_assignment_plan` | local cache | Plan creation, configuration, template, publication, mail or linked LMS posting |
+| `tool_execute_assignment_plan` | write | Execute exact approved assignment plan once |
+| `tool_export_question_rubric` | read-only | Flat rubric export with source revision |
+| `tool_prepare_rubric_plan` | local cache | Prepare rubric import/copy/update/delete plan |
+| `tool_execute_rubric_plan` | write | Verified rubric changes with partial journal |
+| `tool_patch_assignment_outline` | write | Modify selected question fields preserving the rest |
+| `tool_preview_outline_regions` | local cache | Render PDF crop overlays |
+| `tool_inspect_submission_pdf` | read-only | Check PDF page counts and required pages |
+| `tool_download_submission_files` | local cache | Validated original attachments, page images and batch ZIP |
+| `tool_respond_regrade_request` | write | Staff reply and verified completion/reopen request |
+| `tool_modify_extension_options` | write | Edit time limits or delete local overrides |
+| `tool_set_answer_group_members` | write | Confirm/move/remove ungraded group members |
+| `tool_review_assignment` | read-only | Progress, missing work, score/bonus anomalies and publishing state |
+| `tool_sample_question_submissions` | read-only | Reproducible sample for human/agent calibration |
+| `tool_archive_assignment` | local cache | Private grading evidence/score ZIP with fingerprints |
+| `tool_check_archive_freshness` | read-only | Detect stale outline/rubric archives |
+| `tool_prepare_choice_bonus_plan` | local cache | Class-wide A/B/C tally and reviewed bonus plan |
+| `tool_prepare_assignment_clone` | local cache | Prepare copy of settings/template/outline/flat rubrics |
+| `tool_execute_assignment_clone` | write | Execute copy with partial journal and created assignment ID |
+| `tool_get_autograder_status` | read-only | Configuration choices and discovered build/log state |
+| `tool_prepare_autograder_plan` | local cache | Plan supported configuration or discovered rerun form |
+| `tool_execute_autograder_plan` | write | Submit approved build/rerun once; completion separate |
+| `tool_get_autograder_results` | read-only | Read available programming submission test results |
+| `tool_poll_operation` | local cache | Poll and record linked LMS grade-posting jobs |
+| `tool_merge_answer_groups` | write | Merge ungraded groups with membership verification |
 | `tool_set_question_scoring` | write | Positive/negative scoring, floor/ceiling; preserves zero weight |
 | `tool_set_question_grading_method` | write | Individual/manual or configured AI grouping; optional all assignment questions |
 | `tool_create_answer_group` | write | Create a manual group and confirm ungraded, ungrouped submissions |
@@ -281,6 +322,10 @@ submission is already graded) and repeats that call with
 
 ### Numbers
 
+`value` sets time-limit values; `count` and `seed` control sampling; `points_a`, `points_b`, `points_c` set minority-game bonuses.
+
+`required_pages` lists one-based PDF pages to check.
+
 `tolerance` controls calibration error tolerance.
 - The number arguments (`point_adjustment`, `confidence`, `weight`,
   `expected_member_count`, and `point_adjustment` / `confidence` in batch
@@ -305,7 +350,7 @@ submission is already graded) and repeats that call with
   rather than read from a guessed column; unknown is not ungraded.
 
 ### Write safety
-- The tools with a `confirm_write` parameter (the `write` kind, 16 of
+- The tools with a `confirm_write` parameter (the `write` kind, 25 of
   them) are the only tools that change Gradescope data. With the default
   `confirm_write=False` they return a preview ("Write confirmation required
   ...") and change nothing.
@@ -940,3 +985,33 @@ Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type
 - `tools/grading_plans.py`: lifecycle implementation and regression coverage.
 
 - `tests/test_grading_plans.py`: lifecycle implementation and regression coverage.
+
+- `tools/assignment_admin.py`: lifecycle implementation and regression coverage.
+
+- `tools/rubric_plans.py`: lifecycle implementation and regression coverage.
+
+- `tools/pdf_regions.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_assignment_admin.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_rubric_plans.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_pdf_regions.py`: lifecycle implementation and regression coverage.
+
+- `tools/submission_files.py`: lifecycle implementation and regression coverage.
+
+- `tools/post_grading.py`: lifecycle implementation and regression coverage.
+
+- `tools/review.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_lifecycle_review.py`: lifecycle implementation and regression coverage.
+
+- `tools/blueprints.py`: lifecycle implementation and regression coverage.
+
+- `tools/autograder.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_autograder.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_blueprints.py`: lifecycle implementation and regression coverage.
+
+- `tools/rubric_data.py`: pre-submission AssignmentRubric normalization.

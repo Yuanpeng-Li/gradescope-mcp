@@ -66,7 +66,11 @@ _question_guard = threading.Lock()
 @contextlib.contextmanager
 def question_write_lock(course_id, question_id):
     from gradescope_mcp.cache import get_artifact_path
-    import fcntl
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+        import msvcrt
     import os
     import time
 
@@ -87,7 +91,12 @@ def question_write_lock(course_id, question_id):
             deadline = time.monotonic() + _WRITE_LOCK_TIMEOUT
             while True:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:
+                        if os.fstat(fd).st_size == 0: os.write(fd, b"0")
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:

@@ -695,3 +695,83 @@ Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type
 - `tools/grading_plans.py`: lifecycle implementation and regression coverage.
 
 - `tests/test_grading_plans.py`: lifecycle implementation and regression coverage.
+
+`tool_get_assignment_admin`: Settings, publication and form capabilities.
+
+`tool_prepare_assignment_plan`: Plan creation, configuration, template, publication, mail or linked LMS posting.
+
+`tool_execute_assignment_plan`: Execute exact approved assignment plan once.
+
+`tool_export_question_rubric`: Flat rubric export with source revision.
+
+`tool_prepare_rubric_plan`: Prepare rubric import/copy/update/delete plan.
+
+`tool_execute_rubric_plan`: Verified rubric changes with partial journal.
+
+`tool_patch_assignment_outline`: Modify selected question fields preserving the rest.
+
+`tool_preview_outline_regions`: Render PDF crop overlays.
+
+`tool_inspect_submission_pdf`: Check PDF page counts and required pages.
+
+- `tools/assignment_admin.py`: lifecycle implementation and regression coverage.
+
+- `tools/rubric_plans.py`: lifecycle implementation and regression coverage.
+
+- `tools/pdf_regions.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_assignment_admin.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_rubric_plans.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_pdf_regions.py`: lifecycle implementation and regression coverage.
+
+`tool_download_submission_files`: Validated original attachments, page images and batch ZIP.
+
+`tool_respond_regrade_request`: Staff reply and verified completion/reopen request.
+
+`tool_modify_extension_options`: Edit time limits or delete local overrides.
+
+`tool_set_answer_group_members`: Confirm/move/remove ungraded group members.
+
+`tool_review_assignment`: Progress, missing work, score/bonus anomalies and publishing state.
+
+`tool_sample_question_submissions`: Reproducible sample for human/agent calibration.
+
+`tool_archive_assignment`: Private grading evidence/score ZIP with fingerprints.
+
+`tool_check_archive_freshness`: Detect stale outline/rubric archives.
+
+`tool_prepare_choice_bonus_plan`: Class-wide A/B/C tally and reviewed bonus plan.
+
+- `tools/submission_files.py`: lifecycle implementation and regression coverage.
+
+- `tools/post_grading.py`: lifecycle implementation and regression coverage.
+
+- `tools/review.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_lifecycle_review.py`: lifecycle implementation and regression coverage.
+
+`tool_prepare_assignment_clone`: Prepare copy of settings/template/outline/flat rubrics.
+
+`tool_execute_assignment_clone`: Execute copy with partial journal and created assignment ID.
+
+`tool_get_autograder_status`: Configuration choices and discovered build/log state.
+
+`tool_prepare_autograder_plan`: Plan supported configuration or discovered rerun form.
+
+`tool_execute_autograder_plan`: Submit approved build/rerun once; completion separate.
+
+`tool_get_autograder_results`: Read available programming submission test results.
+
+`tool_poll_operation`: Poll and record linked LMS grade-posting jobs.
+
+`tool_merge_answer_groups`: Merge ungraded groups with membership verification.
+
+- `tools/blueprints.py`: lifecycle implementation and regression coverage.
+
+- `tools/autograder.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_autograder.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_blueprints.py`: lifecycle implementation and regression coverage.

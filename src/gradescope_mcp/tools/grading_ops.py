@@ -32,6 +32,7 @@ from gradescope_mcp.tools.common import (
     select_crop_pages,
     split_known_rubric_ids,
 )
+from gradescope_mcp.tools.rubric_data import assignment_rubric_props
 from gradescope_mcp.tools.grading import _build_question_tree, _get_outline_data
 from gradescope_mcp.tools.safety import write_confirmation_required
 
@@ -664,6 +665,25 @@ def _load_question_rubric_context(course_id: str, question_id: str) -> dict:
             f"Cannot access question `{question_id}` "
             f"(status {listing.status_code} / {grade_page.status_code})."
         )
+
+    # Before submissions exist, the assignment rubric editor owns the same
+    # question options and rubric CRUD URLs. Follow only an observed sidebar link.
+    for page in (grade_page, listing):
+        if page.status_code != 200:
+            continue
+        soup = BeautifulSoup(page.text, "html.parser")
+        props = assignment_rubric_props(soup, course_id, question_id)
+        if props is None:
+            pattern = re.compile(rf"^/courses/{re.escape(str(course_id))}/assignments/[0-9]+/rubric/edit$")
+            links = {a.get("href") for a in soup.select("a[href]") if pattern.fullmatch(a.get("href", ""))}
+            if len(links) == 1:
+                editor = conn.session.get(base_url + next(iter(links)))
+                if editor.status_code == 200:
+                    soup = BeautifulSoup(editor.text, "html.parser")
+                    props = assignment_rubric_props(soup, course_id, question_id)
+        if props is not None:
+            return {"props": props, "csrf_token": _csrf_from_soup(soup) or csrf_token,
+                    "session": conn.session, "base_url": base_url, "submission_id": None}
 
     return {
         "props": None,

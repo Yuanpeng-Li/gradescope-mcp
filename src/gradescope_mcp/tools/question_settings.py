@@ -420,3 +420,60 @@ def create_answer_group(
         raise
     except Exception as exc:
         return f"Error: {exc}. Created group ID: {created}; outcome may be partial. Inspect groups before retrying; do not blindly create again."
+
+
+@serialize_question_write
+def set_answer_group_members(course_id: str, question_id: str, submission_ids: list[str], group_id: str | None = None, expected_revision: str = '', confirm_write: bool = False) -> str:
+    """Confirm/move/remove ungraded members. Existing grades are never reassigned."""
+    try:
+        ids=[str(s) for s in submission_ids]
+        if not ids or len(ids)>500 or len(set(ids))!=len(ids):raise ValueError('Supply distinct question submission IDs')
+        conn,p,token=_grouper(course_id,question_id)
+        if group_id is not None and not any(str(g['id'])==str(group_id) for g in p['groups']):raise ValueError('Target group missing')
+        subs={str(s['id']):s for s in p['submissions']}
+        if any(s not in subs for s in ids):raise ValueError('Submission not in this question')
+        affected=[s for s in p['submissions'] if str(s['id']) in ids or (group_id is not None and (str(s.get('confirmed_group_id'))==str(group_id) or str(s.get('unconfirmed_group_id'))==str(group_id)))]
+        if any(s.get('graded') is not False or s.get('graded_individually') for s in affected):raise ValueError('Regrouping graded or unknown-state answers is refused')
+        state=[{k:s.get(k) for k in ('id','graded','graded_individually','confirmed_group_id','unconfirmed_group_id')} for s in affected]
+        payload={'answer_group_id':int(group_id) if group_id is not None else None,'submission_ids':[int(s) for s in ids]}
+        path=f'/courses/{course_id}/questions/{question_id}/answer_group_memberships/many'
+        url=_target(conn.gradescope_base_url,p['urls']['confirmed_memberships_url'],path);headers=_headers(token)
+        preview=_preview('set_answer_group_members',course_id,question_id,state,payload,expected_revision,confirm_write)
+        if preview:return preview
+        resp=conn.session.post(url,json=payload,headers=headers,allow_redirects=False)
+        if resp.status_code!=200:return f'Error: Membership request HTTP {resp.status_code}; inspect before retrying.'
+        saved={str(s['id']):s for s in _grouper(course_id,question_id)[1]['submissions']}
+        if any(s not in saved or (str(saved[s].get('confirmed_group_id'))!=str(group_id)) for s in ids):return '⚠️ Membership accepted; read-back differs.'
+        return 'Answer-group membership saved and verified. No grades submitted.'
+    except AuthError as exc:return f'Authentication error: {exc}'
+    except Exception as exc:return f'Error: Membership outcome not confirmed: {exc}'
+
+
+@serialize_question_write
+def merge_answer_groups(course_id: str, question_id: str, group_ids: list[str], title: str, expected_revision: str = '', confirm_write: bool = False) -> str:
+    """Merge ungraded groups through the browser's merge endpoint."""
+    try:
+        ids={str(g) for g in group_ids}
+        if len(ids)<2 or len(ids)!=len(group_ids) or not title.strip():raise ValueError('At least two distinct groups and a title required')
+        conn,p,token=_grouper(course_id,question_id)
+        if not ids<={str(g['id']) for g in p['groups']}:raise ValueError('Group missing from this question')
+        members=[s for s in p['submissions'] if str(s.get('confirmed_group_id')) in ids or str(s.get('unconfirmed_group_id')) in ids]
+        if not members or any(s.get('graded') is not False or s.get('graded_individually') for s in members):raise ValueError('Only nonempty ungraded groups can be merged')
+        confirmed=sorted({int(s['id']) for s in members if str(s.get('confirmed_group_id')) in ids})
+        inferred=sorted({int(s['id']) for s in members if str(s.get('confirmed_group_id')) not in ids})
+        state=[{k:s.get(k) for k in ('id','graded','graded_individually','confirmed_group_id','unconfirmed_group_id')} for s in members]
+        payload={'title':title,'group_ids':[int(g) for g in sorted(ids)],'confirmed_submission_ids':confirmed,'unconfirmed_submission_ids':inferred}
+        path=f'/courses/{course_id}/questions/{question_id}/answer_group_merges'
+        url=_target(conn.gradescope_base_url,p['urls']['merge_groups_url'],path);headers=_headers(token)
+        preview=_preview('merge_answer_groups',course_id,question_id,state,payload,expected_revision,confirm_write)
+        if preview:return preview
+        resp=conn.session.post(url,json=payload,headers=headers,allow_redirects=False)
+        if resp.status_code!=200:return f'Error: Merge HTTP {resp.status_code}; inspect groups before retrying.'
+        group=resp.json().get('new_group_id')
+        if group is None:return '⚠️ Merge response lacks new_group_id; inspect before retrying.'
+        after=_grouper(course_id,question_id)[1]
+        actual={int(s['id']) for s in after['submissions'] if str(s.get('confirmed_group_id'))==str(group) or str(s.get('unconfirmed_group_id'))==str(group)}
+        if actual!=set(confirmed+inferred):return f'⚠️ Merge group {group} created but members differ; inspect before retrying.'
+        return f'Groups merged into {group}; members verified. Inferred members remain inferred.'
+    except AuthError as exc:return f'Authentication error: {exc}'
+    except Exception as exc:return f'Error: Merge outcome not confirmed: {exc}; inspect before retrying.'

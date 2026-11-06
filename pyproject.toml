@@ -8,9 +8,11 @@ dependencies = [
     "beautifulsoup4>=4.14.0",
     "gradescopeapi>=1.8.1",
     "mcp>=2.3.0,<3",
+    "pypdf>=6.21.4",
     "python-dotenv>=1.2.2",
     # Page downloads use HTTPResponse.read1 (2.2) and shutdown() (2.3); an
     # older urllib3 falls back to iter_content without the hard deadline.
+    "reportlab>=5.1.0",
     "urllib3>=2.3",
 ]
 

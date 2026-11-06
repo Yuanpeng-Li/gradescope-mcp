@@ -13,7 +13,7 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 48 tools (26 read-only, 16 Gradescope writes, 6 local cache writes)
+- 74 tools (34 read-only, 25 Gradescope writes, 15 local cache writes)
 - 3 resources (1 static, 2 URI templates)
 - 7 prompts
 - Offline pytest suite (the current count is recorded in `DEVLOG.md`)
@@ -247,9 +247,25 @@ Grouped by annotation class. `tests/test_server_mcp.py` pins these sets.
 
 99. `tool_calibrate_grade_plan`
 
+99. `tool_get_assignment_admin`
+
+99. `tool_export_question_rubric`
+
+99. `tool_inspect_submission_pdf`
+
+99. `tool_review_assignment`
+
+99. `tool_sample_question_submissions`
+
+99. `tool_check_archive_freshness`
+
+99. `tool_get_autograder_status`
+
+99. `tool_get_autograder_results`
+
 ### Gradescope writes
 `destructiveHint=true`, exactly the tools with `confirm_write`.
-`idempotentHint=false` for upload, outline additions, answer-group creation and rubric-item creation, true otherwise.
+`idempotentHint=false` for upload, outline additions, answer-group creation/merging and rubric-item creation, true otherwise.
 Idempotent follows the MCP definition (a repeat with the same arguments has
 no additional effect), not "returns the same result": a repeated delete
 reports the item missing, and a repeated group grade is refused because
@@ -277,6 +293,24 @@ nothing is sent.
 
 99. `tool_execute_grade_plan`
 
+99. `tool_execute_assignment_plan`
+
+99. `tool_execute_rubric_plan`
+
+99. `tool_patch_assignment_outline`
+
+99. `tool_respond_regrade_request`
+
+99. `tool_modify_extension_options`
+
+99. `tool_set_answer_group_members`
+
+99. `tool_execute_assignment_clone`
+
+99. `tool_execute_autograder_plan`
+
+99. `tool_merge_answer_groups`
+
 ### Local cache writes
 `readOnlyHint=false`, `destructiveHint=false`: they read Gradescope and
 write only to the private cache.
@@ -289,6 +323,24 @@ write only to the private cache.
 99. `tool_prepare_grade_plan`
 
 99. `tool_cancel_operation`
+
+99. `tool_prepare_assignment_plan`
+
+99. `tool_prepare_rubric_plan`
+
+99. `tool_preview_outline_regions`
+
+99. `tool_download_submission_files`
+
+99. `tool_archive_assignment`
+
+99. `tool_prepare_choice_bonus_plan`
+
+99. `tool_prepare_assignment_clone`
+
+99. `tool_prepare_autograder_plan`
+
+99. `tool_poll_operation`
 
 All tools are `openWorldHint=true`.
 
@@ -486,3 +538,35 @@ Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type
 - `tools/grading_plans.py`: lifecycle implementation and regression coverage.
 
 - `tests/test_grading_plans.py`: lifecycle implementation and regression coverage.
+
+- `tools/assignment_admin.py`: lifecycle implementation and regression coverage.
+
+- `tools/rubric_plans.py`: lifecycle implementation and regression coverage.
+
+- `tools/pdf_regions.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_assignment_admin.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_rubric_plans.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_pdf_regions.py`: lifecycle implementation and regression coverage.
+
+- `tools/submission_files.py`: lifecycle implementation and regression coverage.
+
+- `tools/post_grading.py`: lifecycle implementation and regression coverage.
+
+- `tools/review.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_lifecycle_review.py`: lifecycle implementation and regression coverage.
+
+- `tools/blueprints.py`: lifecycle implementation and regression coverage.
+
+- `tools/autograder.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_autograder.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_blueprints.py`: lifecycle implementation and regression coverage.
+
+- `tools/rubric_data.py`: pre-submission AssignmentRubric normalization.
+
+Lifecycle plans are private operation records in `operations.py`. Prepare/show/approve/execute using request_digest and operation_token; an uncertain or partially accepted write is not permission to replay it. Question writes use shared thread/filesystem locks, requiring a valid private cache and coordinating only processes using that root. Pre-submission rubrics use AssignmentRubric props. Plan preparation and new archives are non-idempotent local operations. Autograder adapters are capability-gated to discovered forms; live programming-assignment validation remains pending. See README lifecycle matrix for supported boundaries.

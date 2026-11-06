@@ -1013,3 +1013,11 @@ Validation: 988 offline tests passed. Actual zero-point question scoring and gra
 ## Lifecycle batch 1 — reliable grading
 
 Added snapshot-bound dry-run grade plans, calibration against human references, durable per-row journals, cooperative cancellation and safe resume/reconciliation. Unknown outcomes stop instead of replaying. Question grading/rubric/grouping mutations share a reentrant process and filesystem lock in the configured private cache. Existing clients using different cache roots still require external coordination. No live grade writes performed.
+
+## Lifecycle batch 2 — assignment preparation, reading and completion
+
+Added assignment creation/settings/template/publication/notification/LMS plans, flat rubric export and planned import, question-level outline patches, rendered PDF region previews, original-file downloads and ZIP manifests, PDF completeness checks, sampling, review summaries, minority-choice bonus plans, private versioned archives, regrade response/completion requests, local time-limit/override deletion, group membership and merge operations. Added composed assignment copying and capability-gated programming-assignment configuration/rerun/results adapters.
+
+Observed live creation/settings/publication forms, PostGrades job polling, AssignmentRubric pre-submission structure/URLs, regrade response payloads and grouping/extension frontend contracts. No live writes. No accessible programming assignment found in bounded read-only discovery; programming form/result adapters remain fixture-tested and fail closed when unavailable. Synthetic PDF overlay rendered and visually checked. Fixed eager reportlab import breaking startup from a deleted working directory, checkbox hidden-value preservation, and false-positive override deletion verification.
+
+Batch validation: 1,011 offline tests passed. Registry exposes 74 tools. PDF overlays visually checked on a synthetic document. Live requests remained read-only; programming-assignment contract validation awaits an accessible example.

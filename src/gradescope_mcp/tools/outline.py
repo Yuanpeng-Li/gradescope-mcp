@@ -185,6 +185,7 @@ def update_assignment_outline(
     outline_json: str = "",
     expected_revision: str = "",
     confirm_write: bool = False,
+    identification_regions: dict | None = None,
 ) -> str:
     """Read an editable tree or preview/write it. confirm_write is not user approval."""
     try:
@@ -193,6 +194,14 @@ def update_assignment_outline(
             props, online, current, revision, token, edit_url = _read(
                 conn, course_id, assignment_id
             )
+            if identification_regions is not None:
+                if online or not isinstance(identification_regions, dict) or set(identification_regions) != {'name','sid'}:
+                    raise ValueError('PDF identification_regions must contain name and sid (rectangle or null)')
+                for rect in identification_regions.values():
+                    if rect is not None:
+                        _validate([{'title':'Identification','weight':0,'crop_rect_list':[rect]}],False)
+                if not outline_json:
+                    raise ValueError('Supply outline_json when changing identification regions')
             if not outline_json:
                 return json.dumps(
                     {
@@ -258,7 +267,7 @@ def update_assignment_outline(
                 payload = {
                     "question_data": _pdf(proposed),
                     "assignment": {
-                        "identification_regions": props["assignment"]["id_regions"]
+                        "identification_regions": identification_regions if identification_regions is not None else props["assignment"]["id_regions"]
                     },
                 }
             if not confirm_write:
@@ -286,7 +295,7 @@ def update_assignment_outline(
             if response.status_code != 200:
                 return f"Error: Outline save returned HTTP {response.status_code}; inspect the outline before retrying."
             try:
-                _, _, saved, _, _, _ = _read(conn, course_id, assignment_id)
+                saved_props, _, saved, _, _, _ = _read(conn, course_id, assignment_id)
             except AuthError:
                 raise
             except Exception as exc:
@@ -314,6 +323,8 @@ def update_assignment_outline(
                     result.append(item)
                 return result
 
+            if identification_regions is not None and saved_props.get("assignment",{}).get("id_regions") != identification_regions:
+                return "⚠️ Outline saved but identification regions differ on read-back."
             if comparable(saved) != comparable(proposed):
                 return "⚠️ Save request accepted, but read-back differs. Read the outline before retrying."
             return "Assignment outline saved and verified."
@@ -321,3 +332,28 @@ def update_assignment_outline(
         return f"Authentication error: {exc}"
     except Exception as exc:
         return f"Error updating outline: {exc}"
+
+
+def patch_assignment_outline(course_id: str, assignment_id: str, changes: list[dict], expected_revision: str = '', confirm_write: bool = False) -> str:
+    """Patch named existing questions, preserving all unrelated outline fields."""
+    try:
+        if not isinstance(changes,list) or not changes:raise ValueError('Provide changes for existing question IDs')
+        conn=get_connection();_,online,tree,revision,_,_=_read(conn,course_id,assignment_id)
+        if expected_revision and revision!=expected_revision:raise ValueError('Outline changed; preview again')
+        nodes={}
+        def visit(items):
+            for q in items:
+                nodes[str(q['id'])]=q;visit(q.get('children',[]))
+        visit(tree);seen=set()
+        for change in changes:
+            if not isinstance(change,dict) or set(change)-{'question_id','title','weight','crop_rect_list','content'}:raise ValueError('Unknown patch field')
+            qid=str(change.get('question_id'))
+            if qid not in nodes or qid in seen:raise ValueError('Unknown/duplicate question ID')
+            seen.add(qid)
+            if online and 'crop_rect_list' in change:raise ValueError('Online outline does not use PDF crop regions')
+            if not online and 'content' in change:raise ValueError('PDF content blocks cannot be edited')
+            nodes[qid].update({k:v for k,v in change.items() if k!='question_id'})
+        if confirm_write and not expected_revision:return 'Error: expected_revision from preview required'
+        return update_assignment_outline(course_id,assignment_id,json.dumps(tree),revision,confirm_write)
+    except AuthError as exc:return f'Authentication error: {exc}'
+    except Exception as exc:return f'Error: {exc}'

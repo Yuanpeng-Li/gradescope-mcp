@@ -27,11 +27,20 @@ from gradescope_mcp.tools.grading_ops import (
 
 ID_PARAMS = {
     "course_id", "assignment_id", "question_id", "submission_id", "group_id",
-    "rubric_item_id", "user_id",
+    "rubric_item_id", "user_id", "request_id",
 }
 
 # Tools that write to Gradescope (all have confirm_write).
 GRADESCOPE_WRITES = {
+    "tool_merge_answer_groups",
+    "tool_execute_autograder_plan",
+    "tool_execute_assignment_clone",
+    "tool_set_answer_group_members",
+    "tool_modify_extension_options",
+    "tool_respond_regrade_request",
+    "tool_patch_assignment_outline",
+    "tool_execute_rubric_plan",
+    "tool_execute_assignment_plan",
     "tool_execute_grade_plan",
     "tool_upload_submission", "tool_set_extension", "tool_modify_assignment_dates",
     "tool_rename_assignment", "tool_update_autograder_image", "tool_apply_grade",
@@ -41,6 +50,15 @@ GRADESCOPE_WRITES = {
 }
 # Workflow tools that write only to the private local cache.
 LOCAL_CACHE_WRITES = {
+    "tool_poll_operation",
+    "tool_prepare_autograder_plan",
+    "tool_prepare_assignment_clone",
+    "tool_prepare_choice_bonus_plan",
+    "tool_archive_assignment",
+    "tool_download_submission_files",
+    "tool_preview_outline_regions",
+    "tool_prepare_rubric_plan",
+    "tool_prepare_assignment_plan",
     "tool_cancel_operation",
     "tool_prepare_grade_plan",
     "tool_prepare_grading_artifact", "tool_cache_relevant_pages", "tool_prepare_answer_key",
@@ -51,7 +69,7 @@ LOCAL_CACHE_WRITES = {
 # a repeat returns a different result: a repeated tool_delete_rubric_item finds
 # the item gone, a repeated tool_grade_answer_group without overwrite_graded is
 # refused because the members are now graded.
-NON_IDEMPOTENT = {"tool_create_answer_group", "tool_update_assignment_outline", "tool_upload_submission", "tool_create_rubric_item"}
+NON_IDEMPOTENT = {'tool_prepare_grade_plan', 'tool_prepare_assignment_plan', 'tool_prepare_rubric_plan', 'tool_prepare_choice_bonus_plan', 'tool_prepare_assignment_clone', 'tool_prepare_autograder_plan', 'tool_archive_assignment', 'tool_download_submission_files', "tool_merge_answer_groups", "tool_create_answer_group", "tool_update_assignment_outline", "tool_upload_submission", "tool_create_rubric_item"}
 
 
 def _tools() -> dict:
@@ -73,7 +91,7 @@ def test_registers_expected_tools_resources_and_prompts() -> None:
 
     tools, resources, templates, prompts = anyio.run(inventory)
 
-    assert len(tools) == 48
+    assert len(tools) == 74
     assert [r.uri for r in resources] == ["gradescope://courses"]
     assert sorted(t.uri_template for t in templates) == [
         "gradescope://courses/{course_id}/assignments",
@@ -121,7 +139,7 @@ def test_write_tool_preview_through_mcp_layer() -> None:
 
 def test_every_tool_has_complete_annotations() -> None:
     tools = _tools()
-    assert len(tools) == 48
+    assert len(tools) == 74
     for name, tool in tools.items():
         ann = tool.annotations
         assert ann is not None, name
@@ -187,7 +205,7 @@ def test_every_id_parameter_requires_digits() -> None:
             props.update({f"{row_name}.{k}": v for k, v in row["properties"].items()})
         for prop, sub in props.items():
             base = prop.rsplit(".", 1)[-1]
-            is_id = base in ID_PARAMS or base in ("rubric_item_ids", "expected_graded_ids", "submission_ids")
+            is_id = base in ID_PARAMS or base in ("rubric_item_ids", "expected_graded_ids", "submission_ids", "group_ids")
             strings = _string_schemas(sub)
             if is_id:
                 assert strings, (name, prop)
