@@ -999,3 +999,7 @@ Added revision-checked preview/write support for scanned and online outlines. Br
 ## Final review and school rollout
 
 Review fixed null question IDs and duplicate online sibling indices; added regression tests and avoided repeated indexing of the proposed tree. Full offline suite: 962 passed. School Claude/Codex both use this editable checkout. Synced the locked runtime and verified the real school launcher via a fresh stdio MCP handshake: 40 tools including outline writes. No Gradescope operations were called by the deployment smoke check. Existing client sessions need reconnection to reload Python modules.
+
+## Outline decimal-string weight fix
+
+Gradescope returns weights such as "4.0"; numeric-only validation incorrectly blocked crop-only edits. Normalize finite nonnegative decimal strings on both current/proposed trees and compare read-back weights numerically. Reject booleans, negative/nonfinite values and malformed strings. Regressions cover nested PDF/online preview/save/read-back and unchanged crops. Locally validated both current and proposed A/B trees (34 IDs each) from school's private saved artifacts without modifying those files or writing to Gradescope.

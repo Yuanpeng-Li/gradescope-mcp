@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
@@ -61,7 +62,28 @@ def _read(conn, course_id, assignment_id):
     return props, online, tree, digest, token["content"], url
 
 
+def _weight(value):
+    """Normalize Gradescope decimal strings without accepting bool/nonfinite values."""
+    if isinstance(value, str):
+        if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)", value.strip()):
+            raise ValueError("Weights must be finite nonnegative numbers")
+        value = float(value)
+    try:
+        valid = (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+            and value >= 0
+        )
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError("Weights must be finite nonnegative numbers")
+    return value
+
+
 def _validate(tree, online):
+    """Validate the tree and normalize weights in place for the save payload."""
     ids = set()
 
     def walk(nodes, depth=0, parent=None):
@@ -73,14 +95,7 @@ def _validate(tree, online):
         for q in nodes:
             if not isinstance(q, dict) or not isinstance(q.get("title"), str):
                 raise ValueError("Every question needs a string title")
-            w = q.get("weight")
-            if (
-                isinstance(w, bool)
-                or not isinstance(w, (float, int))
-                or not math.isfinite(w)
-                or w < 0
-            ):
-                raise ValueError("Weights must be finite nonnegative numbers")
+            q["weight"] = _weight(q.get("weight"))
             if "id" in q:
                 if (
                     isinstance(q["id"], bool)
@@ -289,6 +304,7 @@ def update_assignment_outline(
                         k: q.get(k, [] if k in ("content", "crop_rect_list") else None)
                         for k in fields
                     }
+                    item["weight"] = _weight(item["weight"])
                     item["children"] = comparable(q.get("children", []))
                     # Newly allocated IDs differ; existing IDs must remain attached
                     # to the same question in the same position.

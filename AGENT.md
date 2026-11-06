@@ -459,3 +459,5 @@ change. `tests/test_docs_consistency.py` catches inventory and count drift,
 but not wording; check the prose against the code.
 
 For the architecture, upstream audit, capability gaps and outline payload examples, see README.md, “Architecture and capability audit”. Do not advertise unimplemented upstream methods as working tools. The `assignments.serialized_write` wrapper remains for compatibility; the lock registry lives in `tools/safety.py`.
+
+Outline weights returned as decimal strings (for example `"4.0"`) are normalized for preview/save and compared numerically on read-back, including subquestions. Existing saved crop proposals can be reused without changing their coordinates.

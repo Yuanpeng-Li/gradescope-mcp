@@ -917,3 +917,5 @@ gradescope-mcp/
    Each confirmed write re-reads the current settings, but a change made
    elsewhere (another server process, the web UI) between that read and
    the write can still be overwritten.
+
+Outline weights returned as decimal strings (for example `"4.0"`) are normalized for preview/save and compared numerically on read-back, including subquestions. Existing saved crop proposals can be reused without changing their coordinates.

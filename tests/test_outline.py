@@ -271,3 +271,83 @@ def test_duplicate_online_indices_are_rejected():
     }
     with pytest.raises(ValueError, match="indices"):
         outline._validate([node, dict(node, id=-1)], True)
+
+
+@pytest.mark.parametrize("value", ["4.0", "0", " 2.5 ", 4, 4.0])
+def test_decimal_weights(value):
+    node = {"title": "Q", "weight": value}
+    outline._validate([node], False)
+    assert node["weight"] == float(value)
+
+
+@pytest.mark.parametrize(
+    "value", ["", "NaN", "Infinity", "-1.0", "4 pts", "true", True, None, {}, "1_000"]
+)
+def test_invalid_decimal_weights(value):
+    with pytest.raises(ValueError, match="Weights"):
+        outline._weight(value)
+
+
+@pytest.mark.parametrize("online", [False, True])
+def test_crop_edit_with_string_weights_roundtrips(monkeypatch, online):
+    old_rect = {"x1": 10, "y1": 10, "x2": 90, "y2": 30, "page_number": 1}
+    new_rect = dict(old_rect, y2=40)
+    child = {"id": 2, "title": "Part", "weight": "4.0", "crop_rect_list": [old_rect]}
+    current = [
+        {
+            "id": 1,
+            "title": "Group",
+            "weight": "4.0",
+            "crop_rect_list": [],
+            "children": [child],
+        }
+    ]
+    if online:
+        current[0].update(type="QuestionGroup", parent_id=None, index=1, content=[])
+        child.update(type="OnlineQuestion", parent_id=1, index=1, content=[])
+    proposed = copy.deepcopy(current)
+    proposed[0]["children"][0]["crop_rect_list"] = [new_rect]
+    saved = copy.deepcopy(proposed)  # Server returns decimal strings after saving.
+    reads = iter([current, current, saved])
+    props = {
+        "assignment": {"id_regions": {"name": None, "sid": None}},
+        "baseHash": "hash",
+        "saveUrl": "/courses/1/assignments/2/outline",
+    }
+    monkeypatch.setattr(
+        outline,
+        "_read",
+        lambda *a: (
+            props,
+            online,
+            copy.deepcopy(next(reads)),
+            "rev",
+            "csrf",
+            "https://example.com/courses/1/assignments/2/outline/edit",
+        ),
+    )
+    calls = []
+
+    def patch(url, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(
+        outline,
+        "get_connection",
+        lambda: SimpleNamespace(session=SimpleNamespace(patch=patch)),
+    )
+    args = ("1", "2", json.dumps(proposed), "rev")
+    preview = outline.update_assignment_outline(*args)
+    assert "No changes were made" in preview
+    assert not calls
+    assert "verified" in outline.update_assignment_outline(*args, confirm_write=True)
+    payload = (
+        json.loads(calls[0]["data"]["outline"])
+        if online
+        else calls[0]["json"]["question_data"]
+    )
+    assert payload[0]["weight"] == 4.0
+    assert payload[0]["children"][0]["weight"] == 4.0
+    assert payload[0]["children"][0]["crop_rect_list"] == [new_rect]
+    assert proposed[0]["children"][0]["weight"] == "4.0"
