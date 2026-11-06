@@ -59,6 +59,7 @@ from gradescope_mcp.tools.submissions import (
     get_assignment_graders,
 )
 from gradescope_mcp.tools.extensions import get_extensions, set_extension
+from gradescope_mcp.tools.outline import update_assignment_outline
 from gradescope_mcp.tools.grading import (
     get_assignment_outline,
     export_assignment_scores,
@@ -759,6 +760,24 @@ def tool_get_assignment_graders(
         question_id: The question ID within the assignment.
     """
     return get_assignment_graders(course_id, question_id)
+
+
+@gs_tool(gradescope_write("Update assignment outline", idempotent=False))
+def tool_update_assignment_outline(
+    course_id: GradescopeID, assignment_id: GradescopeID,
+    outline_json: str = "", expected_revision: str = "", confirm_write: bool = False,
+) -> str:
+    """Read or write PDF/online outlines, including subquestions, points and crops.
+
+    Omit outline_json to obtain the editable JSON tree and revision. Preserve
+    existing IDs and fields. PDF additions omit id; online additions use unique
+    negative integer IDs (-1, -2, ...) and content arrays (including prompt/reference-answer blocks).
+    Pass the edited tree as outline_json to preview the full save request.
+    Show the preview and obtain explicit approval before confirm_write=True;
+    confirm_write is not user approval. Supply expected_revision from preview.
+    Deletion is refused. Coordinates are percentages, page numbers are one-based.
+    """
+    return update_assignment_outline(course_id, assignment_id, outline_json, expected_revision, confirm_write)
 
 
 @gs_tool(read_only("Get assignment outline"))

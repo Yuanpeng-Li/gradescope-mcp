@@ -13,7 +13,7 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 39 tools (24 read-only, 11 Gradescope writes, 4 local cache writes)
+- 40 tools (24 read-only, 12 Gradescope writes, 4 local cache writes)
 - 3 resources (1 static, 2 URI templates)
 - 7 prompts
 - Offline pytest suite (the current count is recorded in `DEVLOG.md`)
@@ -200,8 +200,14 @@ simple CRUD wrappers.
   zero-width spaces), `escape_md_cell`, `sanitize_inline` (one-line
   student names), `normalize_url`, `is_placeholder_page`,
   `select_crop_pages`, `page_number`.
+- `src/gradescope_mcp/inspect.py`
+  Offline public-registry inspection; never authenticates.
+- `src/gradescope_mcp/tools/outline_data.py`
+  Shared editor parsing for both read and write paths.
+- `src/gradescope_mcp/tools/outline.py`
+  Outline preview/write with revisions, negative temporary online IDs, and read-back.
 - `src/gradescope_mcp/tools/safety.py`
-  Shared confirmation-preview helper for mutations; its last line tells the
+  Shared per-object write locks and confirmation-preview helper for mutations; its last line tells the
   agent to show the preview and re-run with `confirm_write=True` only after
   the user explicitly approves.
 
@@ -239,7 +245,7 @@ Grouped by annotation class. `tests/test_server_mcp.py` pins these sets.
 
 ### Gradescope writes
 `destructiveHint=true`, exactly the tools with `confirm_write`.
-`idempotentHint=false` for upload and rubric-item creation, true otherwise.
+`idempotentHint=false` for upload, outline additions and rubric-item creation, true otherwise.
 Idempotent follows the MCP definition (a repeat with the same arguments has
 no additional effect), not "returns the same result": a repeated delete
 reports the item missing, and a repeated group grade is refused because
@@ -259,14 +265,16 @@ nothing is sent.
 34. `tool_delete_rubric_item`
 35. `tool_grade_answer_group`
 
+36. `tool_update_assignment_outline`
+
 ### Local cache writes
 `readOnlyHint=false`, `destructiveHint=false`: they read Gradescope and
 write only to the private cache.
 
-36. `tool_prepare_grading_artifact`
-37. `tool_cache_relevant_pages`
-38. `tool_prepare_answer_key`
-39. `tool_export_lms_gradebook`
+37. `tool_prepare_grading_artifact`
+38. `tool_cache_relevant_pages`
+39. `tool_prepare_answer_key`
+40. `tool_export_lms_gradebook`
 
 All tools are `openWorldHint=true`.
 
@@ -398,6 +406,8 @@ All tools are `openWorldHint=true`.
 Current test files:
 - `tests/test_answer_groups.py`
 - `tests/test_assignments_and_grading_ops.py`
+- `tests/test_outline.py`
+- `tests/test_inspect.py`
 - `tests/test_auth.py`
 - `tests/test_common.py`
 - `tests/test_dates_extensions_submissions.py`
@@ -438,7 +448,7 @@ npx @modelcontextprotocol/inspector uv run python -m gradescope_mcp
 6. mcp does not interrupt a tool call that the client cancels or that times
    out; the worker thread runs to the end (a batch keeps writing its
    remaining rows, at most `MAX_BATCH_ROWS`).
-7. The per-object write locks serialize date and extension writes only
+7. The per-object write locks serialize date, extension and outline writes only
    within one server process.
 
 ## Maintenance Rule
@@ -447,3 +457,5 @@ When code changes alter capabilities, update `README.md`, this file,
 `skills/gradescope-assisted-grading/SKILL.md` and `DEVLOG.md` in the same
 change. `tests/test_docs_consistency.py` catches inventory and count drift,
 but not wording; check the prose against the code.
+
+For the architecture, upstream audit, capability gaps and outline payload examples, see README.md, “Architecture and capability audit”. Do not advertise unimplemented upstream methods as working tools. The `assignments.serialized_write` wrapper remains for compatibility; the lock registry lives in `tools/safety.py`.

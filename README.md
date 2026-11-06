@@ -13,14 +13,105 @@ This repository also includes a reusable skill at
 `skills/gradescope-assisted-grading/SKILL.md` for human-approved grading
 workflows.
 
+
+## Architecture and capability audit
+
+The core is **inspect → read evidence → plan → preview → write → verify**.
+The public MCP registry in `server.py` is the source of truth; the existing tool
+names remain compatible. The layers have distinct responsibilities:
+
+| Layer | Responsibility | Implementation |
+| --- | --- | --- |
+| MCP boundary | ID/type validation, annotations, error mapping, session recovery | `server.py` |
+| Connection | Login, credential refresh, HTTP deadlines, accepted-write tracking | `auth.py`, `envfiles.py` |
+| Shared data and writes | Outline editor parsing, per-object serialization, previews | `tools/outline_data.py`, `tools/safety.py` |
+| Domain operations | Courses, assignments, extensions, submissions, grading, rubric, groups, regrades | `tools/` |
+| Workflow | Answer key, evidence cache, readiness, grading artifacts | `tools/grading_workflow.py`, `cache.py` |
+| Guidance | Prompts and assisted-grading skill; these do not add backend APIs | MCP prompts, `skills/gradescope-assisted-grading/SKILL.md` |
+
+Use `uv run python -m gradescope_mcp.inspect` for an offline JSON inventory of
+installed versions, tool schemas, write classifications, resources and prompts.
+It reads the actual MCP registry and does not load `.env` or contact Gradescope.
+This avoids maintaining a second executable capability list.
+
+### Which tools to use
+
+- Discovery: courses → assignments → outline; use the roster only when needed.
+- Grading: resolve question-submission IDs → smart read/context → rubric →
+  single/batch grade preview → approved write → progress/scores.
+- Assignment administration: dates, extensions, title, autograder image, outline.
+- Reporting: scores and statistics; LMS export produces an import file, not an
+  LMS synchronization request.
+- Workflow helpers are optional conveniences. Smart read is the normal entry;
+  readiness, page caching and full artifacts are lower-level choices, not four
+  mandatory steps for every submission. Prompts describe workflows; they do not
+  repeat the implementation of grading tools.
+
+### Remaining gaps and boundaries
+
+| Capability | Current status | What is still missing |
+| --- | --- | --- |
+| Course/roster | Read | Course creation, enrollment and roster mutation |
+| Assignments | Read, rename, dates, autograder image, outline | Create/delete/duplicate assignments, template upload |
+| Outline | PDF and online trees, subquestions, points, crops, content | Deletion; live mutation validation; cross-process PDF compare-and-swap |
+| Extensions | Read and merged date writes | Remove override, edit all accommodation settings |
+| Submissions | Listing, detail, upload, grading evidence images | General attachment/ZIP download and bulk export |
+| Grading/rubric | Single/batch writes, rubric CRUD, existing answer groups | Creating/reorganizing AI answer groups, autograder reruns |
+| Regrades | List and read requests | Reply, resolve, reopen |
+| Grade publication | Score exports | Publish/unpublish and student notifications |
+| LMS | Canvas/Brightspace CSV generation | Authenticated LTI roster/grade synchronization |
+| Authentication | Native credentials and session recovery | Interactive institutional SSO |
+| Protocol | Text tool results with JSON where documented | Uniform structured output and persistent batch jobs/cancellation |
+
+These are explicit unsupported features, not placeholder tools. New write
+endpoints need a verified request contract and tests before registration.
+The current refactor consolidates shared outline parsing and write locks;
+large grading modules remain domain modules rather than being mechanically
+split into files without changing their responsibilities.
+
+### Upstream audit on 2026-11-06
+
+- [gradescopeapi 1.8.1](https://pypi.org/project/gradescopeapi/) is still the latest
+  published version. The [upstream repository](https://github.com/nyuoss/gradescope-api)
+  main branch matched tag v1.8.1 when checked. No newer outline/grading API is
+  available there. Its `remove_student_extension` is still a `NotImplementedError`,
+  despite the README advertising extension removal.
+- [MCP SDK 2.3.0](https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.3.0)
+  replaces 2.2.0. The lockfile has been refreshed to compatible stable releases;
+  Python 3.10 support is retained by the resolver. Gradescope's browser endpoints
+  remain separate from the unofficial Python library's optional REST wrapper.
+- No new first-party general REST API was identified in the official material
+  checked. [Gradescope's supported LMS integrations](https://www.gradescope.com/help)
+  are not a drop-in replacement for session-based instructor operations.
+
+### Editing outlines
+
+Call `tool_update_assignment_outline` without `outline_json` to read the full
+editable tree and revision. Preserve existing IDs and fields. Submit the edited
+list as `outline_json` to preview, then pass `expected_revision` and
+`confirm_write=True` only after explicit approval of that payload.
+
+PDF additions omit `id`; existing nodes retain `crop_rect_list`. Crop coordinates
+are percentages with one-based page numbers, for example
+`{"x1":10,"y1":10,"x2":90,"y2":30,"page_number":1}`. Name/ID regions are preserved.
+Online additions use unique **negative integer IDs** (-1, -2, ...), type
+`OnlineQuestion` or `QuestionGroup`, one-based `index`, and the enclosing group's
+`parent_id` (null at the top). Content blocks include
+`{"type":"text","value":"Question text"}` and
+`{"type":"explanation","value":"Reference answer"}`. Preserve other input blocks.
+Read-back verifies existing IDs as well as content. After a warning, inspect the
+outline before retrying. PDF revisions detect changes since the preview but the
+server offers no verified atomic precondition; external edits during a request
+can still race. No real assignment was mutated during this audit.
+
 ## Current Status
 
-- 39 MCP tools (24 read-only, 11 that write to Gradescope, 4 that only write
+- 40 MCP tools (24 read-only, 12 that write to Gradescope, 4 that only write
   to the private local cache)
 - 3 MCP resources (1 static resource, 2 URI templates)
 - 7 MCP prompts
 - Python 3.10+
-- MCP Python SDK v2 (`mcp>=2.2,<3`, `MCPServer`) and `gradescopeapi>=1.8.1`
+- MCP Python SDK v2 (`mcp>=2.3,<3`, `MCPServer`) and `gradescopeapi>=1.8.1`
 - Package manager: `uv`
 - Offline test suite: `uv run pytest -q` (the current count is recorded in
   `DEVLOG.md`)
@@ -81,6 +172,7 @@ the private local cache).
 ### Grading Read
 | Tool | Kind | Description |
 |------|------|-------------|
+| `tool_update_assignment_outline` | write | Read editable JSON; preview and write PDF/online question trees, points, crops and content; requires revision |
 | `tool_get_assignment_outline` | read-only | Question hierarchy (nested subparts), IDs, types, weights, prompt text; no rubric items |
 | `tool_export_assignment_scores` | read-only | Score export summary; `output_format="json"` returns every student with per-question scores |
 | `tool_get_grading_progress` | read-only | Per-question graded counts, numbered as in the outline |
@@ -203,7 +295,7 @@ submission is already graded) and repeats that call with
   rather than read from a guessed column; unknown is not ungraded.
 
 ### Write safety
-- The tools with a `confirm_write` parameter (the `write` kind, 11 of
+- The tools with a `confirm_write` parameter (the `write` kind, 12 of
   them) are the only tools that change Gradescope data. With the default
   `confirm_write=False` they return a preview ("Write confirmation required
   ...") and change nothing.
@@ -596,7 +688,7 @@ the `.env`, or pass the variables through the client configuration.
 ### Tool modules
 - `tools/courses.py`: course listing and roster parsing
 - `tools/assignments.py`: assignment listing, date edits (and the shared
-  date parser and per-object write lock), rename, autograder image
+  date parser), rename, autograder image
 - `tools/submissions.py`: uploads, submission listing, per-student
   submission reads, grader discovery
 - `tools/extensions.py`: extension reads and writes
@@ -612,7 +704,11 @@ the `.env`, or pass the variables through the client configuration.
 - `tools/lms_export.py`: Canvas / Brightspace gradebook import CSV export
 - `tools/common.py`: shared helpers (rubric-ID normalization, untrusted-text
   blocks, markdown escaping, one-line display names, page selection)
-- `tools/safety.py`: the standard write-preview message
+- `tools/safety.py`: write-preview messages and shared per-object write locks
+- `tools/outline_data.py`: shared PDF/online outline parser
+- `tools/outline.py`: revision-checked outline writes
+- `inspect.py`: offline registry inventory
+- `tests/test_outline.py`, `tests/test_inspect.py`: outline and inventory checks
 
 ## Quick Start
 

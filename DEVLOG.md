@@ -981,3 +981,21 @@ Systematic code review identified 12+ potential bugs; 10 were confirmed as real 
 
 ### Remaining gaps noted at that time
 - No structured JSON mode yet for some high-volume read tools
+
+## Outline writes
+
+Added revision-checked preview/write support for scanned and online outlines. Browser assets verified PATCH JSON question_data for scanned outlines and form outline/base_hash for online editors. Existing IDs cannot be deleted. Supports native content arrays and crop rectangles; no live assignment mutations performed.
+
+## 2026-11-06 — Core and upstream audit
+
+- Checked PyPI and nyuoss/gradescope-api: 1.8.1 remains current; main equals v1.8.1. Upstream remove_student_extension remains a stub.
+- Upgraded MCP 2.2.0 to 2.3.0 and refreshed compatible dependencies in uv.lock. Full upgraded baseline: 948 passed.
+- Consolidated PDF/online editor parsing in tools/outline_data.py; moved shared write serialization into tools/safety.py with a compatible assignments wrapper.
+- Fixed online new-question IDs (negative integers), stale baseHash detection, crop preservation, endpoint binding and verification of existing IDs. Read-back failures now report an accepted write rather than imply nothing happened.
+- Added offline registry inspection via python -m gradescope_mcp.inspect and a capability/architecture/gap matrix in README. Kept all existing tool names and separated workflow conveniences from domain operations.
+- Fixed the stale tool count in session-recovery tests. After refactoring: 959 offline tests passed on Python 3.10. Earlier MCP test hangs occurred in the restricted sandbox; running the same suite with sandbox escalation completed normally.
+- Real-account verification was read-only (editor URL/field contracts); no live assignment writes, publication, messages or grade changes. Remaining product gaps are explicit in README, not claimed as implemented.
+
+## Final review and school rollout
+
+Review fixed null question IDs and duplicate online sibling indices; added regression tests and avoided repeated indexing of the proposed tree. Full offline suite: 962 passed. School Claude/Codex both use this editable checkout. Synced the locked runtime and verified the real school launcher via a fresh stdio MCP handshake: 40 tools including outline writes. No Gradescope operations were called by the deployment smoke check. Existing client sessions need reconnection to reload Python modules.

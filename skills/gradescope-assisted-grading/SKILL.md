@@ -671,3 +671,7 @@ Use this default order unless the user directs otherwise:
 - Repeated low-confidence or skipped cases on the same question: pause and ask the user how to proceed
 - If more than roughly 30% of a question's submissions are being skipped, stop proposing grades for that question and escalate
 - If a preview shows an unintended empty rubric state, stop. That usually means `rubric_item_ids=[]` was passed when `None` was intended
+
+Outline editing: `tool_update_assignment_outline` with no `outline_json` returns the editable tree and revision. Preserve existing IDs and fields; PDF additions omit IDs. Online additions use unique negative integer IDs (-1, -2, ...), type OnlineQuestion or QuestionGroup, index and parent_id. Online content uses native editor blocks, including explanations for reference answers. Preview the edited tree, show the complete payload, then obtain explicit user approval before writing with `confirm_write=True` and the preview’s `expected_revision`. Deletion is refused. After a mismatch warning, inspect the saved outline before retrying. No live mutation tests have been performed.
+
+Use smart read as the normal grading-evidence entry point; readiness, page cache and full artifacts are optional specialized helpers. Do not invoke all of them by default. For supported versus missing operations and exact outline payloads, consult README.md. Regrade replies, grade publication and assignment creation are not implemented tools.

@@ -11,13 +11,11 @@ from gradescopeapi.classes.extensions import get_extensions as gs_get_extensions
 
 from gradescope_mcp.auth import get_connection, AuthError
 from gradescope_mcp.tools.assignments import (
-    WriteInProgressError,
     check_date_order,
     parse_date_input,
-    serialized_write,
 )
 from gradescope_mcp.tools.common import escape_md_cell
-from gradescope_mcp.tools.safety import write_confirmation_required
+from gradescope_mcp.tools.safety import WriteInProgressError, serialized_write, write_confirmation_required
 
 
 # gradescopeapi raises RuntimeError("Failed to get extensions for assignment
