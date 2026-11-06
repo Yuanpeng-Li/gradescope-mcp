@@ -66,7 +66,7 @@ def test_pre_submission_editor_normalizes_question_urls():
                 "scoring_type": "positive",
                 "floor": True,
                 "ceiling": False,
-                "children": [],
+                "children": None,
             }
         ],
         "rubric_items": [

@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from gradescope_mcp import operations as ops
 from gradescope_mcp.auth import get_connection, AuthError
 from gradescope_mcp.cache import get_artifact_path, write_artifact
-from gradescope_mcp.tools import assignment_admin as admin, outline, grading_ops
+from gradescope_mcp.tools import assignment_admin as admin, outline
 from gradescope_mcp.tools.rubric_plans import (
     _rubric,
     prepare_rubric_plan,
@@ -100,7 +100,7 @@ def prepare_assignment_clone(
                 )
             )
         request, token = admin._prepare(
-            get_connection(), course_id, None, "create", options, template
+            get_connection(), course_id, None, "create", options, template, True
         )
         new_tree = copy.deepcopy(tree)
         next_id = -1
@@ -184,6 +184,7 @@ def execute_assignment_clone(
                 "create",
                 r["options"],
                 r["template_path"],
+                True,
             )
             if fresh != r["create"]:
                 raise ValueError("Creation capabilities or source PDF changed")
@@ -194,6 +195,7 @@ def execute_assignment_clone(
                 "action": "create",
                 "options": r["options"],
                 "template_path": r["template_path"],
+                "trusted_template": True,
             }
             child = ops.create("assignment", create_req, fresh["baseline"], [])
             op["status"] = "running"
@@ -210,6 +212,10 @@ def execute_assignment_clone(
                 )
             op["created_assignment_id"] = aid
             ops.save(op)
+            if ops.cancelled(operation_token):
+                op["status"] = "cancelled"
+                ops.save(op)
+                return json.dumps(op)
             _, _, _, revision, _, _ = outline._read(
                 get_connection(), r["course_id"], aid
             )
@@ -275,6 +281,11 @@ def execute_assignment_clone(
                 plan = json.loads(prepared)
                 op["rubric_results"][-1]["operation_token"] = plan["operation_token"]
                 ops.save(op)
+                if ops.cancelled(operation_token):
+                    ops.cancel_operation(plan["operation_token"])
+                    op["status"] = "cancelled"
+                    ops.save(op)
+                    return json.dumps(op)
                 result = execute_rubric_plan(
                     plan["operation_token"], plan["request_digest"], True
                 )

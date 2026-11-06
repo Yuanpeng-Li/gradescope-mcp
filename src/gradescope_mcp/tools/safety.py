@@ -66,41 +66,51 @@ _question_guard = threading.Lock()
 @contextlib.contextmanager
 def question_write_lock(course_id, question_id):
     from gradescope_mcp.cache import get_artifact_path
+
     try:
         import fcntl
     except ImportError:
         fcntl = None
         import msvcrt
     import os
+    import errno
     import time
 
     key = (str(course_id), str(question_id))
     with _question_guard:
         lock = _question_locks.setdefault(key, threading.RLock())
     if not lock.acquire(timeout=_WRITE_LOCK_TIMEOUT):
-        raise WriteInProgressError('Question is being modified; retry later')
+        raise WriteInProgressError("Question is being modified; retry later")
     # Thread-local nesting avoids deadlocking on a second file descriptor.
-    held = getattr(_question_local, 'held', set())
+    held = getattr(_question_local, "held", set())
     fd = None
     try:
         if key not in held:
             import hashlib
+
             name = hashlib.sha256(repr(key).encode()).hexdigest()
-            path = get_artifact_path(f'question-lock-{name}')
-            fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            path = get_artifact_path(f"question-lock-{name}")
+            fd = os.open(
+                path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600
+            )
             deadline = time.monotonic() + _WRITE_LOCK_TIMEOUT
             while True:
                 try:
                     if fcntl is not None:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     else:
-                        if os.fstat(fd).st_size == 0: os.write(fd, b"0")
+                        if os.fstat(fd).st_size == 0:
+                            os.write(fd, b"0")
                         os.lseek(fd, 0, os.SEEK_SET)
                         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                     break
-                except BlockingIOError:
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
                     if time.monotonic() >= deadline:
-                        raise WriteInProgressError('Another MCP process is modifying this question')
+                        raise WriteInProgressError(
+                            "Another MCP process is modifying this question"
+                        )
                     time.sleep(0.05)
             _question_local.held = held | {key}
         yield
@@ -118,13 +128,15 @@ def serialize_question_write(fn):
     """Serialize confirmed mutations, preserving the original MCP signature."""
     import functools
     import inspect
+
     signature = inspect.signature(fn)
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         values = signature.bind(*args, **kwargs).arguments
-        if values.get('confirm_write') is not True:
+        if values.get("confirm_write") is not True:
             return fn(*args, **kwargs)
-        with question_write_lock(values['course_id'], values['question_id']):
+        with question_write_lock(values["course_id"], values["question_id"]):
             return fn(*args, **kwargs)
+
     return wrapped

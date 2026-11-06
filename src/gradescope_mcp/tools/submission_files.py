@@ -61,7 +61,12 @@ def _download(conn, url):
             data = _read_page_body(resp, deadline)
             if same:
                 check_streamed_body(resp, data)
-            if "text/html" in resp.headers.get("Content-Type", "").lower():
+            if (
+                same
+                and "text/html" in resp.headers.get("Content-Type", "").lower()
+                and "attachment"
+                not in resp.headers.get("Content-Disposition", "").lower()
+            ):
                 raise ValueError("Received HTML instead of a submission attachment")
             return data
         finally:

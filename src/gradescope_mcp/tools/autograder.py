@@ -230,6 +230,10 @@ def execute_autograder_plan(
                 if hashlib.sha256(data).hexdigest() != r["file"]["sha256"]:
                     raise ValueError("ZIP changed")
                 files = {r["file_field"]: ("autograder.zip", data, "application/zip")}
+            if ops.cancelled(operation_token):
+                op["status"] = "cancelled"
+                ops.save(op)
+                return json.dumps(op)
             op["status"] = "sending"
             ops.save(op)
             try:

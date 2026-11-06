@@ -243,25 +243,25 @@ Grouped by annotation class. `tests/test_server_mcp.py` pins these sets.
 23. `tool_assess_submission_readiness`
 24. `tool_smart_read_submission`
 
-99. `tool_get_operation`
+25. `tool_get_operation`
 
-99. `tool_calibrate_grade_plan`
+26. `tool_calibrate_grade_plan`
 
-99. `tool_get_assignment_admin`
+27. `tool_get_assignment_admin`
 
-99. `tool_export_question_rubric`
+28. `tool_export_question_rubric`
 
-99. `tool_inspect_submission_pdf`
+29. `tool_inspect_submission_pdf`
 
-99. `tool_review_assignment`
+30. `tool_review_assignment`
 
-99. `tool_sample_question_submissions`
+31. `tool_sample_question_submissions`
 
-99. `tool_check_archive_freshness`
+32. `tool_check_archive_freshness`
 
-99. `tool_get_autograder_status`
+33. `tool_get_autograder_status`
 
-99. `tool_get_autograder_results`
+34. `tool_get_autograder_results`
 
 ### Gradescope writes
 `destructiveHint=true`, exactly the tools with `confirm_write`.
@@ -273,74 +273,74 @@ the first call graded the members (without `overwrite_graded`, or with
 an `expected_graded_ids` that no longer matches the graded members);
 nothing is sent.
 
-25. `tool_upload_submission`
-26. `tool_set_extension`
-27. `tool_modify_assignment_dates`
-28. `tool_rename_assignment`
-29. `tool_update_autograder_image`
-30. `tool_apply_grade`
-31. `tool_apply_grade_batch`
-32. `tool_create_rubric_item`
-33. `tool_update_rubric_item`
-34. `tool_delete_rubric_item`
-35. `tool_grade_answer_group`
+35. `tool_upload_submission`
+36. `tool_set_extension`
+37. `tool_modify_assignment_dates`
+38. `tool_rename_assignment`
+39. `tool_update_autograder_image`
+40. `tool_apply_grade`
+41. `tool_apply_grade_batch`
+42. `tool_create_rubric_item`
+43. `tool_update_rubric_item`
+44. `tool_delete_rubric_item`
+45. `tool_grade_answer_group`
 
-36. `tool_update_assignment_outline`
+46. `tool_update_assignment_outline`
 
-41. `tool_set_question_scoring`
-42. `tool_set_question_grading_method`
-43. `tool_create_answer_group`
+47. `tool_set_question_scoring`
+48. `tool_set_question_grading_method`
+49. `tool_create_answer_group`
 
-99. `tool_execute_grade_plan`
+50. `tool_execute_grade_plan`
 
-99. `tool_execute_assignment_plan`
+51. `tool_execute_assignment_plan`
 
-99. `tool_execute_rubric_plan`
+52. `tool_execute_rubric_plan`
 
-99. `tool_patch_assignment_outline`
+53. `tool_patch_assignment_outline`
 
-99. `tool_respond_regrade_request`
+54. `tool_respond_regrade_request`
 
-99. `tool_modify_extension_options`
+55. `tool_modify_extension_options`
 
-99. `tool_set_answer_group_members`
+56. `tool_set_answer_group_members`
 
-99. `tool_execute_assignment_clone`
+57. `tool_execute_assignment_clone`
 
-99. `tool_execute_autograder_plan`
+58. `tool_execute_autograder_plan`
 
-99. `tool_merge_answer_groups`
+59. `tool_merge_answer_groups`
 
 ### Local cache writes
 `readOnlyHint=false`, `destructiveHint=false`: they read Gradescope and
 write only to the private cache.
 
-37. `tool_prepare_grading_artifact`
-38. `tool_cache_relevant_pages`
-39. `tool_prepare_answer_key`
-40. `tool_export_lms_gradebook`
+60. `tool_prepare_grading_artifact`
+61. `tool_cache_relevant_pages`
+62. `tool_prepare_answer_key`
+63. `tool_export_lms_gradebook`
 
-99. `tool_prepare_grade_plan`
+64. `tool_prepare_grade_plan`
 
-99. `tool_cancel_operation`
+65. `tool_cancel_operation`
 
-99. `tool_prepare_assignment_plan`
+66. `tool_prepare_assignment_plan`
 
-99. `tool_prepare_rubric_plan`
+67. `tool_prepare_rubric_plan`
 
-99. `tool_preview_outline_regions`
+68. `tool_preview_outline_regions`
 
-99. `tool_download_submission_files`
+69. `tool_download_submission_files`
 
-99. `tool_archive_assignment`
+70. `tool_archive_assignment`
 
-99. `tool_prepare_choice_bonus_plan`
+71. `tool_prepare_choice_bonus_plan`
 
-99. `tool_prepare_assignment_clone`
+72. `tool_prepare_assignment_clone`
 
-99. `tool_prepare_autograder_plan`
+73. `tool_prepare_autograder_plan`
 
-99. `tool_poll_operation`
+74. `tool_poll_operation`
 
 All tools are `openWorldHint=true`.
 

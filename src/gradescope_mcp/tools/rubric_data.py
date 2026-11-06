@@ -17,9 +17,9 @@ def assignment_rubric_props(soup, course_id, question_id):
             nodes = list(nodes.values())
         for q in nodes:
             questions[str(q["id"])] = q
-            visit(q.get("children", []))
+            visit(q.get("children") or [])
 
-    visit(p.get("questions", []))
+    visit(p.get("questions") or [])
     question = questions.get(str(question_id))
     if question is None:
         raise ValueError("Question absent from rubric editor")
@@ -32,12 +32,12 @@ def assignment_rubric_props(soup, course_id, question_id):
         "course": p.get("course"),
         "rubric_items": [
             r
-            for r in p.get("rubric_items", [])
+            for r in (p.get("rubric_items") or [])
             if str(r.get("question_id")) == str(question_id)
         ],
         "rubric_item_groups": [
             r
-            for r in p.get("rubric_item_groups", [])
+            for r in (p.get("rubric_item_groups") or [])
             if str(r.get("question_id")) == str(question_id)
         ],
         "urls": urls,

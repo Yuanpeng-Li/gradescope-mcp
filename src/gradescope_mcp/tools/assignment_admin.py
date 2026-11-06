@@ -3,12 +3,14 @@
 import hashlib
 import json
 import re
+from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
 from gradescope_mcp import operations as ops
 from gradescope_mcp.auth import AuthError, get_connection
+from gradescope_mcp.cache import get_cache_root
 from gradescope_mcp.tools.assignments import (
     _dates_from_props,
     parse_date_input,
@@ -65,13 +67,14 @@ def _page(conn, path):
 
 
 def _token(soup):
-    t = soup.select_one('meta[name="csrf-token"]')
-    if t is not None:
-        return t.get("content")
-    t = soup.select_one('input[name="authenticity_token"]')
-    if t is None:
+    meta = soup.select_one('meta[name="csrf-token"]')
+    value = meta.get("content") if meta is not None else None
+    if not value:
+        field = soup.select_one('input[name="authenticity_token"]')
+        value = field.get("value") if field is not None else None
+    if not isinstance(value, str) or not value.strip():
         raise ValueError("CSRF token missing")
-    return t.get("value")
+    return value
 
 
 def _form(form):
@@ -115,10 +118,21 @@ def _bound(conn, url, path):
     return path
 
 
-def _file(path):
+def _file(path, trusted_artifact=False):
     if path is None:
         return None
-    p = _validate_upload_path(path, _upload_roots())
+    roots = _upload_roots()
+    if trusted_artifact and roots is None:
+        p = Path(path)
+        root = get_cache_root()
+        if (p.parent != root or p.is_symlink() or not p.is_file()
+                or not re.fullmatch(r'clone-template-[a-f0-9]{20}\.pdf', p.name)):
+            raise ValueError('Invalid internally downloaded clone template')
+        if p.stat().st_size > 100*1024*1024:
+            raise ValueError('Template exceeds 100 MiB')
+    else:
+        # An explicitly configured upload-root policy always takes precedence.
+        p = _validate_upload_path(path, roots)
     content = p.read_bytes()
     if len(content) > 100 * 1024 * 1024 or not content.startswith(b"%PDF-"):
         raise ValueError("Template must be a PDF of at most 100 MiB")
@@ -142,7 +156,10 @@ def _values(options):
             if isinstance(v, bool) or not str(v).isdigit() or int(v) < 1:
                 raise ValueError(f"{k} must be a positive integer")
         if k in _DATE_KEYS and v:
-            parse_date_input(v, k, allow_offset=False)
+            parsed = parse_date_input(v, k, allow_offset=False)
+            if parsed.second or parsed.microsecond:
+                raise ValueError("Assignment dates require minute precision")
+            v = parsed.strftime("%Y-%m-%dT%H:%M")
         result[f"assignment[{k}]"] = (
             ("true" if v else "false")
             if isinstance(v, bool)
@@ -177,10 +194,10 @@ def _settings(conn, c, a):
     return soup, fields, choices
 
 
-def _prepare(conn, course_id, assignment_id, action, options, template_path):
+def _prepare(conn, course_id, assignment_id, action, options, template_path, trusted_template=False):
     c, a = course_id, assignment_id
     root = f"/courses/{c}/assignments" + (f"/{a}" if a else "")
-    artifact = _file(template_path)
+    artifact = _file(template_path, trusted_template)
     if action == "create":
         if a:
             raise ValueError("Creation must omit assignment_id")
@@ -233,8 +250,15 @@ def _prepare(conn, course_id, assignment_id, action, options, template_path):
         soup, fields, choices = _settings(conn, c, a)
         baseline = dict(fields)
         values = _values(options)
+        if action == "settings" and not values:
+            raise ValueError("Specify at least one setting to change")
         if action == "template" and artifact is None:
             raise ValueError("template_path required")
+        if (
+            action == "template"
+            and soup.select_one('input[type="file"][name="template_pdf"]') is None
+        ):
+            raise ValueError("This assignment has no template upload field")
         if action == "settings" and artifact is not None:
             raise ValueError("Use template action for template replacement")
         for k, v in values.items():
@@ -289,6 +313,13 @@ def _prepare(conn, course_id, assignment_id, action, options, template_path):
             baseline = dict(fields)
             if not options.get("subject") or not options.get("message_body"):
                 raise ValueError("Supply explicit subject and message_body")
+            if (
+                any(not isinstance(v, str) for v in options.values())
+                or not str(fields.get("to", "")).strip()
+            ):
+                raise ValueError(
+                    "Notification text and an explicit form recipient scope are required"
+                )
             fields.update(options)
             root += "/notify_students"
             verify = {}
@@ -335,6 +366,12 @@ def _prepare(conn, course_id, assignment_id, action, options, template_path):
         problem = check_date_order(dates)
         if problem:
             raise ValueError(problem)
+    if action in ("settings", "template"):
+        # PATCH only the requested attributes; resending disabled/unrelated
+        # checkbox defaults can reset settings the caller did not approve.
+        fields = {"_method": "patch", **values}
+        if action == "template" and not values:
+            fields["assignment[title]"] = baseline["assignment[title]"]
     return {
         "target": root,
         "fields": fields,
@@ -378,6 +415,21 @@ def prepare_assignment_plan(
         return f"Error: {exc}"
 
 
+def _verify_template(conn, soup, expected_hash):
+    from gradescope_mcp.tools.submission_files import _download
+
+    links = {
+        a["href"]
+        for a in soup.select("a[href]")
+        if urlsplit(a["href"]).path.lower().endswith(".pdf")
+    }
+    if len(links) != 1:
+        raise ValueError("Cannot uniquely identify the uploaded template for read-back")
+    data = _download(conn, next(iter(links)))
+    if hashlib.sha256(data).hexdigest() != expected_hash:
+        raise ValueError("Template bytes differ on read-back; inspect before retrying")
+
+
 def execute_assignment_plan(
     operation_token: str, request_digest: str, confirm_write: bool = False
 ) -> str:
@@ -413,6 +465,7 @@ def execute_assignment_plan(
                 r["action"],
                 r["options"],
                 r["template_path"],
+                r.get("trusted_template", False),
             )
             if any(
                 fresh[k] != r[k]
@@ -425,12 +478,15 @@ def execute_assignment_plan(
             files = None
             if fresh["file"]:
                 meta = fresh["file"]
-                content = _validate_upload_path(
-                    meta["path"], _upload_roots()
-                ).read_bytes()
+                validated = _file(meta["path"], r.get("trusted_template", False))
+                content = Path(validated["path"]).read_bytes()
                 if hashlib.sha256(content).hexdigest() != meta["sha256"]:
                     raise ValueError("Template changed")
                 files = {"template_pdf": ("template.pdf", content, "application/pdf")}
+            if ops.cancelled(operation_token):
+                op["status"] = "cancelled"
+                ops.save(op)
+                return json.dumps(op)
             op["status"] = "sending"
             ops.save(op)
             try:
@@ -471,16 +527,27 @@ def execute_assignment_plan(
                     created = match[1]
                     op["created_assignment_id"] = created
                     ops.save(op)
-                    _, fields, _ = _settings(conn, r["course_id"], created)
+                    created_soup, fields, _ = _settings(conn, r["course_id"], created)
                     if any(fields.get(k) != v for k, v in r["verify"].items()):
                         raise ValueError(
                             "Created assignment settings differ from requested values"
                         )
+                    if r["file"]:
+                        _verify_template(conn, created_soup, r["file"]["sha256"])
+                    if (
+                        fields.get("assignment[type]")
+                        != r["fields"]["assignment[type]"]
+                    ):
+                        raise ValueError("Created assignment type differs")
                     op["status"] = "verified"
-                elif r["action"] == "settings":
-                    _, fields, _ = _settings(conn, r["course_id"], r["assignment_id"])
+                elif r["action"] in ("settings", "template"):
+                    saved_soup, fields, _ = _settings(
+                        conn, r["course_id"], r["assignment_id"]
+                    )
                     if any(fields.get(k) != v for k, v in r["verify"].items()):
                         raise ValueError("Settings read-back differs")
+                    if r["file"]:
+                        _verify_template(conn, saved_soup, r["file"]["sha256"])
                     op["status"] = "verified"
                 elif r["action"] in ("publish", "unpublish"):
                     after, _ = _prepare(
@@ -532,8 +599,16 @@ def get_assignment_admin(course_id: str, assignment_id: str) -> str:
         )
         return json.dumps(
             {
-                "settings": fields,
-                "choices": choices,
+                "settings": {
+                    k[11:-1]: v
+                    for k, v in fields.items()
+                    if k.startswith("assignment[")
+                },
+                "choices": {
+                    k[11:-1]: v
+                    for k, v in choices.items()
+                    if k.startswith("assignment[")
+                },
                 "published": published,
                 "capabilities": capabilities,
                 "lms": {

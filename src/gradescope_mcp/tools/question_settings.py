@@ -4,12 +4,13 @@ Contracts verified against submission_grader and answer_grouper browser assets.
 """
 
 import hashlib
+from contextlib import ExitStack
 import json
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
-from gradescope_mcp.tools.safety import serialize_question_write
+from gradescope_mcp.tools.safety import serialize_question_write, question_write_lock
 from gradescope_mcp.auth import AuthError, get_connection
 from gradescope_mcp.tools.grading_ops import _load_question_rubric_context
 from gradescope_mcp.tools.grading_workflow import _fetch_assignment_questions
@@ -193,7 +194,6 @@ _METHODS = {
 }
 
 
-@serialize_question_write
 def set_question_grading_method(
     course_id: str,
     question_id: str,
@@ -207,7 +207,7 @@ def set_question_grading_method(
     try:
         if method not in _METHODS or type(apply_to_all) is not bool:
             return "Error: Invalid grading method or apply_to_all."
-        with serialized_write("grading method", course_id):
+        with serialized_write("grading method", course_id), ExitStack() as locks:
             conn, props, token = _grouper(course_id, question_id)
             aid = props["question"]["assignment_id"]
             targets = [str(question_id)]
@@ -227,6 +227,10 @@ def set_question_grading_method(
                     raise ValueError(
                         "Question not found among assignment leaf questions"
                     )
+            if confirm_write:
+                for qid in sorted(targets):
+                    locks.enter_context(question_write_lock(course_id, qid))
+                conn, props, token = _grouper(course_id, question_id)
             pages = {str(question_id): (conn, props, token)}
             for qid in targets:
                 if qid not in pages:

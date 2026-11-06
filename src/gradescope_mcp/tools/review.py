@@ -109,6 +109,42 @@ def review_assignment(
                     raise
                 except Exception:
                     unknown.append(f"Question {qid}: rubric unavailable")
+                try:
+                    groups = _fetch_answer_groups_json(course_id, qid)
+                    checked = 0
+                    unavailable = 0
+                    for group in groups.get("groups", []):
+                        members = [
+                            m
+                            for m in groups.get("submissions", [])
+                            if str(m.get("confirmed_group_id")) == str(group.get("id"))
+                            and m.get("graded") is True
+                        ]
+                        if len(members) < 2:
+                            continue
+                        scores = [_finite(m.get("score")) for m in members]
+                        if any(score is None for score in scores):
+                            unavailable += 1
+                            continue
+                        checked += 1
+                        if max(scores) - min(scores) > 0.01:
+                            issues.append(
+                                {
+                                    "kind": "same_group_score_difference",
+                                    "question_id": qid,
+                                    "group_id": str(group["id"]),
+                                    "submission_ids": [str(m["id"]) for m in members],
+                                    "note": "Review individual adjustments; a difference can be intentional.",
+                                }
+                            )
+                    item["group_comparison"] = {
+                        "checked": checked,
+                        "score_unavailable": unavailable,
+                    }
+                except AuthError:
+                    raise
+                except Exception:
+                    item["group_comparison"] = "unavailable"
             questions.append(item)
         question_cols = [f for f in fields if f not in _NON_QUESTION_CSV_COLUMNS]
         for row in rows:

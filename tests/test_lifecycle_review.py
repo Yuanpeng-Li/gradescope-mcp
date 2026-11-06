@@ -135,3 +135,41 @@ def test_extension_readback_error_not_success(monkeypatch):
     assert "could not verify" in post.modify_extension_options(
         "1", "2", "3", "delete", expected_revision=revision, confirm_write=True
     )
+
+
+def test_review_flags_group_score_difference_without_deciding_correctness(monkeypatch):
+    monkeypatch.setattr(
+        review,
+        "_fetch_assignment_questions",
+        lambda *a: {
+            "2": {"id": 2, "weight": 10, "total_graded_count": 2, "total_count": 2}
+        },
+    )
+    monkeypatch.setattr(review, "_fetch_assignment_scores_csv", lambda *a: ([], []))
+    monkeypatch.setattr(
+        review,
+        "_load_question_rubric_context",
+        lambda *a: {"props": {"question": {"weight": 10}}},
+    )
+    monkeypatch.setattr(
+        review,
+        "_rubric",
+        lambda *a: [{"id": "1", "description": "Correct", "weight": 1}],
+    )
+    monkeypatch.setattr(
+        review, "get_assignment_admin", lambda *a: '{"published":false}'
+    )
+    monkeypatch.setattr(
+        review,
+        "_fetch_answer_groups_json",
+        lambda *a: {
+            "groups": [{"id": 9}],
+            "submissions": [
+                {"id": 3, "confirmed_group_id": 9, "graded": True, "score": 1},
+                {"id": 4, "confirmed_group_id": 9, "graded": True, "score": 2},
+            ],
+        },
+    )
+    result = json.loads(review.review_assignment("1", "7", True))
+    assert result["issues"][0]["kind"] == "same_group_score_difference"
+    assert "intentional" in result["issues"][0]["note"]

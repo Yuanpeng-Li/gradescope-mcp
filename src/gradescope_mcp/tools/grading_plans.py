@@ -185,6 +185,10 @@ def execute_grade_plan(
                         op["status"] = "needs_review"
                         ops.save(op)
                         return json.dumps(op)
+                    if ops.cancelled(operation_token):
+                        op["status"] = "cancelled"
+                        ops.save(op)
+                        return json.dumps(op)
                     row["state"] = "sending"
                     op["status"] = "running"
                     ops.save(op)

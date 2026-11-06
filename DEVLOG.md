@@ -1021,3 +1021,13 @@ Added assignment creation/settings/template/publication/notification/LMS plans, 
 Observed live creation/settings/publication forms, PostGrades job polling, AssignmentRubric pre-submission structure/URLs, regrade response payloads and grouping/extension frontend contracts. No live writes. No accessible programming assignment found in bounded read-only discovery; programming form/result adapters remain fixture-tested and fail closed when unavailable. Synthetic PDF overlay rendered and visually checked. Fixed eager reportlab import breaking startup from a deleted working directory, checkbox hidden-value preservation, and false-positive override deletion verification.
 
 Batch validation: 1,011 offline tests passed. Registry exposes 74 tools. PDF overlays visually checked on a synthetic document. Live requests remained read-only; programming-assignment contract validation awaits an accessible example.
+
+## Lifecycle final code review
+
+Reviewed new request binding, retries, field preservation, cancellation, file handling and publication/job outcomes. Fixed: cancellation missing known clone child operations; cancellation arriving during final preflight read; all-question grading-method writes locking only the entry question; assignment read/write field-name mismatch; disabled-checkbox defaults leaking into unrelated PATCHes; missing CSRF validation; template upload success without byte verification; false verified grade read-back when graded=false; rejection of legitimate HTML submission files on trusted storage; excessive journal detail without pagination. Added targeted regressions and a real multi-process lock test.
+
+Remaining validation boundary: no accessible programming assignment found; requested an instructor-accessible example for live read-only autograder contract validation. Reopening regrades and asynchronous remote completion still require backend read-back, not HTTP acceptance. No live assignment, rubric, grade, mail or LMS mutation was executed.
+
+The final live read-only AssignmentRubric smoke test exposed null children on leaf questions; normalized null children/groups/items to empty collections and added the real-shape regression.
+
+Final validation: 1,023 tests passed; targeted Ruff undefined/unused checks and git diff --check passed. A live source assignment produced a complete local clone preview without remote writes. Fixed internally downloaded clone templates being rejected under the default runtime-cache directory; public uploads and explicitly configured upload-root restrictions remain enforced. Fresh school launcher handshake exposed all 74 tools.

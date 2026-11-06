@@ -9,7 +9,6 @@ import stat
 from datetime import datetime, timezone
 
 from gradescope_mcp.cache import get_artifact_path, write_artifact
-from gradescope_mcp.tools.safety import serialized_write
 
 
 def digest(value):
@@ -71,9 +70,63 @@ def create(kind, request, snapshots, rows):
     return plan
 
 
-def get_operation(operation_token: str) -> str:
+def get_operation(
+    operation_token: str,
+    include_details: bool = False,
+    offset: int = 0,
+    limit: int = 50,
+) -> str:
     try:
-        return json.dumps(load(operation_token), ensure_ascii=False)
+        if (
+            type(offset) is not int
+            or offset < 0
+            or type(limit) is not int
+            or not 1 <= limit <= 100
+        ):
+            raise ValueError("offset must be nonnegative and limit must be 1–100")
+        plan = load(operation_token)
+        rows = plan.get("rows", [])
+        counts = {}
+        for row in rows:
+            state = row.get("state", "unknown")
+            counts[state] = counts.get(state, 0) + 1
+        selected = rows[offset : offset + limit]
+        result = {
+            k: v for k, v in plan.items() if k not in ("request", "snapshots", "rows")
+        }
+        result.update(
+            row_counts=counts,
+            total_rows=len(rows),
+            offset=offset,
+            next_offset=offset + limit if offset + limit < len(rows) else None,
+            cancellation_requested=cancelled(operation_token),
+        )
+        result["rows"] = (
+            selected
+            if include_details
+            else [
+                {
+                    k: v
+                    for k, v in row.items()
+                    if k not in ("payload", "evidence", "item", "result")
+                }
+                for row in selected
+            ]
+        )
+        if include_details:
+            result["request"] = {
+                k: v
+                for k, v in plan["request"].items()
+                if k not in ("grades", "payloads", "evidence")
+            }
+            if plan["kind"] == "grade_plan":
+                result["snapshots"] = {
+                    row["submission_id"]: plan["snapshots"].get(row["submission_id"])
+                    for row in selected
+                }
+            else:
+                result["snapshots"] = plan["snapshots"]
+        return json.dumps(result, ensure_ascii=False)
     except Exception as exc:
         return f"Error: Cannot read operation: {exc}"
 
@@ -82,10 +135,23 @@ def cancel_operation(operation_token: str) -> str:
     """Request cooperative cancellation between rows; never undo accepted writes."""
     try:
         # Separate signal avoids rewriting an executor's in-flight row state.
-        load(operation_token)
-        write_artifact(
-            get_artifact_path(f"operation-{operation_token}.cancel"), "cancel"
-        )
+        pending = [operation_token]
+        seen = set()
+        while pending:
+            token = pending.pop()
+            if token in seen:
+                continue
+            seen.add(token)
+            plan = load(token)
+            write_artifact(get_artifact_path(f"operation-{token}.cancel"), "cancel")
+            child = plan.get("creation_operation")
+            if child:
+                pending.append(child)
+            pending.extend(
+                r["operation_token"]
+                for r in plan.get("rubric_results", [])
+                if isinstance(r, dict) and r.get("operation_token")
+            )
         return "Cancellation requested. An in-flight request may finish; subsequent rows will stop. Query the operation for results."
     except Exception as exc:
         return f"Error: Cannot cancel operation: {exc}"

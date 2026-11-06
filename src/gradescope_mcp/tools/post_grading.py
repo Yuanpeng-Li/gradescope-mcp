@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlsplit
 
 from gradescope_mcp.auth import get_connection, AuthError
-from gradescope_mcp.tools.assignment_admin import _page, _token, _bound
+from gradescope_mcp.tools.assignment_admin import _page, _token
 from gradescope_mcp.tools.question_settings import _preview, _target, _headers
 from gradescope_mcp.tools.grading_ops import _get_grading_context, _write_target_problem
 from gradescope_mcp.tools.safety import serialize_question_write, serialized_write
@@ -55,7 +55,6 @@ def respond_regrade_request(
             raise ValueError("Request ID does not belong to this submission")
         base = (props.get("urls") or {}).get("regrade_request", "")
         path = urlsplit(base).path.rstrip("/") + "/" + request_id
-        root = f"/courses/{course_id}/questions/{question_id}/submissions/{submission_id}/regrade_requests"
         # Some pages expose assignment-level request URLs. Only the exact
         # page-provided URL is used, with identity established by its request list.
         if (

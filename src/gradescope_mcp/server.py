@@ -799,9 +799,9 @@ def tool_execute_grade_plan(operation_token: str, request_digest: str, confirm_w
 
 
 @gs_tool(read_only("Inspect operation state"))
-def tool_get_operation(operation_token: str) -> str:
+def tool_get_operation(operation_token: str, include_details: bool = False, offset: Count = 0, limit: Count = 50) -> str:
     """Read a private operation journal, including partial and unknown outcomes."""
-    return get_operation(operation_token)
+    return get_operation(operation_token, include_details, offset, limit)
 
 
 @gs_tool(local_cache_write("Request operation cancellation"))

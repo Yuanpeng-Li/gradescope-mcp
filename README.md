@@ -322,6 +322,8 @@ submission is already graded) and repeats that call with
 
 ### Numbers
 
+`offset` and `limit` page operation journals (at most 100 rows per read).
+
 `value` sets time-limit values; `count` and `seed` control sampling; `points_a`, `points_b`, `points_c` set minority-game bonuses.
 
 `required_pages` lists one-based PDF pages to check.
@@ -1015,3 +1017,5 @@ Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type
 - `tests/test_blueprints.py`: lifecycle implementation and regression coverage.
 
 - `tools/rubric_data.py`: pre-submission AssignmentRubric normalization.
+
+Final review hardening: cancellation propagates through assignment-copy child operations and is checked immediately before writes; all-question grading-method changes acquire question locks in a fixed order. Assignment settings reads use the same bare field names accepted by options, and PATCH sends only requested attributes. PDF template saves are verified against downloaded bytes when available; inability to verify remains explicit. Operation journals support paginated summaries and detailed row reads. Trusted-storage HTML submissions may be downloaded as inert files, while unexpected same-site HTML is rejected.

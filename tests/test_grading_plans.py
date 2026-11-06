@@ -113,3 +113,91 @@ def test_plan_digest_tamper(monkeypatch):
         p["operation_token"], p["request_digest"], True
     ).startswith("Error:")
     assert not sent
+
+
+def test_cancel_during_final_read_prevents_send(monkeypatch):
+    p, states, sent = world(monkeypatch)
+    read = plans.grading._get_grading_context
+
+    def cancelling_read(*args):
+        operations.cancel_operation(p["operation_token"])
+        return read(*args)
+
+    monkeypatch.setattr(plans.grading, "_get_grading_context", cancelling_read)
+    result = json.loads(
+        plans.execute_grade_plan(p["operation_token"], p["request_digest"], True)
+    )
+    assert result["status"] == "cancelled" and not sent
+
+
+def test_cancel_propagates_to_clone_children():
+    child = operations.create("assignment", {}, {}, [])
+    rubric = operations.create("rubric", {}, {}, [])
+    parent = operations.create("assignment_clone", {}, {}, [])
+    parent["creation_operation"] = child["operation_token"]
+    parent["rubric_results"] = [{"operation_token": rubric["operation_token"]}]
+    operations.save(parent)
+    operations.cancel_operation(parent["operation_token"])
+    assert all(
+        operations.cancelled(p["operation_token"]) for p in (parent, child, rubric)
+    )
+
+
+def test_ungraded_readback_is_not_verified(monkeypatch):
+    p, _, sent = world(monkeypatch)
+    monkeypatch.setattr(
+        plans.grading,
+        "_read_back_grade",
+        lambda *a: {"graded": False, "mismatches": []},
+    )
+    result = json.loads(
+        plans.execute_grade_plan(p["operation_token"], p["request_digest"], True)
+    )
+    assert result["rows"][0]["state"] == "accepted_unverified"
+    assert sent == ["3"]
+
+
+def _lock_worker(cache, started, acquired):
+    import os
+
+    os.environ["GRADESCOPE_MCP_CACHE_DIR"] = cache
+    from gradescope_mcp.tools.safety import question_write_lock
+
+    started.set()
+    with question_write_lock("1", "2"):
+        acquired.set()
+
+
+def test_question_lock_coordinates_processes(tmp_path, monkeypatch):
+    import multiprocessing
+    from gradescope_mcp.tools.safety import question_write_lock
+
+    cache = str(tmp_path / "lock-cache")
+    monkeypatch.setenv("GRADESCOPE_MCP_CACHE_DIR", cache)
+    ctx = multiprocessing.get_context("spawn")
+    started = ctx.Event()
+    acquired = ctx.Event()
+    child = ctx.Process(target=_lock_worker, args=(cache, started, acquired))
+    try:
+        with question_write_lock("1", "2"):
+            with question_write_lock("1", "2"):  # Nested workflow calls stay reentrant.
+                child.start()
+                assert started.wait(5)
+                assert not acquired.wait(0.15)
+        assert acquired.wait(5)
+        child.join(5)
+        assert child.exitcode == 0
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(5)
+
+
+def test_journal_pagination_does_not_duplicate_full_grade_payload(monkeypatch):
+    p, _, _ = world(monkeypatch)
+    result = json.loads(operations.get_operation(p["operation_token"], False, 0, 1))
+    assert result["total_rows"] == 2 and result["next_offset"] == 1
+    assert "request" not in result and "payload" not in result["rows"][0]
+    detailed = json.loads(operations.get_operation(p["operation_token"], True, 1, 1))
+    assert detailed["rows"][0]["submission_id"] == "4"
+    assert "grades" not in detailed["request"] and set(detailed["snapshots"]) == {"4"}
