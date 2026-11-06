@@ -55,3 +55,67 @@ def serialized_write(*key: str, timeout: float = _WRITE_LOCK_TIMEOUT):
         yield
     finally:
         lock.release()
+
+
+# One lock domain for grading, rubric and grouping changes to a question.
+# Reentrant because a planned batch can invoke an existing single-grade tool.
+_question_locks = {}
+_question_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def question_write_lock(course_id, question_id):
+    from gradescope_mcp.cache import get_artifact_path
+    import fcntl
+    import os
+    import time
+
+    key = (str(course_id), str(question_id))
+    with _question_guard:
+        lock = _question_locks.setdefault(key, threading.RLock())
+    if not lock.acquire(timeout=_WRITE_LOCK_TIMEOUT):
+        raise WriteInProgressError('Question is being modified; retry later')
+    # Thread-local nesting avoids deadlocking on a second file descriptor.
+    held = getattr(_question_local, 'held', set())
+    fd = None
+    try:
+        if key not in held:
+            import hashlib
+            name = hashlib.sha256(repr(key).encode()).hexdigest()
+            path = get_artifact_path(f'question-lock-{name}')
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            deadline = time.monotonic() + _WRITE_LOCK_TIMEOUT
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise WriteInProgressError('Another MCP process is modifying this question')
+                    time.sleep(0.05)
+            _question_local.held = held | {key}
+        yield
+    finally:
+        if fd is not None:
+            _question_local.held = held
+            os.close(fd)
+        lock.release()
+
+
+_question_local = threading.local()
+
+
+def serialize_question_write(fn):
+    """Serialize confirmed mutations, preserving the original MCP signature."""
+    import functools
+    import inspect
+    signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        values = signature.bind(*args, **kwargs).arguments
+        if values.get('confirm_write') is not True:
+            return fn(*args, **kwargs)
+        with question_write_lock(values['course_id'], values['question_id']):
+            return fn(*args, **kwargs)
+    return wrapped

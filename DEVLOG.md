@@ -1009,3 +1009,7 @@ Gradescope returns weights such as "4.0"; numeric-only validation incorrectly bl
 Added tool_set_question_scoring (positive/negative, floor, ceiling; never sends weight), tool_set_question_grading_method (individual/manual/configured AI; optional all assignment leaf questions), and tool_create_answer_group (ungraded/ungrouped members only). Verified POST save_grading_options with string boolean flags and PATCH question assisted_grading_type contracts in the live frontend. Group creation POST and confirmed memberships POST are separate; partial outcomes report created IDs. All tools preview, require revision on confirmation, bind endpoints and verify read-back. Only read-only live inspection performed; no settings, rubric or grades changed.
 
 Validation: 988 offline tests passed. Actual zero-point question scoring and grading-method previews succeeded with no write requests. School stdio launcher handshake listed 43 tools including all three additions.
+
+## Lifecycle batch 1 — reliable grading
+
+Added snapshot-bound dry-run grade plans, calibration against human references, durable per-row journals, cooperative cancellation and safe resume/reconciliation. Unknown outcomes stop instead of replaying. Question grading/rubric/grouping mutations share a reentrant process and filesystem lock in the configured private cache. Existing clients using different cache roots still require external coordination. No live grade writes performed.

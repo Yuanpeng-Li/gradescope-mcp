@@ -19,6 +19,7 @@ from typing import Any, Iterable
 
 from bs4 import BeautifulSoup
 
+from gradescope_mcp.tools.safety import serialize_question_write
 from gradescope_mcp.auth import get_connection, AuthError
 from gradescope_mcp.tools.common import (
     escape_md_cell,
@@ -1382,6 +1383,7 @@ def _score_text(plan: dict, readback: dict | None, weight: Any) -> str:
     return text
 
 
+@serialize_question_write
 def apply_grade(
     course_id: str,
     question_id: str,
@@ -1947,6 +1949,7 @@ def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
     )
 
 
+@serialize_question_write
 def apply_grade_batch(
     course_id: str,
     question_id: str,
@@ -2272,6 +2275,7 @@ def _response_json(resp) -> tuple[bool, Any]:
         return False, None
 
 
+@serialize_question_write
 def create_rubric_item(
     course_id: str,
     question_id: str,
@@ -2765,6 +2769,7 @@ def _normalize_single_rubric_id(rubric_item_id: Any) -> str | None:
     return ids[0] if ids else None
 
 
+@serialize_question_write
 def update_rubric_item(
     course_id: str,
     question_id: str,
@@ -2892,6 +2897,7 @@ def update_rubric_item(
     return "\n".join(lines)
 
 
+@serialize_question_write
 def delete_rubric_item(
     course_id: str,
     question_id: str,

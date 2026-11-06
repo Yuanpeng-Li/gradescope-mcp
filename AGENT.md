@@ -13,7 +13,7 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 43 tools (24 read-only, 15 Gradescope writes, 4 local cache writes)
+- 48 tools (26 read-only, 16 Gradescope writes, 6 local cache writes)
 - 3 resources (1 static, 2 URI templates)
 - 7 prompts
 - Offline pytest suite (the current count is recorded in `DEVLOG.md`)
@@ -243,6 +243,10 @@ Grouped by annotation class. `tests/test_server_mcp.py` pins these sets.
 23. `tool_assess_submission_readiness`
 24. `tool_smart_read_submission`
 
+99. `tool_get_operation`
+
+99. `tool_calibrate_grade_plan`
+
 ### Gradescope writes
 `destructiveHint=true`, exactly the tools with `confirm_write`.
 `idempotentHint=false` for upload, outline additions, answer-group creation and rubric-item creation, true otherwise.
@@ -271,6 +275,8 @@ nothing is sent.
 42. `tool_set_question_grading_method`
 43. `tool_create_answer_group`
 
+99. `tool_execute_grade_plan`
+
 ### Local cache writes
 `readOnlyHint=false`, `destructiveHint=false`: they read Gradescope and
 write only to the private cache.
@@ -279,6 +285,10 @@ write only to the private cache.
 38. `tool_cache_relevant_pages`
 39. `tool_prepare_answer_key`
 40. `tool_export_lms_gradebook`
+
+99. `tool_prepare_grade_plan`
+
+99. `tool_cancel_operation`
 
 All tools are `openWorldHint=true`.
 
@@ -470,3 +480,9 @@ Outline weights returned as decimal strings (for example `"4.0"`) are normalized
 - `tests/test_question_settings.py`: question settings and manual grouping regressions.
 
 Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type="positive", ceiling=False (floor omitted to preserve it); confirm only after explicit user approval with expected_revision. Weight is never sent and must remain unchanged on read-back. Use `tool_set_question_grading_method` with method="individual" for per-student batch grading or method="groups" for manual grouping. apply_to_all previews every leaf question in the assignment and writes sequentially, so partial completion is possible. AI methods require previously configured answer regions. `tool_create_answer_group` accepts only explicitly ungraded, ungrouped Question Submission IDs; creation and membership are separate steps, and partial failures report the created group ID. Inspect before retrying. These tools do not submit rubric items or grades, but question settings can change existing computed scores. Live mutation behavior has not been tested.
+
+- `operations.py`: lifecycle implementation and regression coverage.
+
+- `tools/grading_plans.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_grading_plans.py`: lifecycle implementation and regression coverage.

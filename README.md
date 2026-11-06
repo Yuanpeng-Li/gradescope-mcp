@@ -106,7 +106,7 @@ can still race. No real assignment was mutated during this audit.
 
 ## Current Status
 
-- 43 MCP tools (24 read-only, 15 that write to Gradescope, 4 that only write
+- 48 MCP tools (26 read-only, 16 that write to Gradescope, 6 that only write
   to the private local cache)
 - 3 MCP resources (1 static resource, 2 URI templates)
 - 7 MCP prompts
@@ -172,6 +172,11 @@ the private local cache).
 ### Grading Read
 | Tool | Kind | Description |
 |------|------|-------------|
+| `tool_prepare_grade_plan` | local cache | Snapshot-bound dry-run grades and exact payloads |
+| `tool_execute_grade_plan` | write | Resumable approved grading with per-row journal |
+| `tool_get_operation` | read-only | Inspect operation status and uncertain outcomes |
+| `tool_cancel_operation` | local cache | Cooperatively stop future operation rows |
+| `tool_calibrate_grade_plan` | read-only | Compare proposed scores to human references |
 | `tool_set_question_scoring` | write | Positive/negative scoring, floor/ceiling; preserves zero weight |
 | `tool_set_question_grading_method` | write | Individual/manual or configured AI grouping; optional all assignment questions |
 | `tool_create_answer_group` | write | Create a manual group and confirm ungraded, ungrouped submissions |
@@ -275,6 +280,8 @@ submission is already graded) and repeats that call with
 - An optional ID that is blank or `null` means "not given".
 
 ### Numbers
+
+`tolerance` controls calibration error tolerance.
 - The number arguments (`point_adjustment`, `confidence`, `weight`,
   `expected_member_count`, and `point_adjustment` / `confidence` in batch
   rows) accept JSON numbers and numeric strings. `true` and `false` are
@@ -298,7 +305,7 @@ submission is already graded) and repeats that call with
   rather than read from a guessed column; unknown is not ungraded.
 
 ### Write safety
-- The tools with a `confirm_write` parameter (the `write` kind, 15 of
+- The tools with a `confirm_write` parameter (the `write` kind, 16 of
   them) are the only tools that change Gradescope data. With the default
   `confirm_write=False` they return a preview ("Write confirmation required
   ...") and change nothing.
@@ -927,3 +934,9 @@ Outline weights returned as decimal strings (for example `"4.0"`) are normalized
 - `tests/test_question_settings.py`: preview, zero-weight preservation, revisions and partial failures.
 
 Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type="positive", ceiling=False (floor omitted to preserve it); confirm only after explicit user approval with expected_revision. Weight is never sent and must remain unchanged on read-back. Use `tool_set_question_grading_method` with method="individual" for per-student batch grading or method="groups" for manual grouping. apply_to_all previews every leaf question in the assignment and writes sequentially, so partial completion is possible. AI methods require previously configured answer regions. `tool_create_answer_group` accepts only explicitly ungraded, ungrouped Question Submission IDs; creation and membership are separate steps, and partial failures report the created group ID. Inspect before retrying. These tools do not submit rubric items or grades, but question settings can change existing computed scores. Live mutation behavior has not been tested.
+
+- `operations.py`: lifecycle implementation and regression coverage.
+
+- `tools/grading_plans.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_grading_plans.py`: lifecycle implementation and regression coverage.

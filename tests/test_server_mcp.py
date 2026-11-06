@@ -32,6 +32,7 @@ ID_PARAMS = {
 
 # Tools that write to Gradescope (all have confirm_write).
 GRADESCOPE_WRITES = {
+    "tool_execute_grade_plan",
     "tool_upload_submission", "tool_set_extension", "tool_modify_assignment_dates",
     "tool_rename_assignment", "tool_update_autograder_image", "tool_apply_grade",
     "tool_apply_grade_batch", "tool_create_rubric_item", "tool_update_rubric_item",
@@ -40,6 +41,8 @@ GRADESCOPE_WRITES = {
 }
 # Workflow tools that write only to the private local cache.
 LOCAL_CACHE_WRITES = {
+    "tool_cancel_operation",
+    "tool_prepare_grade_plan",
     "tool_prepare_grading_artifact", "tool_cache_relevant_pages", "tool_prepare_answer_key",
     "tool_export_lms_gradebook",
 }
@@ -70,7 +73,7 @@ def test_registers_expected_tools_resources_and_prompts() -> None:
 
     tools, resources, templates, prompts = anyio.run(inventory)
 
-    assert len(tools) == 43
+    assert len(tools) == 48
     assert [r.uri for r in resources] == ["gradescope://courses"]
     assert sorted(t.uri_template for t in templates) == [
         "gradescope://courses/{course_id}/assignments",
@@ -118,7 +121,7 @@ def test_write_tool_preview_through_mcp_layer() -> None:
 
 def test_every_tool_has_complete_annotations() -> None:
     tools = _tools()
-    assert len(tools) == 43
+    assert len(tools) == 48
     for name, tool in tools.items():
         ann = tool.annotations
         assert ann is not None, name
@@ -575,6 +578,12 @@ def _sample(prop: str, schema: dict, defs: dict, counter: list[int]):
         return 2.5, 2.5
     if kind == "integer":
         return 4, 4
+    if kind == "object":
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict) and additional.get("type"):
+            value, expected = _sample(prop, additional, defs, counter)
+            return {"sample": value}, {"sample": expected}
+        return {}, {}
     if kind == "array":
         items = schema["items"]
         if "$ref" in items:

@@ -679,3 +679,19 @@ Use smart read as the normal grading-evidence entry point; readiness, page cache
 Outline weights returned as decimal strings (for example `"4.0"`) are normalized for preview/save and compared numerically on read-back, including subquestions. Existing saved crop proposals can be reused without changing their coordinates.
 
 Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type="positive", ceiling=False (floor omitted to preserve it); confirm only after explicit user approval with expected_revision. Weight is never sent and must remain unchanged on read-back. Use `tool_set_question_grading_method` with method="individual" for per-student batch grading or method="groups" for manual grouping. apply_to_all previews every leaf question in the assignment and writes sequentially, so partial completion is possible. AI methods require previously configured answer regions. `tool_create_answer_group` accepts only explicitly ungraded, ungrouped Question Submission IDs; creation and membership are separate steps, and partial failures report the created group ID. Inspect before retrying. These tools do not submit rubric items or grades, but question settings can change existing computed scores. Live mutation behavior has not been tested.
+
+`tool_prepare_grade_plan`: Snapshot-bound dry-run grades and exact payloads.
+
+`tool_execute_grade_plan`: Resumable approved grading with per-row journal.
+
+`tool_get_operation`: Inspect operation status and uncertain outcomes.
+
+`tool_cancel_operation`: Cooperatively stop future operation rows.
+
+`tool_calibrate_grade_plan`: Compare proposed scores to human references.
+
+- `operations.py`: lifecycle implementation and regression coverage.
+
+- `tools/grading_plans.py`: lifecycle implementation and regression coverage.
+
+- `tests/test_grading_plans.py`: lifecycle implementation and regression coverage.

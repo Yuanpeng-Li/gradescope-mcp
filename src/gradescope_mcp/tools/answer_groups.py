@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 
+from gradescope_mcp.tools.safety import serialize_question_write
 from gradescope_mcp.auth import AuthError, get_connection
 from gradescope_mcp.tools.common import (
     escape_md_cell,
@@ -740,6 +741,7 @@ def _grouping_overview_path(
     return None
 
 
+@serialize_question_write
 def grade_answer_group(
     course_id: str,
     question_id: str,

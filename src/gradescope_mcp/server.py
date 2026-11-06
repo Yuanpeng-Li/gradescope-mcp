@@ -59,6 +59,8 @@ from gradescope_mcp.tools.submissions import (
     get_assignment_graders,
 )
 from gradescope_mcp.tools.extensions import get_extensions, set_extension
+from gradescope_mcp.operations import get_operation, cancel_operation
+from gradescope_mcp.tools.grading_plans import prepare_grade_plan, execute_grade_plan, calibrate_grade_plan
 from gradescope_mcp.tools.question_settings import set_question_scoring, set_question_grading_method, create_answer_group
 from gradescope_mcp.tools.outline import update_assignment_outline
 from gradescope_mcp.tools.grading import (
@@ -761,6 +763,45 @@ def tool_get_assignment_graders(
         question_id: The question ID within the assignment.
     """
     return get_assignment_graders(course_id, question_id)
+
+
+@gs_tool(local_cache_write("Prepare a versioned grading plan"))
+def tool_prepare_grade_plan(course_id: GradescopeID, question_id: GradescopeID, grades: list[GradeRow]) -> str:
+    """Prepare up to 500 grades as a private local plan; no grades are sent.
+
+    Returns operation_token, request_digest, exact payloads and projected scores.
+    Show these to the user before executing. Blocked rows are never written.
+    """
+    return prepare_grade_plan(course_id, question_id, grades)
+
+
+@gs_tool(gradescope_write("Execute approved grading plan", idempotent=True))
+def tool_execute_grade_plan(operation_token: str, request_digest: str, confirm_write: bool = False) -> str:
+    """Execute/resume a displayed plan after explicit user approval.
+
+    confirm_write is not user approval. Snapshots and exact payloads are checked;
+    unknown outcomes stop the operation and are never blindly retried. Query the
+    operation after any interruption. Cancellation is cooperative between rows.
+    """
+    return execute_grade_plan(operation_token, request_digest, confirm_write)
+
+
+@gs_tool(read_only("Inspect operation state"))
+def tool_get_operation(operation_token: str) -> str:
+    """Read a private operation journal, including partial and unknown outcomes."""
+    return get_operation(operation_token)
+
+
+@gs_tool(local_cache_write("Request operation cancellation"))
+def tool_cancel_operation(operation_token: str) -> str:
+    """Stop future plan rows. In-flight writes may finish; this does not undo grades."""
+    return cancel_operation(operation_token)
+
+
+@gs_tool(read_only("Compare proposed grades with human references"))
+def tool_calibrate_grade_plan(operation_token: str, reference_scores: dict[str, Number], tolerance: Number = 0.5) -> str:
+    """Compare a sample of proposed scores to human references without writing."""
+    return calibrate_grade_plan(operation_token, reference_scores, tolerance)
 
 
 @gs_tool(gradescope_write("Set question scoring options", idempotent=True))

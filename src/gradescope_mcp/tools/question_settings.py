@@ -9,6 +9,7 @@ from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
+from gradescope_mcp.tools.safety import serialize_question_write
 from gradescope_mcp.auth import AuthError, get_connection
 from gradescope_mcp.tools.grading_ops import _load_question_rubric_context
 from gradescope_mcp.tools.grading_workflow import _fetch_assignment_questions
@@ -79,6 +80,7 @@ def _scoring(course_id, question_id):
     return ctx, state, url
 
 
+@serialize_question_write
 def set_question_scoring(
     course_id: str,
     question_id: str,
@@ -191,6 +193,7 @@ _METHODS = {
 }
 
 
+@serialize_question_write
 def set_question_grading_method(
     course_id: str,
     question_id: str,
@@ -293,6 +296,7 @@ def set_question_grading_method(
         return f"Error: {exc}. Accepted question updates: {json.dumps(completed)}. Inspect targets before retrying."
 
 
+@serialize_question_write
 def create_answer_group(
     course_id: str,
     question_id: str,
