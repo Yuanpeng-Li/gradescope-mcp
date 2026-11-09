@@ -6,6 +6,49 @@
 
 ---
 
+## Session 16 — 2026-10-06: Issue #14 (SSO cookie authentication)
+
+### What was done
+
+1. **Browser-session cookies instead of a password.** For accounts that sign
+   in through school SSO, `GRADESCOPE_COOKIE_HEADER` (a logged-in tab's
+   `Cookie` header) or `GRADESCOPE_SESSION_COOKIE` (the `_gradescope_session`
+   value) replaces the password login. `auth._cookie_login` sets the
+   cookies and fetches `/account` to verify them and read the CSRF token;
+   the expiry hook is installed as after a password login. The header is
+   parsed by hand (`auth.parse_cookie_header`), since `SimpleCookie` stops at
+   the first value it considers illegal.
+2. **Expiry without a loop.** A rejected or expired cookie is remembered by
+   fingerprint (`_dead_cookie`); until the configured cookie changes, calls
+   fail with `COOKIE_EXPIRED_MESSAGE` ("export a fresh one") without
+   contacting Gradescope, so `with_session_recovery`'s re-run returns that
+   error instead of logging in again.
+3. **Refresh and precedence.** `envfiles.CREDENTIAL_KEYS` includes the
+   cookie variables, so a cookie re-exported into `.env` applies on the next
+   call; ones set in the MCP client's `env` block still win over `.env`.
+4. **No secrets, no logout.** Cookie values are scrubbed from errors and
+   logs. `reset_connection()` never logs a cookie session out, which would
+   end the browser's session too.
+5. **`scripts/export_sso_cookie.py`.** Opens Chrome for the SSO login, waits
+   for manual confirmation by default (`--auto-detect` to save as soon as
+   the page looks logged in), and writes `GRADESCOPE_COOKIE_HEADER` to
+   `.env` atomically with mode 0600, replacing earlier cookie lines
+   (including `export`-prefixed ones) and never printing the value.
+
+### Not verified live
+
+The cookie login and its expiry handling are tested against an offline
+fake Gradescope only; what Gradescope's `/account` returns for an expired
+SSO session (redirect, login page or 401) is assumed to match what the
+password session's expiry detection already handles.
+
+### Current state
+
+- **39 tools** + **3 resources** + **7 prompts**
+- **964 automated tests** (`uv run pytest -q`), all passing
+
+---
+
 ## Session 15 — 2026-10-05: Issues #8 (credential refresh) and #7 (LMS gradebook CSV)
 
 ### What was done
