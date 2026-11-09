@@ -4,6 +4,7 @@
 
 **Let your AI assistant work with Gradescope safely: read courses, grade with rubrics, review regrades and manage assignments, with every write previewed and approved first.**
 
+[![Tests](https://github.com/Yuanpeng-Li/gradescope-mcp/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Yuanpeng-Li/gradescope-mcp/actions/workflows/tests.yml)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-v2-6E56CF)](https://github.com/modelcontextprotocol/python-sdk)
 [![uv](https://img.shields.io/badge/managed%20with-uv-DE5FE9?logo=uv&logoColor=white)](https://docs.astral.sh/uv/)
@@ -1075,6 +1076,7 @@ outside the repository. `OPERATIONS_LOGS/` is gitignored for that purpose.
 
 ```text
 gradescope-mcp/
+├── .github/workflows/tests.yml
 ├── .env.example
 ├── .gitignore
 ├── .python-version
@@ -1165,6 +1167,8 @@ gradescope-mcp/
 Issues and pull requests are welcome. Before opening a PR:
 
 1. Run `uv run pytest -q` and keep it green; it needs no Gradescope account.
+   GitHub Actions runs the same suite on Python 3.10 and 3.13 for every push
+   and pull request.
 2. New or renamed tools go into the [tool catalog](#-tool-catalog) above and
    the inventory in `AGENT.md`; the docs-consistency tests enforce this.
 3. Anything that changes Gradescope data must take `confirm_write`, return a
