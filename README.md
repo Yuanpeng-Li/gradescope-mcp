@@ -1,273 +1,349 @@
-# Gradescope MCP Server
+<div align="center">
+
+# 🎓 Gradescope MCP
+
+**Let your AI assistant work with Gradescope safely: read courses, grade with rubrics, review regrades and manage assignments, with every write previewed and approved first.**
+
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![MCP SDK](https://img.shields.io/badge/MCP%20SDK-v2-6E56CF)](https://github.com/modelcontextprotocol/python-sdk)
+[![uv](https://img.shields.io/badge/managed%20with-uv-DE5FE9?logo=uv&logoColor=white)](https://docs.astral.sh/uv/)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+[Quick start](#-quick-start) ·
+[Features](#-features) ·
+[Safety model](#-safety-model) ·
+[Tools](#-tool-catalog) ·
+[Configuration](#configuration) ·
+[Contributing](#-contributing)
+
+</div>
+
+---
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for
-[Gradescope](https://www.gradescope.com/) that exposes course management,
-grading, regrade review, statistics, and AI-assisted grading workflows to MCP
-clients.
+[Gradescope](https://www.gradescope.com/). It gives MCP clients such as Claude
+Code, Claude Desktop, Cursor or the MCP Inspector access to course management,
+grading, regrade review, statistics and AI-assisted grading workflows.
 
-The server is designed for instructors and TAs who want to use AI agents with
-real Gradescope data while keeping every write behind a preview and an
-explicit confirmation step.
+It is built for **instructors and TAs** who want an AI agent to work with real
+Gradescope data and still decide every change themselves.
 
-This repository also includes a reusable skill at
-`skills/gradescope-assisted-grading/SKILL.md` for human-approved grading
-workflows.
+> [!NOTE]
+> This is an independent, unofficial project. It is not affiliated with or
+> endorsed by Gradescope or Turnitin. It drives the same web endpoints the
+> Gradescope UI uses, so Gradescope changes can break individual tools.
 
+## ✨ Features
 
-## Architecture and capability audit
+|   |   |
+|---|---|
+| 📚 **Course & assignment discovery** | Courses, rosters, assignments, outlines (online and scanned PDF), submissions, extensions |
+| ✍️ **Rubric grading** | Grading context, crop-first smart reading, single and batch (≤ 50) grade writes with read-back |
+| 🧭 **Durable grade plans** | Evidence-bound plans, calibration against human scores, resumable execution with a per-row journal |
+| 🧩 **Answer groups** | Inspect AI clusters, create/merge groups, grade a whole group with membership guards |
+| 🔁 **Regrades** | List requests, read the student's message, respond and close |
+| 🛠️ **Assignment lifecycle** | Create/configure/copy assignments, edit outlines and crop regions, scoring and grading methods |
+| 🤖 **Autograder** | Status, build logs, results, Docker image and rerun plans |
+| 📊 **Review & export** | Progress, statistics, anomaly review, score export, Canvas/Brightspace gradebook CSV, archives |
+| 🛡️ **Safety first** | Preview before every write, revision checks, untrusted-text fencing, private local cache |
 
-The core is **inspect → read evidence → plan → preview → write → verify**.
-The public MCP registry in `server.py` is the source of truth; the existing tool
-names remain compatible. The layers have distinct responsibilities:
+**At a glance:** 74 MCP tools (34 read-only · 25 that write to Gradescope ·
+15 that only write to the private local cache), 3 MCP resources and
+7 MCP prompts, plus a ready-made
+[assisted-grading skill](#assisted-grading-skill).
 
-| Layer | Responsibility | Implementation |
-| --- | --- | --- |
-| MCP boundary | ID/type validation, annotations, error mapping, session recovery | `server.py` |
-| Connection | Login, credential refresh, HTTP deadlines, accepted-write tracking | `auth.py`, `envfiles.py` |
-| Shared data and writes | Outline editor parsing, per-object serialization, previews | `tools/outline_data.py`, `tools/safety.py` |
-| Domain operations | Courses, assignments, extensions, submissions, grading, rubric, groups, regrades | `tools/` |
-| Workflow | Answer key, evidence cache, readiness, grading artifacts | `tools/grading_workflow.py`, `cache.py` |
-| Guidance | Prompts and assisted-grading skill; these do not add backend APIs | MCP prompts, `skills/gradescope-assisted-grading/SKILL.md` |
+## 🚀 Quick start
 
-Use `uv run python -m gradescope_mcp.inspect` for an offline JSON inventory of
-installed versions, tool schemas, write classifications, resources and prompts.
-It reads the actual MCP registry and does not load `.env` or contact Gradescope.
-This avoids maintaining a second executable capability list.
+**Prerequisites:** Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
-### Which tools to use
+### 1. Install
 
-- Discovery: courses → assignments → outline; use the roster only when needed.
-- Grading: resolve question-submission IDs → smart read/context → rubric →
-  single/batch grade preview → approved write → progress/scores.
-- Assignment administration: dates, extensions, title, autograder image, outline.
-- Reporting: scores and statistics; LMS export produces an import file, not an
-  LMS synchronization request.
-- Workflow helpers are optional conveniences. Smart read is the normal entry;
-  readiness, page caching and full artifacts are lower-level choices, not four
-  mandatory steps for every submission. Prompts describe workflows; they do not
-  repeat the implementation of grading tools.
+```bash
+git clone https://github.com/Yuanpeng-Li/gradescope-mcp.git
+cd gradescope-mcp
+cp .env.example .env   # then put your Gradescope email and password in .env
+```
 
-### Lifecycle coverage and boundaries
+The server loads this `.env` automatically when it runs from the checkout (see
+[Configuration](#configuration)), so you don't have to copy your password into
+client config files.
 
-| Stage | Available | Boundary |
-| --- | --- | --- |
-| Assignment setup | Creation plans, editable settings, PDF template upload, composed assignment copy | Copy excludes student data, LMS links, autograder images and rubric group constraints |
-| Outline/rubric | Partial question patches, PDF crop overlays, identification regions, flat rubric export/import/copy | No automatic OCR-based region approval; review rendered pages |
-| Submissions | Scoped attachment/page downloads, ZIP, PDF count checks, reproducible sampling | Typed-only submissions may have no attachment; 25 MiB/file and 250 MiB/batch caps |
-| Grading | Local evidence-bound plans, calibration, snapshot checks, per-row journal, cancellation/resume | Cancellation does not undo in-flight writes; uncertain outcomes stop for review |
-| Grouping | Create, confirm, move/remove members, merge groups | Graded/unknown-state members are refused; no destructive reset |
-| Review | Progress, missing submissions, totals, bonus configuration, evidence/score archives | Mechanical checks are not proof of grading correctness |
-| Publication | Separate publish/unpublish and notification plans | Mail delivery is not proven by submission success |
-| Regrades/accommodations | Staff response/completion request, local override deletion/time limits | Reopening must be confirmed by backend read-back; inherited overrides are not edited here |
-| Autograder | Discovered configuration/build status/logs, ZIP plan, rerun form plan, result reads | No accessible programming assignment was available for live validation; a missing/ambiguous form is refused |
-| LMS | CSV exports plus posting to an already linked LMS resource and job polling | Does not create institutional LTI/SSO deployments or synchronize rosters |
-| Authentication | Native credentials and recovery | Interactive institutional SSO is not implemented |
+### 2. Connect your MCP client
 
-Start with assignment configuration, then prepare local plans, show their exact
-requests, obtain explicit approval and execute. Operation tokens and request
-digests bind execution to the reviewed plan. The operation journal distinguishes
-prepared, sending, verified/completed, accepted_unverified, unknown, stale,
-needs_review and cancelled states. Never interpret HTTP acceptance as completed
-mail delivery, a finished autograder run or a successful LMS job. Query journals
-and the corresponding read tool before retrying. No universal rollback is claimed.
+<details open>
+<summary><b>Claude Code</b></summary>
 
-Plan preparation returns a new local operation each time and is marked
-non-idempotent. Keep and reuse its token instead of preparing duplicate operations.
-A grade plan can store per-submission evidence references; unknown outcomes are
-reconciled against current grades and never blindly resent. The old direct grading
-tools remain compatible; planned execution is preferred for long agent workflows.
+```bash
+claude mcp add gradescope -- uv run --directory /path/to/gradescope-mcp python -m gradescope_mcp
+```
 
-Question write locks coordinate threads and MCP processes sharing the same private
-cache root. They cannot coordinate a web user or another cache root. These writes
-now require an accessible private cache even when their result is returned as text.
-Archives record outline, rubric and scoring fingerprints; freshness checks do not
-claim that historical exported scores are current. Workflow answer-key markdown
-remains an explicit cache; use versioned archives/plans for source-bound grading.
+</details>
 
-### Upstream audit on 2026-11-06
+<details>
+<summary><b>Claude Desktop / Cursor / any JSON-configured client</b></summary>
 
-- [gradescopeapi 1.8.1](https://pypi.org/project/gradescopeapi/) is still the latest
-  published version. The [upstream repository](https://github.com/nyuoss/gradescope-api)
-  main branch matched tag v1.8.1 when checked. No newer outline/grading API is
-  available there. Its `remove_student_extension` is still a `NotImplementedError`,
-  despite the README advertising extension removal.
-- [MCP SDK 2.3.0](https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.3.0)
-  replaces 2.2.0. The lockfile has been refreshed to compatible stable releases;
-  Python 3.10 support is retained by the resolver. Gradescope's browser endpoints
-  remain separate from the unofficial Python library's optional REST wrapper.
-- No new first-party general REST API was identified in the official material
-  checked. [Gradescope's supported LMS integrations](https://www.gradescope.com/help)
-  are not a drop-in replacement for session-based instructor operations.
+```json
+{
+  "mcpServers": {
+    "gradescope": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/gradescope-mcp", "python", "-m", "gradescope_mcp"]
+    }
+  }
+}
+```
 
-### Editing outlines
+You can also pass `GRADESCOPE_EMAIL` / `GRADESCOPE_PASSWORD` in an `env` block
+instead of using `.env`. Client configuration files store them in plain text,
+so keep such files private (this repository ignores `.mcp.json` and `.env`).
 
-Call `tool_update_assignment_outline` without `outline_json` to read the full
-editable tree and revision. Preserve existing IDs and fields. Submit the edited
-list as `outline_json` to preview, then pass `expected_revision` and
-`confirm_write=True` only after explicit approval of that payload.
+</details>
 
-PDF additions omit `id`; existing nodes retain `crop_rect_list`. Crop coordinates
-are percentages with one-based page numbers, for example
-`{"x1":10,"y1":10,"x2":90,"y2":30,"page_number":1}`. Name/ID regions are preserved.
-Online additions use unique **negative integer IDs** (-1, -2, ...), type
-`OnlineQuestion` or `QuestionGroup`, one-based `index`, and the enclosing group's
-`parent_id` (null at the top). Content blocks include
-`{"type":"text","value":"Question text"}` and
-`{"type":"explanation","value":"Reference answer"}`. Preserve other input blocks.
-Read-back verifies existing IDs as well as content. After a warning, inspect the
-outline before retrying. PDF revisions detect changes since the preview but the
-server offers no verified atomic precondition; external edits during a request
-can still race. No real assignment was mutated during this audit.
+<details>
+<summary><b>MCP Inspector (debugging)</b></summary>
 
-## Current Status
+```bash
+npx @modelcontextprotocol/inspector uv run python -m gradescope_mcp
+```
 
-- 74 MCP tools (34 read-only, 25 that write to Gradescope, 15 that only write
-  to the private local cache)
-- 3 MCP resources (1 static resource, 2 URI templates)
-- 7 MCP prompts
-- Python 3.10+
-- MCP Python SDK v2 (`mcp>=2.3,<3`, `MCPServer`) and `gradescopeapi>=1.8.1`
-- Package manager: `uv`
-- Offline test suite: `uv run pytest -q` (the current count is recorded in
-  `DEVLOG.md`)
+</details>
 
-## What The Project Provides
+### 3. Ask your agent
 
-### Read-oriented workflows
-- Course discovery and assignment listing
-- Assignment outline parsing for online and scanned-PDF assignments
-- Roster inspection with a custom HTML parser
-- Submission listing for multiple assignment types
-- Grading progress, rubric context, answer groups, regrades, and statistics
-- Workflow helpers that write grading artifacts, answer-key snapshots and
-  page images to a private per-user cache (see [Local cache](#local-cache);
-  the tools print the real path)
+```text
+List my Gradescope courses and show grading progress for "Midterm 1".
+Grade the ungraded submissions of question 3 with the rubric. Preview first.
+Review the open regrade requests for Homework 4 and draft responses.
+Export Midterm 1 scores as a Canvas gradebook CSV.
+```
 
-### Write-oriented workflows
-- Uploading submissions
-- Setting student extensions
-- Modifying assignment dates
-- Renaming assignments
-- Changing a programming assignment's autograder Docker image
-- Applying grades, one at a time or in batches
-- Creating, updating, and deleting rubric items
-- Batch grading answer groups
+## 🔒 Safety model
 
-Every tool that writes to Gradescope returns a preview unless it is called
-with `confirm_write=True`. See [Write safety](#write-safety).
+All work follows **inspect → read evidence → plan → preview → write → verify**:
 
-## Tool Inventory
+```mermaid
+flowchart LR
+    A[Inspect<br/>courses, outline, rubric] --> B[Read evidence<br/>smart read, pages]
+    B --> C[Plan<br/>grades or settings]
+    C --> D[Preview<br/>exact payload]
+    D -->|user approves| E[Write<br/>confirm_write=True]
+    E --> F[Verify<br/>read-back]
+    D -.->|user rejects| C
+```
 
-The Kind column matches the tool annotations clients see: `read-only`
+- **Nothing changes without a preview.** Every Gradescope write defaults to
+  `confirm_write=False` and returns exactly what it would send.
+- **Approval is explicit.** Previews tell the agent to show them to the user;
+  the prompts and the skill require the user's explicit approval. Write tools
+  carry `destructiveHint: true`, so a client can require a confirmation for
+  each call.
+- **Writes are verified.** Grades, rubric items, dates, extensions and
+  outlines are read back after writing, and mismatches are reported.
+- **Existing grades are protected.** Overwriting a graded submission requires
+  an explicit, per-row opt-in.
+- **Student text is fenced.** Typed answers and regrade messages are returned
+  as untrusted data blocks, never as instructions.
+- **Local artifacts stay private.** Page images and grading artifacts go to a
+  per-user cache with `0700`/`0600` permissions.
+
+See [How the tools behave](#how-the-tools-behave) for the full contract.
+
+## 🧰 Tool catalog
+
+The **Kind** column matches the tool annotations clients see: `read-only`
 (`readOnlyHint`), `write` (changes Gradescope data; `destructiveHint`, has
 `confirm_write`), or `local cache` (reads Gradescope, writes files only to
 the private local cache).
 
-### Courses And Assignments
+**Which tools to use**
+
+- **Discovery:** courses → assignments → outline; the roster only when needed.
+- **Grading:** resolve Question Submission IDs → smart read / context → rubric
+  → single or batch grade preview → approved write → progress and scores.
+  For long agent sessions, prefer a grade plan (prepare → calibrate → execute).
+- **Assignment administration:** dates, extensions, title, outline, scoring,
+  autograder.
+- **Reporting:** scores and statistics. LMS export produces an import file, not
+  an LMS synchronization request.
+- Workflow helpers are optional. Smart read is the normal entry; readiness,
+  page caching and full artifacts are lower-level choices, not four mandatory
+  steps for every submission.
+
+`uv run python -m gradescope_mcp.inspect` prints an offline JSON inventory of
+installed versions, tool schemas, write classifications, resources and prompts,
+straight from the live MCP registry (it does not load `.env` or contact
+Gradescope).
+
+<details>
+<summary><b>📚 Courses &amp; assignments</b> (6)</summary>
+
 | Tool | Kind | Description |
 |------|------|-------------|
 | `tool_list_courses` | read-only | List all courses grouped by role (instructor vs student) |
 | `tool_get_assignments` | read-only | List a course's assignments with dates; status and grade for student accounts (N/A for staff) |
 | `tool_get_assignment_details` | read-only | One assignment's name and dates (status and grade for student accounts) |
-| `tool_upload_submission` | write | Upload local files as a new submission from the logged-in account (path restrictions and success check below) |
-
-### Instructor / TA Management
-| Tool | Kind | Description |
-|------|------|-------------|
 | `tool_get_course_roster` | read-only | Roster grouped by role: name, email, SID, user ID, submission count, sections |
-| `tool_get_extensions` | read-only | Extensions for one assignment: dates as course-local time = UTC instant, plus other settings (e.g. time limit) |
-| `tool_set_extension` | write | Add or update one student's extension; other current settings are re-sent and kept; `timezone` for dates without an offset |
-| `tool_modify_assignment_dates` | write | Change release / due / late-due dates; omitted dates are kept |
-| `tool_rename_assignment` | write | Rename an assignment |
-| `tool_update_autograder_image` | write | Change a programming assignment's autograder Docker Hub image |
-| `tool_get_assignment_submissions` | read-only | Global Submission IDs with graded status, progress and late flag |
-| `tool_get_student_submission` | read-only | One student's typed answers (untrusted blocks), file and page links, per-question and total scores |
-| `tool_get_assignment_graders` | read-only | Staff who last graded a question's submissions, with counts (not the assigned graders) |
+| `tool_get_assignment_admin` | read-only | Settings, publication and form capabilities |
+| `tool_get_assignment_outline` | read-only | Question hierarchy (nested subparts), IDs, types, weights, prompt text; no rubric items |
 
-### Grading Read
+</details>
+
+<details>
+<summary><b>🛠️ Assignment setup &amp; configuration</b> (11)</summary>
+
 | Tool | Kind | Description |
 |------|------|-------------|
-| `tool_prepare_grade_plan` | local cache | Snapshot-bound dry-run grades and exact payloads |
-| `tool_execute_grade_plan` | write | Resumable approved grading with per-row journal |
-| `tool_get_operation` | read-only | Inspect operation status and uncertain outcomes |
-| `tool_cancel_operation` | local cache | Cooperatively stop future operation rows |
-| `tool_calibrate_grade_plan` | read-only | Compare proposed scores to human references |
-| `tool_get_assignment_admin` | read-only | Settings, publication and form capabilities |
 | `tool_prepare_assignment_plan` | local cache | Plan creation, configuration, template, publication, mail or linked LMS posting |
 | `tool_execute_assignment_plan` | write | Execute exact approved assignment plan once |
-| `tool_export_question_rubric` | read-only | Flat rubric export with source revision |
-| `tool_prepare_rubric_plan` | local cache | Prepare rubric import/copy/update/delete plan |
-| `tool_execute_rubric_plan` | write | Verified rubric changes with partial journal |
-| `tool_patch_assignment_outline` | write | Modify selected question fields preserving the rest |
-| `tool_preview_outline_regions` | local cache | Render PDF crop overlays |
-| `tool_inspect_submission_pdf` | read-only | Check PDF page counts and required pages |
-| `tool_download_submission_files` | local cache | Validated original attachments, page images and batch ZIP |
-| `tool_respond_regrade_request` | write | Staff reply and verified completion/reopen request |
-| `tool_modify_extension_options` | write | Edit time limits or delete local overrides |
-| `tool_set_answer_group_members` | write | Confirm/move/remove ungraded group members |
-| `tool_review_assignment` | read-only | Progress, missing work, score/bonus anomalies and publishing state |
-| `tool_sample_question_submissions` | read-only | Reproducible sample for human/agent calibration |
-| `tool_archive_assignment` | local cache | Private grading evidence/score ZIP with fingerprints |
-| `tool_check_archive_freshness` | read-only | Detect stale outline/rubric archives |
-| `tool_prepare_choice_bonus_plan` | local cache | Class-wide A/B/C tally and reviewed bonus plan |
 | `tool_prepare_assignment_clone` | local cache | Prepare copy of settings/template/outline/flat rubrics |
 | `tool_execute_assignment_clone` | write | Execute copy with partial journal and created assignment ID |
-| `tool_get_autograder_status` | read-only | Configuration choices and discovered build/log state |
-| `tool_prepare_autograder_plan` | local cache | Plan supported configuration or discovered rerun form |
-| `tool_execute_autograder_plan` | write | Submit approved build/rerun once; completion separate |
-| `tool_get_autograder_results` | read-only | Read available programming submission test results |
-| `tool_poll_operation` | local cache | Poll and record linked LMS grade-posting jobs |
-| `tool_merge_answer_groups` | write | Merge ungraded groups with membership verification |
+| `tool_rename_assignment` | write | Rename an assignment |
+| `tool_modify_assignment_dates` | write | Change release / due / late-due dates; omitted dates are kept |
+| `tool_update_assignment_outline` | write | Read editable JSON; preview and write PDF/online question trees, points, crops and content; requires revision |
+| `tool_patch_assignment_outline` | write | Modify selected question fields preserving the rest |
+| `tool_preview_outline_regions` | local cache | Render PDF crop overlays |
 | `tool_set_question_scoring` | write | Positive/negative scoring, floor/ceiling; preserves zero weight |
 | `tool_set_question_grading_method` | write | Individual/manual or configured AI grouping; optional all assignment questions |
-| `tool_create_answer_group` | write | Create a manual group and confirm ungraded, ungrouped submissions |
-| `tool_update_assignment_outline` | write | Read editable JSON; preview and write PDF/online question trees, points, crops and content; requires revision |
-| `tool_get_assignment_outline` | read-only | Question hierarchy (nested subparts), IDs, types, weights, prompt text; no rubric items |
-| `tool_export_assignment_scores` | read-only | Score export summary; `output_format="json"` returns every student with per-question scores |
-| `tool_get_grading_progress` | read-only | Per-question graded counts, numbered as in the outline |
-| `tool_get_submission_grading_context` | read-only | Rubric (IDs, applied state), score, typed answer, crop pages ±1; `output_format="json"` available |
-| `tool_get_question_rubric` | read-only | Rubric items and scoring type without a submission ID |
-| `tool_list_question_submissions` | read-only | Question Submission IDs; `filter` = `all` / `ungraded` / `graded` (`graded: null` rows, state unknown, appear only under `all`) |
-| `tool_get_student_submission_map` | read-only | Per-student map of question ID to Question Submission ID, keyed by email |
-| `tool_get_student_assignment_link` | read-only | Per-student whole-assignment submission URL, by name or `student_email` |
-| `tool_get_next_ungraded` | read-only | Grading context of the next ungraded submission of the same question |
 
-### Grading Write
+</details>
+
+<details>
+<summary><b>⏰ Extensions</b> (3)</summary>
+
+| Tool | Kind | Description |
+|------|------|-------------|
+| `tool_get_extensions` | read-only | Extensions for one assignment: dates as course-local time = UTC instant, plus other settings (e.g. time limit) |
+| `tool_set_extension` | write | Add or update one student's extension; other current settings are re-sent and kept; `timezone` for dates without an offset |
+| `tool_modify_extension_options` | write | Edit time limits or delete local overrides |
+
+</details>
+
+<details>
+<summary><b>📄 Submissions &amp; files</b> (10)</summary>
+
+| Tool | Kind | Description |
+|------|------|-------------|
+| `tool_get_assignment_submissions` | read-only | Global Submission IDs with graded status, progress and late flag |
+| `tool_get_student_submission` | read-only | One student's typed answers (untrusted blocks), file and page links, per-question and total scores |
+| `tool_get_student_assignment_link` | read-only | Per-student whole-assignment submission URL, by name or `student_email` |
+| `tool_get_student_submission_map` | read-only | Per-student map of question ID to Question Submission ID, keyed by email |
+| `tool_list_question_submissions` | read-only | Question Submission IDs; `filter` = `all` / `ungraded` / `graded` (`graded: null` rows, state unknown, appear only under `all`) |
+| `tool_sample_question_submissions` | read-only | Reproducible sample for human/agent calibration |
+| `tool_get_assignment_graders` | read-only | Staff who last graded a question's submissions, with counts (not the assigned graders) |
+| `tool_upload_submission` | write | Upload local files as a new submission from the logged-in account (path restrictions and success check below) |
+| `tool_download_submission_files` | local cache | Validated original attachments, page images and batch ZIP |
+| `tool_inspect_submission_pdf` | read-only | Check PDF page counts and required pages |
+
+</details>
+
+<details>
+<summary><b>🔍 Grading: read &amp; navigate</b> (9)</summary>
+
+| Tool | Kind | Description |
+|------|------|-------------|
+| `tool_get_submission_grading_context` | read-only | Rubric (IDs, applied state), score, typed answer, crop pages ±1; `output_format="json"` available |
+| `tool_get_next_ungraded` | read-only | Grading context of the next ungraded submission of the same question |
+| `tool_get_question_rubric` | read-only | Rubric items and scoring type without a submission ID |
+| `tool_get_grading_progress` | read-only | Per-question graded counts, numbered as in the outline |
+| `tool_smart_read_submission` | read-only | Crop-first reading plan: crop page, adjacent pages, other pages; typed answers for online questions |
+| `tool_assess_submission_readiness` | read-only | Report pre-read context (prompt, reference, rubric, crop, located student work); not grading confidence |
+| `tool_cache_relevant_pages` | local cache | Download a submission's page images (all pages by default; `include_all_pages=False` for crop pages and neighbours) and print the directory |
+| `tool_prepare_grading_artifact` | local cache | Write a question's grading artifact (prompt, scoring type, signed rubric, reference answer or rubric summary, crops, sample pages) and print its path |
+| `tool_prepare_answer_key` | local cache | Write an assignment-wide grading basis (prompts, instructor reference answers) and print its path |
+
+</details>
+
+<details>
+<summary><b>✍️ Grading: direct writes</b> (2)</summary>
+
 | Tool | Kind | Description |
 |------|------|-------------|
 | `tool_apply_grade` | write | Set one submission's rubric items, point adjustment and comment; an already graded submission needs `overwrite_graded`; reads the score back |
 | `tool_apply_grade_batch` | write | Grade up to 50 submissions of one question in one call; typed rows, a graded row skipped unless that row has `overwrite: true`, per-row read-back |
+
+</details>
+
+<details>
+<summary><b>🧭 Grade plans &amp; operations</b> (6)</summary>
+
+| Tool | Kind | Description |
+|------|------|-------------|
+| `tool_prepare_grade_plan` | local cache | Snapshot-bound dry-run grades and exact payloads |
+| `tool_calibrate_grade_plan` | read-only | Compare proposed scores to human references |
+| `tool_execute_grade_plan` | write | Resumable approved grading with per-row journal |
+| `tool_get_operation` | read-only | Inspect operation status and uncertain outcomes |
+| `tool_cancel_operation` | local cache | Cooperatively stop future operation rows |
+| `tool_poll_operation` | local cache | Poll and record linked LMS grade-posting jobs |
+
+</details>
+
+<details>
+<summary><b>📐 Rubrics</b> (6)</summary>
+
+| Tool | Kind | Description |
+|------|------|-------------|
+| `tool_export_question_rubric` | read-only | Flat rubric export with source revision |
+| `tool_prepare_rubric_plan` | local cache | Prepare rubric import/copy/update/delete plan |
+| `tool_execute_rubric_plan` | write | Verified rubric changes with partial journal |
 | `tool_create_rubric_item` | write | Create a rubric item (positive weight; ADD/DEDUCT shown in the preview) |
 | `tool_update_rubric_item` | write | Update an existing rubric item's description or weight |
 | `tool_delete_rubric_item` | write | Delete a rubric item (removes it from every submission) |
 
-### AI-Assisted / Workflow Helpers
-| Tool | Kind | Description |
-|------|------|-------------|
-| `tool_prepare_grading_artifact` | local cache | Write a question's grading artifact (prompt, scoring type, signed rubric, reference answer or rubric summary, crops, sample pages) and print its path |
-| `tool_assess_submission_readiness` | read-only | Report pre-read context (prompt, reference, rubric, crop, located student work); not grading confidence |
-| `tool_cache_relevant_pages` | local cache | Download a submission's page images (all pages by default; `include_all_pages=False` for crop pages and neighbours) and print the directory |
-| `tool_prepare_answer_key` | local cache | Write an assignment-wide grading basis (prompts, instructor reference answers) and print its path |
-| `tool_export_lms_gradebook` | local cache | Write the assignment's scores as a Canvas or Brightspace gradebook import CSV (fully graded scores only by default) and print its path |
-| `tool_smart_read_submission` | read-only | Crop-first reading plan: crop page, adjacent pages, other pages; typed answers for online questions |
+</details>
 
-### Answer Groups
+<details>
+<summary><b>🧩 Answer groups</b> (6)</summary>
+
 | Tool | Kind | Description |
 |------|------|-------------|
 | `tool_get_answer_groups` | read-only | AI-clustered answer groups with sizes, graded counts and inferred members |
 | `tool_get_answer_group_detail` | read-only | One group's members, crops and graded counts (confirmed and inferred) |
 | `tool_grade_answer_group` | write | Grade every member of one group; `overwrite_graded` + `expected_graded_ids` and `expected_member_count` guards |
+| `tool_create_answer_group` | write | Create a manual group and confirm ungraded, ungrouped submissions |
+| `tool_set_answer_group_members` | write | Confirm/move/remove ungraded group members |
+| `tool_merge_answer_groups` | write | Merge ungraded groups with membership verification |
 
-### Regrades
+</details>
+
+<details>
+<summary><b>🔁 Regrades</b> (3)</summary>
+
 | Tool | Kind | Description |
 |------|------|-------------|
 | `tool_get_regrade_requests` | read-only | Regrade requests with status ✅ completed / ⏳ pending / ❓ unknown |
 | `tool_get_regrade_detail` | read-only | Current score, adjustment, comment, rubric, pages, staff response and the student's message |
+| `tool_respond_regrade_request` | write | Staff reply and verified completion/reopen request |
 
-### Statistics
+</details>
+
+<details>
+<summary><b>🤖 Autograder</b> (5)</summary>
+
 | Tool | Kind | Description |
 |------|------|-------------|
+| `tool_get_autograder_status` | read-only | Configuration choices and discovered build/log state |
+| `tool_get_autograder_results` | read-only | Read available programming submission test results |
+| `tool_update_autograder_image` | write | Change a programming assignment's autograder Docker Hub image |
+| `tool_prepare_autograder_plan` | local cache | Plan supported configuration or discovered rerun form |
+| `tool_execute_autograder_plan` | write | Submit approved build/rerun once; completion separate |
+
+</details>
+
+<details>
+<summary><b>📊 Review, reporting &amp; export</b> (7)</summary>
+
+| Tool | Kind | Description |
+|------|------|-------------|
+| `tool_review_assignment` | read-only | Progress, missing work, score/bonus anomalies and publishing state |
 | `tool_get_assignment_statistics` | read-only | Assignment summary and per-question averages; flags low-scoring graded questions |
+| `tool_export_assignment_scores` | read-only | Score export summary; `output_format="json"` returns every student with per-question scores |
+| `tool_export_lms_gradebook` | local cache | Write the assignment's scores as a Canvas or Brightspace gradebook import CSV (fully graded scores only by default) and print its path |
+| `tool_prepare_choice_bonus_plan` | local cache | Class-wide A/B/C tally and reviewed bonus plan |
+| `tool_archive_assignment` | local cache | Private grading evidence/score ZIP with fingerprints |
+| `tool_check_archive_freshness` | read-only | Detect stale outline/rubric archives |
+
+</details>
 
 ## Resources
 
@@ -306,7 +382,119 @@ the batch is previewed again.
 submission is already graded) and repeats that call with
 `confirm_write=True` only after the user approves the preview.
 
-## How The Tools Behave
+## Assisted Grading Skill
+
+The repository ships one agent skill,
+[`gradescope-assisted-grading`](skills/gradescope-assisted-grading/SKILL.md),
+for human-approved grading workflows:
+
+- preview-first grading
+- rubric review before mutation
+- scanned exam grading
+- answer-group triage
+- explicit human approval before any grade write
+
+**Install.** Link (or copy) the skill directory into your client's skills
+directory. For Claude Code, personal skills live in `~/.claude/skills/<name>/`
+and project skills in `.claude/skills/<name>/` of the project you work in.
+
+```bash
+mkdir -p ~/.claude/skills
+ln -s "$(pwd)/skills/gradescope-assisted-grading" ~/.claude/skills/gradescope-assisted-grading
+# or copy it (re-copy after updating this repository):
+# cp -R skills/gradescope-assisted-grading ~/.claude/skills/
+```
+
+For other clients, put the directory wherever that client loads skills from.
+
+**Verify.**
+
+```bash
+ls ~/.claude/skills/gradescope-assisted-grading
+head -n 5 ~/.claude/skills/gradescope-assisted-grading/SKILL.md
+```
+
+In Claude Code, invoke it with `/gradescope-assisted-grading` or by asking
+"Use the gradescope-assisted-grading skill".
+
+## 🧭 Lifecycle coverage
+
+| Stage | Available | Boundary |
+| --- | --- | --- |
+| Assignment setup | Creation plans, editable settings, PDF template upload, composed assignment copy | Copy excludes student data, LMS links, autograder images and rubric group constraints |
+| Outline/rubric | Partial question patches, PDF crop overlays, identification regions, flat rubric export/import/copy | No automatic OCR-based region approval; review rendered pages |
+| Submissions | Scoped attachment/page downloads, ZIP, PDF count checks, reproducible sampling | Typed-only submissions may have no attachment; 25 MiB/file and 250 MiB/batch caps |
+| Grading | Local evidence-bound plans, calibration, snapshot checks, per-row journal, cancellation/resume | Cancellation does not undo in-flight writes; uncertain outcomes stop for review |
+| Grouping | Create, confirm, move/remove members, merge groups | Graded/unknown-state members are refused; no destructive reset |
+| Review | Progress, missing submissions, totals, bonus configuration, evidence/score archives | Mechanical checks are not proof of grading correctness |
+| Publication | Separate publish/unpublish and notification plans | Mail delivery is not proven by submission success |
+| Regrades/accommodations | Staff response/completion request, local override deletion/time limits | Reopening must be confirmed by backend read-back; inherited overrides are not edited here |
+| Autograder | Discovered configuration/build status/logs, ZIP plan, rerun form plan, result reads | No accessible programming assignment was available for live validation; a missing/ambiguous form is refused |
+| LMS | CSV exports plus posting to an already linked LMS resource and job polling | Does not create institutional LTI/SSO deployments or synchronize rosters |
+| Authentication | Native credentials and recovery | Interactive institutional SSO is not implemented |
+
+### Plans, operations and journals
+
+Start with assignment configuration, then prepare local plans, show their exact
+requests, obtain explicit approval and execute. Operation tokens and request
+digests bind execution to the reviewed plan. The operation journal distinguishes
+prepared, sending, verified/completed, accepted_unverified, unknown, stale,
+needs_review and cancelled states. Never interpret HTTP acceptance as completed
+mail delivery, a finished autograder run or a successful LMS job. Query journals
+and the corresponding read tool before retrying. No universal rollback is claimed.
+
+Plan preparation returns a new local operation each time and is marked
+non-idempotent. Keep and reuse its token instead of preparing duplicate operations.
+A grade plan can store per-submission evidence references; unknown outcomes are
+reconciled against current grades and never blindly resent. The direct grading
+tools remain available; planned execution is preferred for long agent workflows.
+
+Question write locks coordinate threads and MCP processes sharing the same private
+cache root. They cannot coordinate a web user or another cache root. These writes
+require an accessible private cache even when their result is returned as text.
+Archives record outline, rubric and scoring fingerprints; freshness checks do not
+claim that historical exported scores are current. Workflow answer-key markdown
+remains an explicit cache; use versioned archives/plans for source-bound grading.
+
+### Editing outlines
+
+Call `tool_update_assignment_outline` without `outline_json` to read the full
+editable tree and revision. Preserve existing IDs and fields. Submit the edited
+list as `outline_json` to preview, then pass `expected_revision` and
+`confirm_write=True` only after explicit approval of that payload.
+
+PDF additions omit `id`; existing nodes retain `crop_rect_list`. Crop coordinates
+are percentages with one-based page numbers, for example
+`{"x1":10,"y1":10,"x2":90,"y2":30,"page_number":1}`. Name/ID regions are preserved.
+Online additions use unique **negative integer IDs** (-1, -2, ...), type
+`OnlineQuestion` or `QuestionGroup`, one-based `index`, and the enclosing group's
+`parent_id` (null at the top). Content blocks include
+`{"type":"text","value":"Question text"}` and
+`{"type":"explanation","value":"Reference answer"}`. Preserve other input blocks.
+Read-back verifies existing IDs as well as content; outline weights returned as
+decimal strings (for example `"4.0"`) are compared numerically, including
+subquestions. After a warning, inspect the outline before retrying. PDF
+revisions detect changes since the preview but the server offers no verified
+atomic precondition; external edits during a request can still race.
+
+### Question scoring and grading method
+
+Zero-point bonus workflow: preview `tool_set_question_scoring` with
+`scoring_type="positive"`, `ceiling=False` (floor omitted to preserve it); confirm
+only after explicit user approval with `expected_revision`. Weight is never sent
+and must remain unchanged on read-back. Use `tool_set_question_grading_method`
+with `method="individual"` for per-student batch grading or `method="groups"` for
+manual grouping. `apply_to_all` previews every leaf question in the assignment
+and writes sequentially, so partial completion is possible. AI methods require
+previously configured answer regions. `tool_create_answer_group` accepts only
+explicitly ungraded, ungrouped Question Submission IDs; creation and membership
+are separate steps, and partial failures report the created group ID. These
+tools do not submit rubric items or grades, but question settings can change
+existing computed scores.
+
+## How the tools behave
+
+<sub>The precise contract for agents and client authors. `tests/test_docs_consistency.py` keeps this section in sync with the code.</sub>
 
 ### IDs
 - Every Gradescope ID parameter (`course_id`, `assignment_id`,
@@ -321,19 +509,16 @@ submission is already graded) and repeats that call with
 - An optional ID that is blank or `null` means "not given".
 
 ### Numbers
-
-`offset` and `limit` page operation journals (at most 100 rows per read).
-
-`value` sets time-limit values; `count` and `seed` control sampling; `points_a`, `points_b`, `points_c` set minority-game bonuses.
-
-`required_pages` lists one-based PDF pages to check.
-
-`tolerance` controls calibration error tolerance.
 - The number arguments (`point_adjustment`, `confidence`, `weight`,
   `expected_member_count`, and `point_adjustment` / `confidence` in batch
   rows) accept JSON numbers and numeric strings. `true` and `false` are
   rejected (`must be a number, not a boolean`) instead of being read as 1
   and 0. `expected_member_count` must be a whole number of at least 0.
+- Other number arguments: `offset` and `limit` page operation journals (at
+  most 100 rows per read); `value` sets time-limit values; `count` and `seed`
+  control sampling; `points_a`, `points_b`, `points_c` set minority-game
+  bonuses; `required_pages` lists one-based PDF pages to check; `tolerance`
+  controls calibration error tolerance.
 - A batch row's `overwrite` accepts only JSON `true`, `false` or `null`.
   Strings and numbers (`"yes"`, `"true"`, `1`) are rejected (`must be
   true, false or null`) instead of opting the row into an overwrite.
@@ -429,10 +614,10 @@ submission is already graded) and repeats that call with
   partial preview when they can't be read; the write refuses for the same
   reason. Preview and result name the course timezone the page reports
   (the IANA name, for example `America/Los_Angeles`; no DST abbreviation,
-  since the one Gradescope shows is only correct for today) and warn when the due date is synced from an LMS,
-  since a later sync may overwrite it. The result is verified by
-  re-reading the settings the same way, and requested values that were
-  already set are labelled as such.
+  since the one Gradescope shows is only correct for today) and warn when
+  the due date is synced from an LMS, since a later sync may overwrite it.
+  The result is verified by re-reading the settings the same way, and
+  requested values that were already set are labelled as such.
 - `tool_get_assignments` / `tool_get_assignment_details` show dates that
   Gradescope reports with a UTC offset with that offset (for example
   `2026-10-01 23:59 UTC-07:00`). `tool_get_assignments` names assignment
@@ -496,8 +681,9 @@ submission is already graded) and repeats that call with
   is re-read when the write runs, so a grade entered after the preview
   (for example by another grader) is protected too: the batch lists such
   rows under "Not written: already graded at write time", whatever the
-  other rows carry. The result names every grade it overwrote. A graded submission that already holds exactly the
-  requested grade is reported as such, and nothing is sent.
+  other rows carry. The result names every grade it overwrote. A graded
+  submission that already holds exactly the requested grade is reported as
+  such, and nothing is sent.
 - The grade is posted to the save URL of the grading page Gradescope
   serves. If that page belongs to another submission, nothing is sent:
   `tool_apply_grade` returns an Error, the batch preview refuses the batch,
@@ -576,10 +762,10 @@ Any other outcome is `❌ Upload not confirmed`, with the redirect target,
 the final page and any message Gradescope showed (an error message is
 quoted on its own line). A visible message that is not styled as an error
 or a success (a warning, a bare `role="alert"`) does not turn a confirmed
-upload into a failure: the success result quotes it under a ⚠️ line. A rejected upload that
-ends on an older submission is therefore not reported as a success. Check
-the assignment in Gradescope before uploading again, since every upload
-creates a new submission.
+upload into a failure: the success result quotes it under a ⚠️ line. A
+rejected upload that ends on an older submission is therefore not reported
+as a success. Check the assignment in Gradescope before uploading again,
+since every upload creates a new submission.
 
 ### Scoring direction
 - Gradescope questions use `positive` or `negative` scoring.
@@ -588,8 +774,8 @@ creates a new submission.
   `unknown (not reported by Gradescope; projections assume negative)`;
   JSON `scoring_type: null` plus `scoring_type_note`) instead of assuming a
   direction, and the grade previews warn that their projected scores
-  assume deduction. No tool can resolve it: ask the user or check the
-  question's scoring settings in Gradescope.
+  assume deduction. Ask the user or check the question's scoring settings
+  in Gradescope (`tool_set_question_scoring` can set it).
 - Rubric weights are positive numbers in both modes; the scoring type
   decides whether a checked item adds or deducts points. Negative weights
   are rejected unless `allow_negative=True` is passed deliberately.
@@ -713,7 +899,39 @@ the `.env`, or pass the variables through the client configuration.
 
 ## Architecture
 
-### Entry points
+```mermaid
+flowchart TB
+    Client["MCP client<br/>(Claude Code, Desktop, Inspector…)"] -- stdio --> Server
+    subgraph Server["gradescope-mcp"]
+        direction TB
+        S["server.py<br/>validation · annotations · error mapping · session recovery"]
+        T["tools/*<br/>domain operations, plans, workflow helpers"]
+        A["auth.py · envfiles.py<br/>login, timeouts, accepted-write tracking"]
+        C["cache.py · operations.py<br/>private cache, operation journals, locks"]
+        S --> T --> A
+        T --> C
+    end
+    A -- HTTPS --> GS[(Gradescope)]
+```
+
+| Layer | Responsibility | Implementation |
+| --- | --- | --- |
+| MCP boundary | ID/type validation, annotations, error mapping, session recovery | `server.py` |
+| Connection | Login, credential refresh, HTTP deadlines, accepted-write tracking | `auth.py`, `envfiles.py` |
+| Shared data and writes | Outline editor parsing, rubric normalization, per-object serialization, previews | `tools/outline_data.py`, `tools/rubric_data.py`, `tools/safety.py` |
+| Domain operations | Courses, assignments, extensions, submissions, grading, rubric, groups, regrades | `tools/` |
+| Plans and journals | Prepared operations, tokens, digests, per-row journals, cancellation | `operations.py`, `tools/*_plans.py` |
+| Workflow | Answer key, evidence cache, readiness, grading artifacts | `tools/grading_workflow.py`, `cache.py` |
+| Guidance | Prompts and assisted-grading skill; these do not add backend APIs | MCP prompts, `skills/gradescope-assisted-grading/SKILL.md` |
+
+The public MCP registry in `server.py` is the source of truth, and existing
+tool names stay compatible.
+
+<details>
+<summary><b>Entry points, runtime and modules</b></summary>
+
+**Entry points**
+
 - `src/gradescope_mcp/__main__.py`: `main()` loads the `.env` files (see
   [Configuration](#configuration)), sets up the private cache environment,
   configures logging, and runs the `MCPServer` (mcp v2) over stdio. The
@@ -725,154 +943,135 @@ the `.env`, or pass the variables through the client configuration.
   annotations, the title and the `isError` mapping. It also defines the
   argument types (`GradescopeID`, `Number`, `Count`) and the typed
   `GradeRow` batch rows.
+- `src/gradescope_mcp/inspect.py`: offline registry inventory.
 
-### Runtime
+**Runtime**
+
 - mcp v2 runs these sync tool functions on worker threads, so tool calls can
   run concurrently and pings are answered while a tool waits on Gradescope.
   A cancelled or timed-out call is not interrupted; its thread runs to the
-  end (see [Known Caveats](#known-caveats)).
-- `src/gradescope_mcp/auth.py`: one shared `GSConnection` behind a lock;
-  form-body login, failed-login cooldowns, `TimeoutHTTPAdapter` default
-  timeouts, a response hook that raises `SessionExpiredError` and counts the
-  writes Gradescope accepted during the call, and `with_session_recovery`,
-  which re-runs a call once after an expiry unless a write was accepted.
-- `src/gradescope_mcp/cache.py`: the private per-user cache root and safe
-  artifact writes.
-- `src/gradescope_mcp/envfiles.py`: which `.env` files are loaded, in what
-  precedence, and `refresh_credentials()`, which re-reads the credentials
-  from those files before each login attempt.
+  end (see [Known limitations](#-known-limitations)).
+- `auth.py`: one shared `GSConnection` behind a lock; form-body login,
+  failed-login cooldowns, `TimeoutHTTPAdapter` default timeouts, a response
+  hook that raises `SessionExpiredError` and counts the writes Gradescope
+  accepted during the call, and `with_session_recovery`, which re-runs a
+  call once after an expiry unless a write was accepted.
+- `cache.py`: the private per-user cache root and safe artifact writes.
+- `envfiles.py`: which `.env` files are loaded, in what precedence, and
+  `refresh_credentials()`, which re-reads the credentials from those files
+  before each login attempt.
+- `operations.py`: prepared operations, tokens, request digests, per-row
+  journals and cancellation shared by the plan/execute tools.
 
-### Tool modules
-- `tools/courses.py`: course listing and roster parsing
-- `tools/assignments.py`: assignment listing, date edits (and the shared
-  date parser), rename, autograder image
-- `tools/submissions.py`: uploads, submission listing, per-student
-  submission reads, grader discovery
-- `tools/extensions.py`: extension reads and writes
-- `tools/grading.py`: outline parsing, score exports, grading progress,
-  student submission links
-- `tools/grading_ops.py`: grading context, grade writes (single and batch),
-  rubric CRUD, question-submission discovery, navigation
-- `tools/grading_workflow.py`: grading artifacts, answer keys, readiness,
-  page caching, smart reading
-- `tools/answer_groups.py`: answer-group inspection and batch writes
-- `tools/regrades.py`: regrade listing and detail
-- `tools/statistics.py`: assignment statistics
-- `tools/lms_export.py`: Canvas / Brightspace gradebook import CSV export
-- `tools/common.py`: shared helpers (rubric-ID normalization, untrusted-text
-  blocks, markdown escaping, one-line display names, page selection)
-- `tools/safety.py`: write-preview messages and shared per-object write locks
-- `tools/outline_data.py`: shared PDF/online outline parser
-- `tools/outline.py`: revision-checked outline writes
-- `inspect.py`: offline registry inventory
-- `tests/test_outline.py`, `tests/test_inspect.py`: outline and inventory checks
+**Tool modules** (`src/gradescope_mcp/tools/`)
 
-## Quick Start
+| Module | Covers |
+| --- | --- |
+| `courses.py` | Course listing and roster parsing |
+| `assignments.py` | Assignment listing, date edits (and the shared date parser), rename, autograder image |
+| `assignment_admin.py` | Assignment settings, creation/configuration/publication plans |
+| `blueprints.py` | Assignment copy (settings, template, outline, flat rubrics) |
+| `extensions.py` | Extension reads, writes and options |
+| `submissions.py` | Uploads, submission listing, per-student submission reads, grader discovery |
+| `submission_files.py` | Attachment/page downloads, ZIP batches, PDF checks |
+| `grading.py` | Outline parsing, score exports, grading progress, student submission links |
+| `grading_ops.py` | Grading context, grade writes (single and batch), rubric CRUD, question-submission discovery, navigation |
+| `grading_plans.py` | Grade plans, calibration, resumable execution |
+| `grading_workflow.py` | Grading artifacts, answer keys, readiness, page caching, smart reading |
+| `rubric_data.py` | Pre-submission rubric normalization |
+| `rubric_plans.py` | Rubric export/import/copy plans |
+| `question_settings.py` | Scoring options, grading-method selection, manual answer-group creation |
+| `answer_groups.py` | Answer-group inspection, batch writes, membership and merges |
+| `regrades.py` | Regrade listing, detail and responses |
+| `outline_data.py` | Shared PDF/online outline parser |
+| `outline.py` | Revision-checked outline writes |
+| `pdf_regions.py` | PDF crop-region overlays |
+| `autograder.py` | Autograder status, results and plans |
+| `review.py` | Assignment review and sampling |
+| `post_grading.py` | Archives, freshness checks, bonus plans |
+| `statistics.py` | Assignment statistics |
+| `lms_export.py` | Canvas / Brightspace gradebook import CSV export |
+| `common.py` | Shared helpers (rubric-ID normalization, untrusted-text blocks, markdown escaping, one-line display names, page selection) |
+| `safety.py` | Write-preview messages and shared per-object write locks |
 
-### 1. Prerequisites
-- Python 3.10+
-- [uv](https://docs.astral.sh/uv/)
+</details>
 
-### 2. Install
+<details>
+<summary><b>Upstream compatibility (audited 2026-11-06)</b></summary>
+
+- [gradescopeapi 1.8.1](https://pypi.org/project/gradescopeapi/) is still the
+  latest published version; the [upstream repository](https://github.com/nyuoss/gradescope-api)
+  main branch matched tag v1.8.1 when checked. No newer outline/grading API is
+  available there. Its `remove_student_extension` is still a
+  `NotImplementedError`, despite the README advertising extension removal.
+- [MCP SDK 2.3.0](https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.3.0)
+  is the current minimum. The lockfile uses compatible stable releases, and
+  Python 3.10 support is retained.
+- No new first-party general REST API was identified in the official material
+  checked. [Gradescope's supported LMS integrations](https://www.gradescope.com/help)
+  are not a drop-in replacement for session-based instructor operations.
+
+</details>
+
+## 🚧 Known limitations
+
+1. Gradescope behavior differs across assignment types; several tools rely on
+   HTML parsing or reverse-engineered endpoints, and some write behavior
+   (for example how `save_many_grades` treats inferred members) can't be
+   verified offline. The tools choose the conservative option and say so.
+   The pages the date and group-grading writes read (the settings page's
+   due-date data, the group grade page's redirect to a group-mode
+   submission page) were checked read-only against a live account; the
+   writes themselves, and the question-settings and lifecycle writes, have
+   not been run against one.
+2. Roster parsing uses a custom parser because the upstream library parser is
+   unreliable when sections are present.
+3. Some assignment types do not support the extensions API even for staff
+   users, and removing an extension is not supported. `tool_set_extension`
+   refuses when the extensions page has neither the extensions table nor
+   an existing extension; if Gradescope renders such a page for an
+   assignment without extensions, add the first one in the web UI.
+4. Scanned assignments usually do not provide a structured answer key.
+5. Question grading requires Question Submission IDs, not assignment-level
+   Global Submission IDs.
+6. mcp runs each tool call on a worker thread and does not stop it when the
+   client cancels or times out. The call runs to the end (a batch writes
+   its remaining rows, at most 50) and the client never sees its result.
+   After a timed-out write, re-read the affected submissions or settings
+   before retrying.
+7. Date and extension writes are serialized only within one server process.
+   Each confirmed write re-reads the current settings, but a change made
+   elsewhere (another server process, the web UI) between that read and
+   the write can still be overwritten.
+8. Only email/password login is supported; institutional SSO is not.
+
+## 💻 Development
+
 ```bash
-git clone https://github.com/Yuanpeng-Li/gradescope-mcp.git
-cd gradescope-mcp
-cp .env.example .env
-```
-
-Then edit `.env` with your Gradescope credentials (and any optional
-settings).
-
-### 3. Run locally
-```bash
-uv run python -m gradescope_mcp
-```
-
-### 4. Configure an MCP client
-
-Example client configuration:
-
-```json
-{
-  "mcpServers": {
-    "gradescope": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/path/to/gradescope-mcp",
-        "python",
-        "-m",
-        "gradescope_mcp"
-      ],
-      "env": {
-        "GRADESCOPE_EMAIL": "your_email@example.com",
-        "GRADESCOPE_PASSWORD": "your_password"
-      }
-    }
-  }
-}
-```
-
-Credentials in a client configuration file are stored in plain text; keep
-that file private (this repository ignores `.mcp.json` and `.env`).
-
-### 5. Debug with MCP Inspector
-```bash
-npx @modelcontextprotocol/inspector uv run python -m gradescope_mcp
-```
-
-### 6. Run tests
-```bash
-uv run pytest -q
+uv sync                                   # install runtime + dev dependencies
+uv run pytest -q                          # offline test suite
+uv run python -m gradescope_mcp.inspect   # dump the live tool/resource/prompt registry
 ```
 
 The tests are offline: they use fakes, a per-test cache directory and no
-credentials.
+credentials. The current test count is recorded in `DEVLOG.md`.
 
-## Assisted Grading Skill
+| Document | Purpose |
+| --- | --- |
+| [`AGENT.md`](AGENT.md) | Developer guide: architecture, tool inventory and the rules for changing tools |
+| [`DEVLOG.md`](DEVLOG.md) | Implementation history, session by session |
+| [`SKILL.md`](skills/gradescope-assisted-grading/SKILL.md) | Agent-facing assisted-grading workflow |
 
-The repository includes one skill:
+`tests/test_docs_consistency.py` checks this README, `AGENT.md` and the skill
+against the registered tools, resources, prompts, parameters and environment
+variables, so adding or renaming a tool without updating the docs fails the
+suite.
 
-- `gradescope-assisted-grading`
+If you test writes against a real account, keep the log of those changes
+outside the repository. `OPERATIONS_LOGS/` is gitignored for that purpose.
 
-It is intended for:
-- preview-first grading
-- rubric review before mutation
-- scanned exam grading
-- answer-group triage
-- explicit human approval before any grade write
-
-### Install the skill
-
-Link (or copy) the skill directory into your client's skills directory. For
-Claude Code, personal skills live in `~/.claude/skills/<name>/` and project
-skills in `.claude/skills/<name>/` of the project you work in.
-
-```bash
-mkdir -p ~/.claude/skills
-ln -s "$(pwd)/skills/gradescope-assisted-grading" ~/.claude/skills/gradescope-assisted-grading
-```
-
-If you prefer copying (re-copy after updating this repository):
-
-```bash
-mkdir -p ~/.claude/skills
-cp -R skills/gradescope-assisted-grading ~/.claude/skills/
-```
-
-For other clients, put the directory wherever that client loads skills from.
-
-### Verify installation
-```bash
-ls ~/.claude/skills/gradescope-assisted-grading
-head -n 5 ~/.claude/skills/gradescope-assisted-grading/SKILL.md
-```
-
-In Claude Code, invoke it with `/gradescope-assisted-grading` or by asking
-"Use the gradescope-assisted-grading skill".
-
-## Project Structure
+<details>
+<summary><b>Project structure</b></summary>
 
 ```text
 gradescope-mcp/
@@ -895,127 +1094,93 @@ gradescope-mcp/
 │       ├── auth.py
 │       ├── cache.py
 │       ├── envfiles.py
+│       ├── inspect.py
+│       ├── operations.py
 │       ├── server.py
 │       └── tools/
 │           ├── __init__.py
 │           ├── answer_groups.py
+│           ├── assignment_admin.py
 │           ├── assignments.py
+│           ├── autograder.py
+│           ├── blueprints.py
 │           ├── common.py
 │           ├── courses.py
 │           ├── extensions.py
 │           ├── grading.py
 │           ├── grading_ops.py
+│           ├── grading_plans.py
 │           ├── grading_workflow.py
 │           ├── lms_export.py
+│           ├── outline.py
+│           ├── outline_data.py
+│           ├── pdf_regions.py
+│           ├── post_grading.py
+│           ├── question_settings.py
 │           ├── regrades.py
+│           ├── review.py
+│           ├── rubric_data.py
+│           ├── rubric_plans.py
 │           ├── safety.py
 │           ├── statistics.py
+│           ├── submission_files.py
 │           └── submissions.py
 └── tests/
     ├── conftest.py
     ├── test_answer_groups.py
+    ├── test_assignment_admin.py
     ├── test_assignments_and_grading_ops.py
     ├── test_auth.py
+    ├── test_autograder.py
+    ├── test_blueprints.py
     ├── test_common.py
     ├── test_dates_extensions_submissions.py
     ├── test_docs_consistency.py
     ├── test_extensions_and_answer_key.py
     ├── test_grading_ops_fixes.py
+    ├── test_grading_plans.py
     ├── test_grading_workflow.py
+    ├── test_inspect.py
+    ├── test_lifecycle_review.py
     ├── test_live_fixes.py
     ├── test_lms_export.py
+    ├── test_outline.py
     ├── test_p0_fixes.py
     ├── test_page_selection.py
+    ├── test_pdf_regions.py
+    ├── test_question_settings.py
     ├── test_read_side_fixes.py
     ├── test_round3_runtime.py
+    ├── test_rubric_plans.py
     ├── test_server_mcp.py
     ├── test_session_recovery.py
     ├── test_workflow_fixes.py
     └── test_write_safety.py
 ```
 
-## Development Notes
+</details>
 
-- `AGENT.md` summarizes the architecture and the rules for changing tools.
-- `DEVLOG.md` records the implementation history.
-- `tests/test_docs_consistency.py` checks this file, `AGENT.md` and the skill
-  against the registered tools, resources, prompts and environment
-  variables.
-- If you test writes against a real account, keep the log of those changes
-  outside the repository. `OPERATIONS_LOGS/` is gitignored for that purpose
-  and is not part of the repository.
+## 🤝 Contributing
 
-## Known Caveats
+Issues and pull requests are welcome. Before opening a PR:
 
-1. Gradescope behavior differs across assignment types; several tools rely on
-   HTML parsing or reverse-engineered endpoints, and some write behavior
-   (for example how `save_many_grades` treats inferred members) can't be
-   verified offline. The tools choose the conservative option and say so.
-   The pages the date and group-grading writes read (the settings page's
-   due-date data, the group grade page's redirect to a group-mode
-   submission page) were checked read-only against a live account; the
-   writes themselves have not been run against one.
-2. Roster parsing uses a custom parser because the upstream library parser is
-   unreliable when sections are present.
-3. Some assignment types do not support the extensions API even for staff
-   users, and removing an extension is not supported. `tool_set_extension`
-   refuses when the extensions page has neither the extensions table nor
-   an existing extension; if Gradescope renders such a page for an
-   assignment without extensions, add the first one in the web UI.
-4. Scanned assignments usually do not provide a structured answer key.
-5. Question grading requires Question Submission IDs, not assignment-level
-   Global Submission IDs.
-6. mcp runs each tool call on a worker thread and does not stop it when the
-   client cancels or times out. The call runs to the end (a batch writes
-   its remaining rows, at most 50) and the client never sees its result.
-   After a timed-out write, re-read the affected submissions or settings
-   before retrying.
-7. Date and extension writes are serialized only within one server process.
-   Each confirmed write re-reads the current settings, but a change made
-   elsewhere (another server process, the web UI) between that read and
-   the write can still be overwritten.
+1. Run `uv run pytest -q` and keep it green; it needs no Gradescope account.
+2. New or renamed tools go into the [tool catalog](#-tool-catalog) above and
+   the inventory in `AGENT.md`; the docs-consistency tests enforce this.
+3. Anything that changes Gradescope data must take `confirm_write`, return a
+   preview by default, and read the result back where practical (see
+   [Write safety](#write-safety) and the rules in `AGENT.md`).
+4. Treat student-authored text as untrusted and never log credentials.
 
-Outline weights returned as decimal strings (for example `"4.0"`) are normalized for preview/save and compared numerically on read-back, including subquestions. Existing saved crop proposals can be reused without changing their coordinates.
+Please report security problems (for example credential leakage) privately to
+the maintainer rather than in a public issue.
 
-- `tools/question_settings.py`: scoring options, grading-method selection and manual answer-group creation.
-- `tests/test_question_settings.py`: preview, zero-weight preservation, revisions and partial failures.
+## 🙏 Acknowledgements
 
-Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type="positive", ceiling=False (floor omitted to preserve it); confirm only after explicit user approval with expected_revision. Weight is never sent and must remain unchanged on read-back. Use `tool_set_question_grading_method` with method="individual" for per-student batch grading or method="groups" for manual grouping. apply_to_all previews every leaf question in the assignment and writes sequentially, so partial completion is possible. AI methods require previously configured answer regions. `tool_create_answer_group` accepts only explicitly ungraded, ungrouped Question Submission IDs; creation and membership are separate steps, and partial failures report the created group ID. Inspect before retrying. These tools do not submit rubric items or grades, but question settings can change existing computed scores. Live mutation behavior has not been tested.
+Built on the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
+and the community [`gradescopeapi`](https://github.com/nyuoss/gradescope-api)
+library.
 
-- `operations.py`: lifecycle implementation and regression coverage.
+## 📄 License
 
-- `tools/grading_plans.py`: lifecycle implementation and regression coverage.
-
-- `tests/test_grading_plans.py`: lifecycle implementation and regression coverage.
-
-- `tools/assignment_admin.py`: lifecycle implementation and regression coverage.
-
-- `tools/rubric_plans.py`: lifecycle implementation and regression coverage.
-
-- `tools/pdf_regions.py`: lifecycle implementation and regression coverage.
-
-- `tests/test_assignment_admin.py`: lifecycle implementation and regression coverage.
-
-- `tests/test_rubric_plans.py`: lifecycle implementation and regression coverage.
-
-- `tests/test_pdf_regions.py`: lifecycle implementation and regression coverage.
-
-- `tools/submission_files.py`: lifecycle implementation and regression coverage.
-
-- `tools/post_grading.py`: lifecycle implementation and regression coverage.
-
-- `tools/review.py`: lifecycle implementation and regression coverage.
-
-- `tests/test_lifecycle_review.py`: lifecycle implementation and regression coverage.
-
-- `tools/blueprints.py`: lifecycle implementation and regression coverage.
-
-- `tools/autograder.py`: lifecycle implementation and regression coverage.
-
-- `tests/test_autograder.py`: lifecycle implementation and regression coverage.
-
-- `tests/test_blueprints.py`: lifecycle implementation and regression coverage.
-
-- `tools/rubric_data.py`: pre-submission AssignmentRubric normalization.
-
-Final review hardening: cancellation propagates through assignment-copy child operations and is checked immediately before writes; all-question grading-method changes acquire question locks in a fixed order. Assignment settings reads use the same bare field names accepted by options, and PATCH sends only requested attributes. PDF template saves are verified against downloaded bytes when available; inability to verify remains explicit. Operation journals support paginated summaries and detailed row reads. Trusted-storage HTML submissions may be downloaded as inert files, while unexpected same-site HTML is rejected.
+[MIT](LICENSE) © 2026 Yuanpeng Li
