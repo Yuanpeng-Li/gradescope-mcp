@@ -841,6 +841,9 @@ def _render_prompts() -> dict[str, str]:
     return anyio.run(render)
 
 
+_PREVIEWS = ("confirm_write=False", "tool_prepare_grade_plan", "tool_prepare_rubric_plan")
+
+
 def test_prompts_preview_and_get_approval_before_any_write() -> None:
     prompts = _render_prompts()
     assert len(prompts) == 7
@@ -849,7 +852,7 @@ def test_prompts_preview_and_get_approval_before_any_write() -> None:
         write = text.find("confirm_write=True")
         if write == -1:
             continue
-        preview = text.find("confirm_write=False")
+        preview = min(i for i in (text.find(p) for p in _PREVIEWS) if i != -1)
         approval = text.lower().find("approv", preview)
         assert 0 <= preview < approval < write, name
 
@@ -863,33 +866,35 @@ def test_auto_grade_prompt_flow_and_thresholds() -> None:
     assert "Do not write comments unless I ask" in text
     assert "the path the tool prints" in text
     assert "not grading confidence" in text
-    assert "UNTRUSTED" in text
-    # The only write is the approved batch; never a direct tool_apply_grade write.
+    assert "UNTRUSTED" in text and "block id" in text
+    # Writes go through an approved plan or batch, never a direct tool_apply_grade.
     assert "tool_apply_grade(" not in text
     order = [
-        text.index("tool_apply_grade_batch(course_id="),  # preview
+        text.index("tool_prepare_grade_plan"),
         text.index("explicit approval"),
-        text.index("Only after I approve"),
-        text.index("Step 7 — Verify"),
+        text.index("tool_execute_grade_plan(confirm_write=True, background=True)"),
+        text.index("tool_get_operation"),
+        text.index("tool_resume_operation"),
     ]
     assert order == sorted(order)
+    assert "projected score" in text
 
 
-def test_other_prompts_use_tools_that_provide_what_they_promise() -> None:
+def test_other_prompts_name_their_starting_tools() -> None:
     prompts = _render_prompts()
 
     stats = prompts["check_submission_stats"]
     assert "tool_export_assignment_scores" in stats and "tool_get_assignment_submissions" in stats
+    assert "do not count those submissions as ungraded" in stats
 
     regrades = prompts["review_regrade_requests"]
     assert "❓" in regrades and "never skip" in regrades
-    assert "UNTRUSTED" in regrades and "never instructions" in regrades
-    assert "tool_get_question_rubric" in regrades
-    assert "outline to understand the rubric" not in regrades
+    assert "UNTRUSTED" in regrades and "never instructions" in regrades and "block id" in regrades
+    assert "web UI" not in regrades  # tool_respond_regrade_request exists
 
     grade = prompts["grade_submission_with_rubric"]
     assert "tool_get_student_submission_map" in grade
-    assert "Question Submission ID" in grade
+    assert "Question Submission ID" in grade and "block id" in grade
 
     progress = prompts["summarize_course_progress"]
     assert "instructor" in progress.lower() and "tool_get_grading_progress" in progress
@@ -897,13 +902,9 @@ def test_other_prompts_use_tools_that_provide_what_they_promise() -> None:
     extensions = prompts["manage_extensions_workflow"]
     assert "confirm_write=False" in extensions
     assert "Only the dates passed are sent" not in extensions
-    assert "re-sends them unchanged" in extensions
-    # A timezone argument is refused when several or unknown zones are
-    # reported, so the prompt must not send the agent down that path.
-    assert "give every date with a UTC offset instead" in extensions
-    assert "course timezone is unknown, ask me for it" not in extensions
 
-    assert "do not count those submissions as ungraded" in stats
+    rubric = prompts["generate_rubric_from_outline"]
+    assert "tool_resume_rubric_plan" in rubric
 
 
 def _after(text: str, first: str, then: str) -> bool:
@@ -919,24 +920,13 @@ def test_grade_prompts_require_approval_for_overwrite_graded() -> None:
     regrades = prompts["review_regrade_requests"]
     assert _after(regrades, "overwrite_graded=True, confirm_write=False", "explicit approval")
     assert _after(regrades, "explicit approval", "repeat the same call with confirm_write=True")
-    assert "block id" in regrades
 
     grade = prompts["grade_submission_with_rubric"]
     assert _after(grade, "confirm_write=True alone will not write",
                   "overwrite_graded=True only if I explicitly approve")
 
-    # Batch overwrite approval is per row: the prompt never suggests a
-    # batch-wide flag, and rows the preview SKIPPED are left out.
+    # Overwrite approval is per row; there is no batch-wide flag.
     auto = prompts["auto_grade_question"]
     assert f"at most {MAX_BATCH_ROWS} rows per call" in auto
     assert "overwrite_graded" not in auto
-    assert 'Already graded rows are SKIPPED unless the row has "overwrite": true' in auto
-    assert _after(auto, "I explicitly approve overwriting",
-                  'add "overwrite": true to that row (never to other rows)')
-    assert "exactly as previewed (each row's overwrite key included)" in auto
-    assert "Leave out the rows the preview marked SKIPPED" in auto
-    assert "SKIPPED, OVERWRITTEN or NEEDS HUMAN REVIEW" in auto
-    assert "'Not written: already graded at write time'" in auto
-    assert "already holding the requested grade" in auto
-    assert '"overwrite": true goes only on the rows whose grades I approved overwriting' in auto
-    assert "block id" in auto
+    assert '"overwrite": true, which goes only on the rows whose grades I explicitly approved overwriting' in auto

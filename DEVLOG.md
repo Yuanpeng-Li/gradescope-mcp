@@ -6,6 +6,32 @@
 
 ---
 
+## 2026-11-11: Codex review fixes and leaner agent guidance
+
+Codex review of the grading-feedback branch found four real problems, all fixed
+with regressions:
+- `tool_resume_rubric_plan` re-sent a create whose item was absent from the
+  rubric. Absence does not prove a timed-out POST failed (it may still land),
+  so a second POST could duplicate the item. Rows now journal `sent` before the
+  POST; an absent create is re-sent automatically only when `sent` is False,
+  otherwise it stops as needs_review unless `retry_unconfirmed_creates=True`.
+- The batch/single-grade read-back counted a write as verified without
+  `graded is True`; it now requires it, like grade plans.
+- `tool_list_courses` silently dropped courses linked in unrecognised markup
+  when other boxes parsed; such course IDs are now listed in a warning.
+- Rubric execute/resume now hold the operation run lock, so
+  `tool_get_operation` no longer calls a live rubric run abandoned, and its
+  "resume" hint names the resume tool for the operation's kind.
+
+Agent guidance: SKILL.md (779 → 205 lines) and the 7 MCP prompts (~19k → ~8k
+source chars) were rewritten for current agents: they keep the approval policy,
+safety invariants and Gradescope gotchas that the tool descriptions cannot
+convey, and drop step-by-step tool walkthroughs, parameter restatements and
+~100 lines of auto-generated junk. An audit pass compared old and new text and
+restored the few non-redundant rules the first cut lost.
+
+---
+
 ## 2026-11-11: Grading feedback — structuredContent, markup preflight, score check
 
 From a 127-student grading run's feedback.

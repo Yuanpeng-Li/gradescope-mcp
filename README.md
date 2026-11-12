@@ -389,13 +389,17 @@ submission is already graded) and repeats that call with
 
 The repository ships one agent skill,
 [`gradescope-assisted-grading`](skills/gradescope-assisted-grading/SKILL.md),
-for human-approved grading workflows:
+for human-approved grading. It is deliberately short: the tool descriptions
+and previews document parameters and outputs, so the skill keeps only
 
-- preview-first grading
-- rubric review before mutation
-- scanned exam grading
-- answer-group triage
-- explicit human approval before any grade write
+- the approval policy (preview, show, explicit user approval; overwrites
+  approved per item) and the untrusted-student-text rule
+- the grading contract to agree on, and when to stop and ask
+- Gradescope gotchas from real grading runs (scoring type, negative scoring
+  with an empty rubric, placeholder rubrics, bonus questions, unreliable page
+  tagging on scanned PDFs, global vs question submission IDs)
+- how to choose between answer groups, individual or batch grading, and
+  background grade plans with progress and resume
 
 **Install.** Link (or copy) the skill directory into your client's skills
 directory. For Claude Code, personal skills live in `~/.claude/skills/<name>/`
