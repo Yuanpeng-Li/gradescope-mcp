@@ -992,6 +992,7 @@ tool names stay compatible.
 | `post_grading.py` | Archives, freshness checks, bonus plans |
 | `statistics.py` | Assignment statistics |
 | `lms_export.py` | Canvas / Brightspace gradebook import CSV export |
+| `markup_check.py` | Advisory Markdown/KaTeX delimiter checks for text about to be written |
 | `common.py` | Shared helpers (rubric-ID normalization, untrusted-text blocks, markdown escaping, one-line display names, page selection) |
 | `safety.py` | Write-preview messages and shared per-object write locks |
 
@@ -1114,6 +1115,7 @@ gradescope-mcp/
 │           ├── grading_plans.py
 │           ├── grading_workflow.py
 │           ├── lms_export.py
+│           ├── markup_check.py
 │           ├── outline.py
 │           ├── outline_data.py
 │           ├── pdf_regions.py

@@ -188,6 +188,10 @@ simple CRUD wrappers.
   Regrade list/detail scraping.
 - `src/gradescope_mcp/tools/statistics.py`
   Assignment statistics.
+- `src/gradescope_mcp/tools/markup_check.py`
+  `math_markup_warnings`: advisory Markdown/KaTeX delimiter checks (doubled
+  `$$`, unclosed `$`, unbalanced braces) for comments and rubric text; never
+  blocks a write.
 - `src/gradescope_mcp/tools/lms_export.py`
   `export_lms_gradebook`: builds a Canvas or Brightspace gradebook import CSV
   from the assignment's `/scores` export and writes it to the private cache
