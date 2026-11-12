@@ -290,11 +290,22 @@ def test_batch_row_with_field_mismatch_needs_check(monkeypatch) -> None:
 def test_readback_problems_shape() -> None:
     plan = {"projected_score": 6.0}
 
-    assert grading_ops._readback_problems(plan, {"score": "6.0", "mismatches": []}) == []
+    ok = {"score": "6.0", "graded": True, "mismatches": []}
+    assert grading_ops._readback_problems(plan, ok) == []
     assert grading_ops._readback_problems(plan, {"error": "boom"}) == ["read-back failed: boom"]
     assert grading_ops._readback_problems(
-        {"projected_score": None}, {"score": 6.0, "mismatches": []}
+        {"projected_score": None}, {**ok, "score": 6.0}
     ) == ["score 6 could not be compared: no projected score (question weight unknown)"]
+
+
+@pytest.mark.parametrize("graded", [False, None, "true"])
+def test_readback_problems_require_graded_flag(graded) -> None:
+    """A matching score is not verified unless the page says graded=True."""
+    readback = {"score": 6.0, "mismatches": []}
+    if graded is not None:
+        readback["graded"] = graded
+    problems = grading_ops._readback_problems({"projected_score": 6.0}, readback)
+    assert len(problems) == 1 and "not show the submission as graded" in problems[0]
 
 
 def test_apply_grade_reports_verified_or_needs_check(monkeypatch) -> None:

@@ -253,3 +253,23 @@ def test_deep_course_links_are_not_course_boxes():
     )
     parsed = courses._parse_account_courses(soup)
     assert parsed["boxes"] == 0 and parsed["course_links"] == 0
+
+
+def test_course_links_in_unrecognised_markup_are_flagged_beside_parsed_ones(monkeypatch):
+    """One readable box must not hide another course in unfamiliar markup."""
+    body = page(
+        '<h2 class="pageHeading">Instructor Courses</h2><div class="courseList">'
+        + box("1", "A 1")
+        + '</div><div class="newCourseGrid">'
+        '<a class="tile" href="/courses/2"><span>B 2</span></a>'
+        '<a class="tile" href="/courses/1">again</a></div>'
+    )
+    text, _ = run(monkeypatch, {"/account": (200, body)})
+    assert "`1`" in text
+    assert "links course(s) `2` in a layout this parser does not recognise" in text
+    assert "`1` in a layout" not in text
+
+
+def test_fully_parsed_page_has_no_unmatched_warning(monkeypatch):
+    text, _ = run(monkeypatch, {"/account": (200, CLASSIC)})
+    assert "does not recognise" not in text

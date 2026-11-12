@@ -1413,8 +1413,9 @@ def _readback_problems(plan: dict, readback: dict | None) -> list[str]:
     """Why a saved grade is not verified by its read-back (``[]`` = verified).
 
     Verified means the grading page re-read after the save shows the rubric
-    items, point adjustment and comment that were sent (no ``mismatches``)
-    AND a score equal to the projected score. A failed read-back, a missing
+    items, point adjustment and comment that were sent (no ``mismatches``),
+    marks the submission graded (``graded is True``) AND shows a score equal
+    to the projected score. A failed read-back, a missing
     score or projection, or a score that differs from the projection (for
     example because the scoring direction was assumed) leaves the write
     saved but in need of a check.
@@ -1423,6 +1424,11 @@ def _readback_problems(plan: dict, readback: dict | None) -> list[str]:
     if readback.get("error"):
         return [f"read-back failed: {readback['error']}"]
     problems = list(readback.get("mismatches") or [])
+    if readback.get("graded") is not True:
+        problems.append(
+            "Gradescope does not show the submission as graded after the save "
+            f"(graded={readback.get('graded')!r})"
+        )
     projected = plan.get("projected_score")
     actual = _to_float(readback.get("score"))
     if actual is None:

@@ -1,6 +1,7 @@
 """Export, copy and reconcile flat rubric entries through approved plans."""
 
 import json
+from contextlib import contextmanager
 
 from gradescope_mcp import operations as ops
 from gradescope_mcp.auth import AuthError
@@ -127,6 +128,25 @@ def prepare_rubric_plan(
         return f"Error: {exc}"
 
 
+@contextmanager
+def _claimed(token):
+    """Hold the operation run lock, so get_operation reports an active run.
+
+    Raises ``OperationRunningError`` at once if another executor holds it.
+    """
+    handle = ops.acquire_run(token)
+    try:
+        yield
+    finally:
+        ops.release_run(handle)
+
+
+_ALREADY_RUNNING = (
+    "Error: This rubric operation is already running in another call; "
+    "poll it with tool_get_operation instead of starting it again."
+)
+
+
 def execute_rubric_plan(
     operation_token: str, request_digest: str, confirm_write: bool = False
 ) -> str:
@@ -145,7 +165,7 @@ def execute_rubric_plan(
                 ],
             )
         c, q = req["course_id"], req["question_id"]
-        with question_write_lock(c, q):
+        with _claimed(operation_token), question_write_lock(c, q):
             op = ops.load(operation_token)
             if op["status"] not in ("prepared", "completed"):
                 return (
@@ -159,6 +179,8 @@ def execute_rubric_plan(
             if _keyed(_rubric(c, q)) != _keyed(op["snapshots"]):
                 raise ValueError("Rubric changed since preview")
             return _run_rows(op, c, q, _keyed(op["snapshots"]))
+    except ops.OperationRunningError:
+        return _ALREADY_RUNNING
     except AuthError as exc:
         return f"Authentication error: {exc}"
     except Exception as exc:
@@ -166,7 +188,10 @@ def execute_rubric_plan(
 
 
 def resume_rubric_plan(
-    operation_token: str, request_digest: str, confirm_write: bool = False
+    operation_token: str,
+    request_digest: str,
+    confirm_write: bool = False,
+    retry_unconfirmed_creates: bool = False,
 ) -> str:
     """Continue an interrupted or stopped rubric plan without duplicating writes.
 
@@ -176,6 +201,14 @@ def resume_rubric_plan(
     again), an unapplied one is sent under the same pre-send freshness check
     and post-write verification as execution, and anything ambiguous (e.g.
     two matching new items, or unrelated changes) stops as needs_review.
+
+    A create whose item is absent is re-sent only when the journal proves the
+    earlier POST was never sent. If it may have been sent (timed out, crashed
+    mid-request), absence is not proof it failed: Gradescope may still be
+    processing it, and a second POST would create a duplicate. Such rows stop
+    as needs_review unless ``retry_unconfirmed_creates`` is True, which the
+    caller should pass only after re-reading the rubric and confirming with
+    the user that the item is still missing.
     """
     try:
         initial = ops.load(operation_token)
@@ -204,7 +237,7 @@ def resume_rubric_plan(
                 ],
             )
         c, q = req["course_id"], req["question_id"]
-        with question_write_lock(c, q):
+        with _claimed(operation_token), question_write_lock(c, q):
             op = ops.load(operation_token)
             if op["status"] == "completed":
                 return json.dumps(op)
@@ -229,7 +262,9 @@ def resume_rubric_plan(
             current = _keyed(_rubric(c, q))
             while start < len(rows) and rows[start].get("state") != "pending":
                 row = rows[start]
-                verdict, detail = _reconcile(row, model, current)
+                verdict, detail = _reconcile(
+                    row, model, current, retry_unconfirmed_creates
+                )
                 row["reconciled"] = verdict
                 if verdict == "review":
                     return _stop(op, row, start, detail)
@@ -243,6 +278,8 @@ def resume_rubric_plan(
                 _save(op, start)
                 start += 1
             return _run_rows(op, c, q, model, start)
+    except ops.OperationRunningError:
+        return _ALREADY_RUNNING
     except AuthError as exc:
         return f"Authentication error: {exc}"
     except Exception as exc:
@@ -293,7 +330,7 @@ def _apply(model, row) -> bool:
     return True
 
 
-def _reconcile(row, model, current):
+def _reconcile(row, model, current, retry_unconfirmed_creates=False):
     """Decide an uncertain row from the live rubric.
 
     Returns ("verified", created_id_or_None), ("send", None) when the row was
@@ -313,7 +350,13 @@ def _reconcile(row, model, current):
             return "review", f"{len(matches)} matching new items; cannot tell which one this plan created"
         if matches:
             return "verified", matches[0]
-        return "send", None
+        if row.get("sent") is False or retry_unconfirmed_creates:
+            return "send", None
+        return "review", (
+            "the create may already have been sent and the item is not in the "
+            "rubric yet; re-read the rubric later, and only if it is still "
+            "missing resume with retry_unconfirmed_creates=True"
+        )
     target = item["id"]
     rest_model = {k: v for k, v in model.items() if k != target}
     rest_current = {k: v for k, v in current.items() if k != target}
@@ -366,6 +409,7 @@ def _run_rows(op, c, q, expected, start=0):
             return json.dumps(op)
         item = row["item"]
         row["state"] = "sending"
+        row["sent"] = False
         op["status"] = "running"
         _save(op, index)
         before = _rubric(c, q)
@@ -375,6 +419,8 @@ def _run_rows(op, c, q, expected, start=0):
             _save(op, index)
             return json.dumps(op)
         try:
+            row["sent"] = True
+            _save(op, index)
             row["result"] = _send(c, q, row)
             after = _rubric(c, q)
             if row["action"] == "create":

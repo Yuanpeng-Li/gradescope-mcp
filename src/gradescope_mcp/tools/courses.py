@@ -95,11 +95,14 @@ def _parse_account_courses(soup: BeautifulSoup) -> dict:
     courses: list[dict] = []
     boxes = unreadable = 0
     seen: set[str] = set()
-    course_links = sum(
-        1
-        for a in soup.find_all("a", href=True)
-        if _COURSE_HREF_RE.match(str(a["href"]).strip())
-    )
+    link_ids: set[str] = set()
+    course_links = 0
+    for a in soup.find_all("a", href=True):
+        match = _COURSE_HREF_RE.match(str(a["href"]).strip())
+        if match:
+            course_links += 1
+            link_ids.add(match.group(1))
+    box_ids: set[str] = set()
     for tag in soup.find_all(True):
         classes = _classes(tag)
         if tag.name in ("h1", "h2", "h3") and "pageHeading" in classes:
@@ -110,6 +113,7 @@ def _parse_account_courses(soup: BeautifulSoup) -> dict:
         elif _is_course_box(tag):
             boxes += 1
             course_id = _COURSE_HREF_RE.match(str(tag["href"]).strip()).group(1)
+            box_ids.add(course_id)
             short = _text(tag.find(class_="courseBox--shortname"))
             if not short:
                 unreadable += 1
@@ -145,6 +149,9 @@ def _parse_account_courses(soup: BeautifulSoup) -> dict:
         "unreadable": unreadable,
         "course_links": course_links,
         "has_container": has_container,
+        # Course IDs linked on the page that no course box carries: markup
+        # this parser does not recognise, so those courses are not listed.
+        "unmatched_ids": sorted(link_ids - box_ids, key=int),
     }
 
 
@@ -229,6 +236,13 @@ def list_courses() -> str:
         lines.append(
             f"\n⚠️ {parsed['unreadable']} course box(es) on the account page "
             "had no readable course name and are not listed."
+        )
+    if parsed.get("unmatched_ids"):
+        ids = ", ".join(f"`{i}`" for i in parsed["unmatched_ids"])
+        lines.append(
+            f"\n⚠️ The account page also links course(s) {ids} in a layout this "
+            "parser does not recognise, so they are not listed above (role and "
+            f"name unknown). {direct}"
         )
     return "\n".join(lines)
 

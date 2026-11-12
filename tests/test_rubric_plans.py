@@ -168,16 +168,23 @@ def _two_creates():
     ])
 
 
-def _mark(p, index, state, status="running"):
+_UNSET = object()
+
+
+def _mark(p, index, state, status="running", sent=_UNSET):
     """Rewrite the journal as an interrupted run would have left it."""
     op = ops.load(p["operation_token"])
     op["status"] = status
     op["rows"][index]["state"] = state
+    if sent is not _UNSET:
+        op["rows"][index]["sent"] = sent
     ops.save(op)
 
 
-def _resume(p, confirm=True):
-    out = rp.resume_rubric_plan(p["operation_token"], p["request_digest"], confirm)
+def _resume(p, confirm=True, retry_unconfirmed=False):
+    out = rp.resume_rubric_plan(
+        p["operation_token"], p["request_digest"], confirm, retry_unconfirmed
+    )
     return json.loads(out) if out.startswith("{") else out
 
 
@@ -213,7 +220,7 @@ def test_create_failure_then_resume_reconciles_without_duplicate(rubric):
 
 def test_interrupted_create_that_never_reached_gradescope_is_sent(rubric):
     p = _two_creates()
-    _mark(p, 0, "sending")  # crashed before the request
+    _mark(p, 0, "sending", sent=False)  # crashed before the request
 
     result = _resume(p)
 
@@ -315,9 +322,40 @@ def test_applied_delete_is_verified_without_resend(rubric):
     assert result["status"] == "completed" and rubric.calls == [("delete", "3")]
 
 
+@pytest.mark.parametrize("state", ["sending", "unknown"])
+@pytest.mark.parametrize("sent", [True, _UNSET])
+def test_possibly_sent_create_absent_from_rubric_is_not_resent(rubric, state, sent):
+    """Absence is no proof a timed-out POST failed: it may still land."""
+    p = _two_creates()
+    _mark(p, 0, state, sent=sent)
+
+    blocked = _resume(p)
+
+    assert blocked["status"] == "needs_review" and rubric.calls == []
+    assert "retry_unconfirmed_creates=True" in blocked["rows"][0]["review_reason"]
+
+    # Only an explicit retry, after the user confirmed it is still missing.
+    result = _resume(p, retry_unconfirmed=True)
+    assert result["status"] == "completed"
+    assert rubric.calls == [("create", "New A"), ("create", "New B")]
+
+
+def test_possibly_sent_create_that_landed_late_is_reconciled(rubric):
+    p = _two_creates()
+    _mark(p, 0, "unknown", sent=True)
+    assert _resume(p)["status"] == "needs_review"
+
+    rubric.items.append({"id": "90", "description": "New A", "weight": 1.0})
+    result = _resume(p)
+
+    assert result["status"] == "completed"
+    assert result["rows"][0]["created_id"] == "90"
+    assert rubric.calls == [("create", "New B")]
+
+
 def test_stale_row_is_sent_only_once_the_rubric_matches_again(rubric):
     p = _two_creates()
-    _mark(p, 0, "stale", "needs_review")
+    _mark(p, 0, "stale", "needs_review", sent=False)
     rubric.items.append({"id": "70", "description": "Intruder", "weight": 1.0})
 
     blocked = _resume(p)
@@ -378,3 +416,38 @@ def test_prepare_reports_markup_warnings_without_blocking(rubric):
     clean = _plan([{"description": "Plain", "weight": 1}])
     assert clean["markup_warnings"] == {}
     assert ops.load(clean["operation_token"])["progress"]["pending"] == 1
+
+
+def test_running_rubric_operation_reports_executor_active(rubric, monkeypatch):
+    """Polling mid-write must not call a live rubric run abandoned."""
+    p = _two_creates()
+    seen = []
+    real_send = rp._send
+
+    def spying_send(c, q, row):
+        seen.append(json.loads(ops.get_operation(p["operation_token"])))
+        again = rp.execute_rubric_plan(p["operation_token"], p["request_digest"], True)
+        seen.append(again)
+        return real_send(c, q, row)
+
+    monkeypatch.setattr(rp, "_send", spying_send)
+    result = json.loads(
+        rp.execute_rubric_plan(p["operation_token"], p["request_digest"], True)
+    )
+
+    assert result["status"] == "completed"
+    polled = seen[0]
+    assert polled["status"] == "running" and polled["executor_active"] is True
+    assert "note" not in polled
+    assert seen[1].startswith("Error: This rubric operation is already running")
+    assert rubric.calls == [("create", "New A"), ("create", "New B")]
+    assert not ops.is_running(p["operation_token"])
+
+
+def test_abandoned_rubric_run_points_to_rubric_resume(rubric):
+    p = _two_creates()
+    _mark(p, 0, "sending", sent=False)
+    polled = json.loads(ops.get_operation(p["operation_token"]))
+    assert polled["executor_active"] is False
+    assert "tool_resume_rubric_plan" in polled["note"]
+    assert "tool_resume_operation " not in polled["note"]

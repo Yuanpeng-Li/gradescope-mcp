@@ -177,6 +177,14 @@ def create(kind, request, snapshots, rows):
     return plan
 
 
+# Kinds whose executors hold the run lock (so executor_active is meaningful)
+# and the tool that resumes each of them.
+_RESUME_TOOLS = {
+    "grade_plan": "tool_resume_operation",
+    "rubric": "tool_resume_rubric_plan",
+}
+
+
 def get_operation(
     operation_token: str,
     include_details: bool = False,
@@ -209,10 +217,15 @@ def get_operation(
             cancellation_requested=cancelled(operation_token),
             executor_active=is_running(operation_token),
         )
-        if plan.get("status") == "running" and not result["executor_active"]:
+        resume_tool = _RESUME_TOOLS.get(plan.get("kind"))
+        if (
+            resume_tool
+            and plan.get("status") == "running"
+            and not result["executor_active"]
+        ):
             result["note"] = (
                 "The journal says running but no executor holds this operation "
-                "(the server may have stopped). Use tool_resume_operation to "
+                f"(the server may have stopped). Use {resume_tool} to "
                 "reconcile uncertain rows and continue."
             )
         result["rows"] = (
