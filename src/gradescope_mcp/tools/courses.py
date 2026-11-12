@@ -23,46 +23,213 @@ def _assignment_count_text(value) -> str:
     return text or "N/A"
 
 
+# A course box links to the course home page: "/courses/123" (optionally
+# absolute or with a trailing slash). Deeper links are not course boxes.
+_COURSE_HREF_RE = re.compile(r"^(?:https?://[^/]+)?/courses/(\d+)/?(?:[?#].*)?$")
+
+_ROLE_TITLES = {
+    "instructor": "Instructor Courses",
+    "student": "Student Courses",
+    "other": "Other Courses",
+}
+
+
+def _classes(tag) -> list[str]:
+    value = tag.get("class") or []
+    return value.split() if isinstance(value, str) else list(value)
+
+
+def _text(tag) -> str:
+    return " ".join(tag.get_text(" ").split()) if tag is not None else ""
+
+
+def _role_for_heading(heading: str | None, has_create_button: bool) -> str:
+    """Map an account-page section heading to a role group.
+
+    Gradescope titles its sections "Instructor Courses", "Course Staff",
+    "Student Courses" and similar. Without any heading, fall back to the
+    "Create Course" button (only instructors see it); a page with neither
+    states no role, which is reported as "other" rather than guessed: a TA
+    has no Create Course button but is not a student.
+    """
+    if heading is None:
+        return "instructor" if has_create_button else "other"
+    text = heading.lower()
+    if "student" in text or "enrolled" in text:
+        return "student"
+    if any(
+        word in text
+        for word in ("instructor", "staff", "teaching", "reader", "grader")
+    ):
+        return "instructor"
+    return "other"
+
+
+def _is_course_box(tag) -> bool:
+    if tag.name != "a" or not _COURSE_HREF_RE.match(str(tag.get("href") or "").strip()):
+        return False
+    return (
+        "courseBox" in _classes(tag)
+        or tag.find(class_="courseBox--shortname") is not None
+    )
+
+
+def _parse_account_courses(soup: BeautifulSoup) -> dict:
+    """Parse the course boxes of a Gradescope account page.
+
+    Replaces gradescopeapi's ``get_courses_info``, which only found course
+    links that are ``<a>`` siblings after a term heading and decided
+    instructor vs student solely by the "Create Course" button, so a TA
+    without that button or a page whose boxes sit in other wrapper elements
+    could come back as a silent empty list.
+
+    Walks the page in document order, so each course box is attributed to
+    the nearest preceding section heading (``.pageHeading``) and term
+    (``.courseList--term``) whatever containers wrap it. Returns
+    ``{"courses": [...], "boxes": n, "unreadable": n, "course_links": n,
+    "has_container": bool}``.
+    """
+    has_create_button = soup.select_one(".js-createNewCourse") is not None
+    heading = None
+    term = None
+    courses: list[dict] = []
+    boxes = unreadable = 0
+    seen: set[str] = set()
+    course_links = sum(
+        1
+        for a in soup.find_all("a", href=True)
+        if _COURSE_HREF_RE.match(str(a["href"]).strip())
+    )
+    for tag in soup.find_all(True):
+        classes = _classes(tag)
+        if tag.name in ("h1", "h2", "h3") and "pageHeading" in classes:
+            heading = _text(tag) or None
+            term = None
+        elif "courseList--term" in classes:
+            term = _text(tag) or None
+        elif _is_course_box(tag):
+            boxes += 1
+            course_id = _COURSE_HREF_RE.match(str(tag["href"]).strip()).group(1)
+            short = _text(tag.find(class_="courseBox--shortname"))
+            if not short:
+                unreadable += 1
+                continue
+            if course_id in seen:
+                continue
+            seen.add(course_id)
+            assignments = tag.find(class_="courseBox--assignments")
+            courses.append(
+                {
+                    "id": course_id,
+                    "name": short,
+                    "full_name": _text(tag.find(class_="courseBox--name")),
+                    "term": term or "",
+                    "heading": heading or "",
+                    "role": _role_for_heading(heading, has_create_button),
+                    # The separator keeps "1 assignment" apart from a child
+                    # label such as "No Published Grades".
+                    "num_assignments": (
+                        _assignment_count_text(assignments.get_text("\n"))
+                        if assignments is not None
+                        else "N/A"
+                    ),
+                }
+            )
+    has_container = (
+        soup.select_one("#account-show") is not None
+        or soup.select_one(".courseList") is not None
+    )
+    return {
+        "courses": courses,
+        "boxes": boxes,
+        "unreadable": unreadable,
+        "course_links": course_links,
+        "has_container": has_container,
+    }
+
+
+def _fetch_account_courses(conn) -> dict | str:
+    """Fetch and parse the account page, falling back from /account to /.
+
+    Returns the parse result, or an error string for an HTTP failure.
+    """
+    base = conn.gradescope_base_url
+    parsed = None
+    for path in ("/account", "/"):
+        resp = conn.session.get(f"{base}{path}")
+        if resp.status_code != 200:
+            if parsed is not None:
+                break  # keep what /account gave
+            return (
+                f"Error: Unable to load the Gradescope account page {path} "
+                f"(HTTP {resp.status_code}); cannot list courses."
+            )
+        parsed = _parse_account_courses(BeautifulSoup(resp.text, "html.parser"))
+        if parsed["has_container"] or parsed["boxes"] or parsed["course_links"]:
+            break
+    return parsed
+
+
 def list_courses() -> str:
     """List all courses for the authenticated user.
 
-    Returns courses grouped by role (instructor vs student).
+    Returns courses grouped by role (instructor/staff vs student). Tells a
+    genuinely empty account apart from a page this parser could not read.
     """
     try:
         conn = get_connection()
-        courses = conn.account.get_courses()
+        parsed = _fetch_account_courses(conn)
     except AuthError as e:
         return f"Authentication error: {e}"
     except Exception as e:
         return f"Error fetching courses: {e}"
+    if isinstance(parsed, str):
+        return parsed
+
+    courses = parsed["courses"]
+    direct = (
+        "A known course ID can still be used directly with the other tools "
+        "(e.g. tool_get_assignments)."
+    )
+    if not courses:
+        if parsed["boxes"] or parsed["course_links"]:
+            return (
+                "Error: Could not parse the course list: the account page has "
+                f"{parsed['course_links']} course link(s) ({parsed['boxes']} "
+                f"course box(es), {parsed['unreadable']} without a readable "
+                "name), but none could be read. Gradescope's page layout may "
+                f"have changed. {direct}"
+            )
+        if not parsed["has_container"]:
+            return (
+                "Error: Could not parse the course list: the account page has "
+                f"no course list section (unexpected page). {direct}"
+            )
+        return f"No courses found for this account. {direct}"
 
     lines = []
-
-    instructor_courses = courses.get("instructor", {})
-    if instructor_courses:
-        lines.append("## Instructor Courses\n")
-        for course_id, course in instructor_courses.items():
-            lines.append(
-                f"- **{course.name}** ({course.full_name})\n"
-                f"  - ID: `{course_id}`\n"
-                f"  - Semester: {course.semester} {course.year}\n"
-                f"  - Assignments: {_assignment_count_text(course.num_assignments)}"
+    for role in ("instructor", "student", "other"):
+        group = [c for c in courses if c["role"] == role]
+        if not group:
+            continue
+        lines.append(("\n" if lines else "") + f"## {_ROLE_TITLES[role]}\n")
+        for course in group:
+            full = f" ({course['full_name']})" if course["full_name"] else ""
+            entry = (
+                f"- **{course['name']}**{full}\n"
+                f"  - ID: `{course['id']}`\n"
+                f"  - Semester: {course['term'] or 'N/A'}\n"
+                f"  - Assignments: {course['num_assignments']}"
             )
-
-    student_courses = courses.get("student", {})
-    if student_courses:
-        lines.append("\n## Student Courses\n")
-        for course_id, course in student_courses.items():
-            lines.append(
-                f"- **{course.name}** ({course.full_name})\n"
-                f"  - ID: `{course_id}`\n"
-                f"  - Semester: {course.semester} {course.year}\n"
-                f"  - Assignments: {_assignment_count_text(course.num_assignments)}"
-            )
-
-    if not lines:
-        return "No courses found for this account."
-
+            if role == "other":
+                section = course["heading"] or "not stated on the page"
+                entry += f"\n  - Section: {section}"
+            lines.append(entry)
+    if parsed["unreadable"]:
+        lines.append(
+            f"\n⚠️ {parsed['unreadable']} course box(es) on the account page "
+            "had no readable course name and are not listed."
+        )
     return "\n".join(lines)
 
 

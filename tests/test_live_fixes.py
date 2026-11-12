@@ -698,7 +698,11 @@ def test_list_courses_separates_the_assignment_count_from_the_grades_label(monke
     parsed = get_courses_info(BeautifulSoup(_account_page(), "html.parser"))
     # The upstream parser glues the texts together.
     assert parsed["instructor"]["111"].num_assignments == "1 assignmentNo Published Grades"
-    conn = SimpleNamespace(account=SimpleNamespace(get_courses=lambda: parsed))
+    # list_courses now parses the account page itself.
+    conn = SimpleNamespace(
+        gradescope_base_url="https://gs.test",
+        session=SimpleNamespace(get=lambda url, **kw: _page(_account_page())),
+    )
     monkeypatch.setattr(courses, "get_connection", lambda: conn)
 
     result = courses.list_courses()

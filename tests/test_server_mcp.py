@@ -40,6 +40,7 @@ GRADESCOPE_WRITES = {
     "tool_respond_regrade_request",
     "tool_patch_assignment_outline",
     "tool_execute_rubric_plan",
+    "tool_resume_rubric_plan",
     "tool_execute_assignment_plan",
     "tool_execute_grade_plan",
     "tool_upload_submission", "tool_set_extension", "tool_modify_assignment_dates",
@@ -91,7 +92,7 @@ def test_registers_expected_tools_resources_and_prompts() -> None:
 
     tools, resources, templates, prompts = anyio.run(inventory)
 
-    assert len(tools) == 74
+    assert len(tools) == 75
     assert [r.uri for r in resources] == ["gradescope://courses"]
     assert sorted(t.uri_template for t in templates) == [
         "gradescope://courses/{course_id}/assignments",
@@ -139,7 +140,7 @@ def test_write_tool_preview_through_mcp_layer() -> None:
 
 def test_every_tool_has_complete_annotations() -> None:
     tools = _tools()
-    assert len(tools) == 74
+    assert len(tools) == 75
     for name, tool in tools.items():
         ann = tool.annotations
         assert ann is not None, name

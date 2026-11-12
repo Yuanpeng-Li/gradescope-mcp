@@ -13,7 +13,7 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 74 tools (34 read-only, 25 Gradescope writes, 15 local cache writes)
+- 75 tools (34 read-only, 26 Gradescope writes, 15 local cache writes)
 - 3 resources (1 static, 2 URI templates)
 - 7 prompts
 - Offline pytest suite (the current count is recorded in `DEVLOG.md`)
@@ -301,50 +301,52 @@ nothing is sent.
 
 52. `tool_execute_rubric_plan`
 
-53. `tool_patch_assignment_outline`
+53. `tool_resume_rubric_plan`
 
-54. `tool_respond_regrade_request`
+54. `tool_patch_assignment_outline`
 
-55. `tool_modify_extension_options`
+55. `tool_respond_regrade_request`
 
-56. `tool_set_answer_group_members`
+56. `tool_modify_extension_options`
 
-57. `tool_execute_assignment_clone`
+57. `tool_set_answer_group_members`
 
-58. `tool_execute_autograder_plan`
+58. `tool_execute_assignment_clone`
 
-59. `tool_merge_answer_groups`
+59. `tool_execute_autograder_plan`
+
+60. `tool_merge_answer_groups`
 
 ### Local cache writes
 `readOnlyHint=false`, `destructiveHint=false`: they read Gradescope and
 write only to the private cache.
 
-60. `tool_prepare_grading_artifact`
-61. `tool_cache_relevant_pages`
-62. `tool_prepare_answer_key`
-63. `tool_export_lms_gradebook`
+61. `tool_prepare_grading_artifact`
+62. `tool_cache_relevant_pages`
+63. `tool_prepare_answer_key`
+64. `tool_export_lms_gradebook`
 
-64. `tool_prepare_grade_plan`
+65. `tool_prepare_grade_plan`
 
-65. `tool_cancel_operation`
+66. `tool_cancel_operation`
 
-66. `tool_prepare_assignment_plan`
+67. `tool_prepare_assignment_plan`
 
-67. `tool_prepare_rubric_plan`
+68. `tool_prepare_rubric_plan`
 
-68. `tool_preview_outline_regions`
+69. `tool_preview_outline_regions`
 
-69. `tool_download_submission_files`
+70. `tool_download_submission_files`
 
-70. `tool_archive_assignment`
+71. `tool_archive_assignment`
 
-71. `tool_prepare_choice_bonus_plan`
+72. `tool_prepare_choice_bonus_plan`
 
-72. `tool_prepare_assignment_clone`
+73. `tool_prepare_assignment_clone`
 
-73. `tool_prepare_autograder_plan`
+74. `tool_prepare_autograder_plan`
 
-74. `tool_poll_operation`
+75. `tool_poll_operation`
 
 All tools are `openWorldHint=true`.
 
@@ -398,6 +400,14 @@ All tools are `openWorldHint=true`.
   approval: prompts and the skill require a shown preview and explicit
   user approval first
 - Rubric updates and deletions are cascading operations
+- `tool_execute_rubric_plan` runs a plan once; a stopped plan continues only
+  through `tool_resume_rubric_plan`, which re-reads the rubric and reconciles
+  each uncertain row first (an already-created item is adopted by ID, never
+  created twice; ambiguity stops as `needs_review`). Rubric operation records
+  carry `progress` (total/verified/failed/pending/current_index)
+- `tool_list_courses` parses the account page itself (`courses._parse_account_courses`),
+  not gradescopeapi's `get_courses`; an unreadable page is an error, never
+  an empty list
 - Batch answer-group writes can affect many submissions at once, including
   inferred members; already-graded members need `overwrite_graded=True`
   plus the `expected_graded_ids` the preview printed (refused, nothing
@@ -480,6 +490,7 @@ Current test files:
 - `tests/test_inspect.py`
 - `tests/test_auth.py`
 - `tests/test_common.py`
+- `tests/test_course_list_parser.py`: offline account-page fixtures for `list_courses`.
 - `tests/test_dates_extensions_submissions.py`
 - `tests/test_docs_consistency.py`
 - `tests/test_extensions_and_answer_key.py`
