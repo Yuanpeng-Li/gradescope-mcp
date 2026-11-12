@@ -1391,3 +1391,45 @@ def test_dns_failure_then_expiry_still_reruns(monkeypatch):
         return "second"
 
     assert tool() == "second" and calls == [1, 1]
+
+
+def _proxy_wrapped(original):
+    """requests.ProxyError as HTTPAdapter.send builds it for a proxy failure."""
+    import requests
+    from urllib3.exceptions import MaxRetryError, ProxyError
+
+    reason = ProxyError("Unable to connect to proxy", original)
+    return requests.exceptions.ProxyError(MaxRetryError(None, "/x", reason=reason))
+
+
+@pytest.mark.parametrize(
+    "make, never_sent",
+    [
+        (lambda e: _proxy_wrapped(e.NewConnectionError(None, "refused")), True),
+        (lambda e: _proxy_wrapped(e.NameResolutionError("proxy", None, "dns")), True),
+        (lambda e: _proxy_wrapped(OSError("tunnel broke")), False),
+        (lambda e: _proxy_wrapped(e.ProtocolError("reset")), False),
+    ],
+)
+def test_proxy_wrapped_failures_classification(make, never_sent):
+    import urllib3.exceptions as e
+
+    assert auth._failed_before_sending(make(e)) is never_sent
+
+
+def test_refused_proxy_is_not_a_possible_write():
+    """Real HTTPAdapter conversion through an unreachable proxy."""
+    import socket
+
+    import requests
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    adapter = auth.TimeoutHTTPAdapter(default_timeout=(2, 2))
+    request = requests.Request("POST", "http://gs.test/x", data="a").prepare()
+    auth._reset_call_state()
+    with pytest.raises(requests.exceptions.ProxyError):
+        adapter.send(request, proxies={"http": f"http://127.0.0.1:{port}"})
+    assert auth._possible_writes_this_call() == 0
+    auth._reset_call_state()

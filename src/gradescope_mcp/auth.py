@@ -244,7 +244,9 @@ def _failed_before_sending(exc: BaseException) -> bool:
     requests wraps urllib3's connection-establishment errors
     (``ConnectTimeoutError`` and its subclasses ``NewConnectionError`` and
     ``NameResolutionError``: timeout, refused connection, DNS failure) in
-    ``ConnectTimeout`` or ``ConnectionError``, usually via ``MaxRetryError``.
+    ``ConnectTimeout`` or ``ConnectionError`` (``ProxyError`` through a
+    proxy), usually via ``MaxRetryError`` and, for a proxy, urllib3's
+    ``ProxyError.original_error``.
     Only an unbroken chain to such an error counts; anything else (a reset
     or read timeout after sending, an unknown error) may have been sent.
     Retries are off on these adapters (``max_retries`` 0), so the reported
@@ -258,6 +260,9 @@ def _failed_before_sending(exc: BaseException) -> bool:
             return True
         if isinstance(current, urllib3_exc.MaxRetryError):
             current = current.reason
+        elif isinstance(current, urllib3_exc.ProxyError):
+            # Through a proxy: the connection error is wrapped once more.
+            current = getattr(current, "original_error", None)
         elif isinstance(current, requests.exceptions.ConnectionError) and current.args:
             current = current.args[0]
         else:
