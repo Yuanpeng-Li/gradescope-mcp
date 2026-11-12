@@ -71,7 +71,7 @@ LOCAL_CACHE_WRITES = {
 # a repeat returns a different result: a repeated tool_delete_rubric_item finds
 # the item gone, a repeated tool_grade_answer_group without overwrite_graded is
 # refused because the members are now graded.
-NON_IDEMPOTENT = {'tool_prepare_grade_plan', 'tool_prepare_assignment_plan', 'tool_prepare_rubric_plan', 'tool_prepare_choice_bonus_plan', 'tool_prepare_assignment_clone', 'tool_prepare_autograder_plan', 'tool_archive_assignment', 'tool_download_submission_files', "tool_merge_answer_groups", "tool_create_answer_group", "tool_update_assignment_outline", "tool_upload_submission", "tool_create_rubric_item"}
+NON_IDEMPOTENT = {'tool_prepare_grade_plan', 'tool_prepare_assignment_plan', 'tool_prepare_rubric_plan', 'tool_prepare_choice_bonus_plan', 'tool_prepare_assignment_clone', 'tool_prepare_autograder_plan', 'tool_archive_assignment', 'tool_download_submission_files', "tool_merge_answer_groups", "tool_create_answer_group", "tool_update_assignment_outline", "tool_upload_submission", "tool_create_rubric_item", "tool_resume_rubric_plan"}
 
 
 def _tools() -> dict:

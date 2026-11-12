@@ -850,6 +850,18 @@ def run_with_call_state(fn: Callable[..., T], *args, **kwargs):
     return result, exc, state
 
 
+def count_possible_write() -> None:
+    """Record a write whose outcome is unknown as if Gradescope accepted it.
+
+    A request that raised (e.g. a read timeout) leaves no response, so
+    ``_note_write`` never counts it, yet Gradescope may still process it.
+    Calling this makes ``with_session_recovery`` refuse to re-run the call
+    after a later session expiry, which could otherwise send a
+    non-idempotent write (such as a rubric create) a second time.
+    """
+    _local.writes = getattr(_local, "writes", 0) + 1
+
+
 def merge_call_state(state: ThreadCallState) -> None:
     """Fold a helper thread's ``ThreadCallState`` into the current thread.
 

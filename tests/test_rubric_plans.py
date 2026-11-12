@@ -109,12 +109,15 @@ class FakeRubric:
         self.next_id = 100
         self.calls = []
         self.fail_after = set()  # actions that apply, then raise
+        self.fail_before = set()  # actions that raise without applying
 
     def read(self, *a):
         return copy.deepcopy(self.items)
 
     def create(self, c, q, description, weight, *a):
         self.calls.append(("create", description))
+        if "create" in self.fail_before:
+            raise RuntimeError("read timeout")
         self.next_id += 1
         self.items.append(
             {"id": str(self.next_id), "description": description, "weight": float(weight)}
@@ -451,3 +454,55 @@ def test_abandoned_rubric_run_points_to_rubric_resume(rubric):
     assert polled["executor_active"] is False
     assert "tool_resume_rubric_plan" in polled["note"]
     assert "tool_resume_operation " not in polled["note"]
+
+
+def test_failed_forced_retry_never_makes_a_later_resume_resend(rubric):
+    """'sent' is monotonic: a retry that fails again keeps the row possibly-sent."""
+    p = _two_creates()
+    _mark(p, 0, "unknown", sent=True)
+    rubric.fail_before = {"create"}
+
+    forced = _resume(p, retry_unconfirmed=True)
+    assert forced["status"] == "needs_review"
+    assert forced["rows"][0]["sent"] is True
+    assert rubric.calls == [("create", "New A")]
+
+    rubric.fail_before = set()
+    default = _resume(p)
+    assert default["status"] == "needs_review"
+    assert rubric.calls == [("create", "New A")]  # nothing sent again
+
+
+def test_legacy_row_without_sent_record_stays_possibly_sent(rubric):
+    p = _two_creates()
+    _mark(p, 0, "sending")  # older journal: no "sent" key
+    rubric.fail_before = {"create"}
+    _resume(p, retry_unconfirmed=True)
+    assert "sent" in ops.load(p["operation_token"])["rows"][0]
+    assert ops.load(p["operation_token"])["rows"][0]["sent"] is True
+
+
+def test_failed_send_blocks_session_recovery_replay(rubric):
+    """A request that raised may still land: count it so the call is not re-run."""
+    from gradescope_mcp import auth
+
+    p = _two_creates()
+    _mark(p, 0, "unknown", sent=True)
+    rubric.fail_before = {"create"}
+    auth._local.writes = 0
+    _resume(p, retry_unconfirmed=True)
+    assert auth._local.writes >= 1
+
+
+def test_resume_preview_flags_duplicate_risk_of_forced_retry(rubric):
+    p = _two_creates()
+    _mark(p, 0, "unknown", sent=True)
+    plain = rp.resume_rubric_plan(p["operation_token"], p["request_digest"], False)
+    forced = rp.resume_rubric_plan(
+        p["operation_token"], p["request_digest"], False, True
+    )
+    assert "retry_unconfirmed_creates=False" in plain
+    assert "DUPLICATE RISK" not in plain and "stops for review" in plain
+    assert "retry_unconfirmed_creates=True" in forced
+    assert "DUPLICATE RISK: create row(s) [0]" in forced
+    assert rubric.calls == []

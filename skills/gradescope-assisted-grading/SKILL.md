@@ -107,7 +107,10 @@ being skipped.
 - **Switching `scoring_type` after grading** can reset the question weight to
   0 under positive scoring, flips the meaning of every applied item (rename
   them) and inverts existing scores, which then need an approved overwrite
-  re-batch. Switching back restores the original scores without re-grading.
+  re-batch. Switching straight back restores the original scores only while
+  the original weights, applied items, adjustments and floor/ceiling are
+  untouched; after a re-batch, restore and verify each submission's original
+  state through an approved plan instead.
 - **Scanned-PDF page tagging is unreliable.** Students often tag the wrong
   pages. Read all pages (the page-cache default) until you have verified
   tagging for that assignment. If minus signs, decimals or exponents are

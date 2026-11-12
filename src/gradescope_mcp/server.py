@@ -970,7 +970,7 @@ def tool_execute_rubric_plan(operation_token: str, request_digest: str, confirm_
     return execute_rubric_plan(operation_token, request_digest, confirm_write)
 
 
-@gs_tool(gradescope_write("Resume an interrupted rubric plan", idempotent=True))
+@gs_tool(gradescope_write("Resume an interrupted rubric plan", idempotent=False))
 def tool_resume_rubric_plan(operation_token: str, request_digest: str, confirm_write: bool = False, retry_unconfirmed_creates: bool = False) -> str:
     """Resume a stopped rubric plan: skip verified rows, reconcile uncertain ones, send the rest.
 

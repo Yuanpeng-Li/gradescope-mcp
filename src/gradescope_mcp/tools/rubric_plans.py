@@ -4,7 +4,7 @@ import json
 from contextlib import contextmanager
 
 from gradescope_mcp import operations as ops
-from gradescope_mcp.auth import AuthError
+from gradescope_mcp.auth import AuthError, count_possible_write
 from gradescope_mcp.tools import grading_ops as grading
 from gradescope_mcp.tools.markup_check import markup_warnings_for
 from gradescope_mcp.tools.safety import question_write_lock, write_confirmation_required
@@ -222,15 +222,44 @@ def resume_rubric_plan(
             )
         if not confirm_write:
             open_rows = [
-                {"index": i, "action": r["action"], "state": r.get("state"), "item": r["item"]}
+                {
+                    "index": i,
+                    "action": r["action"],
+                    "state": r.get("state"),
+                    "possibly_sent_before": r.get("sent") is not False
+                    and r.get("state") != "pending",
+                    "item": r["item"],
+                }
                 for i, r in enumerate(initial["rows"])
                 if r.get("state") != "verified"
             ]
+            risky = [
+                r["index"]
+                for r in open_rows
+                if r["action"] == "create" and r["possibly_sent_before"]
+            ]
+            override = [f"retry_unconfirmed_creates={retry_unconfirmed_creates}"]
+            if retry_unconfirmed_creates and risky:
+                override.append(
+                    f"⚠️ DUPLICATE RISK: create row(s) {risky} may already have "
+                    "been sent. With retry_unconfirmed_creates=True, any of them "
+                    "not visible in the rubric is sent AGAIN. An item missing "
+                    "now does not prove the earlier request failed; if it lands "
+                    "later the rubric gets a duplicate. Get the user's explicit "
+                    "approval of this risk, not just of the item list."
+                )
+            elif risky:
+                override.append(
+                    f"Create row(s) {risky} may already have been sent; if their "
+                    "item is not in the rubric, resume stops for review instead "
+                    "of sending them again."
+                )
             return write_confirmation_required(
                 "resume_rubric_plan",
                 [
                     f"status={initial['status']}",
                     f"progress={json.dumps(_progress(initial))}",
+                    *override,
                     "rows to reconcile or send: " + json.dumps(open_rows),
                     f"operation_token={operation_token}",
                     f"request_digest={request_digest}",
@@ -408,8 +437,14 @@ def _run_rows(op, c, q, expected, start=0):
             _save(op, index)
             return json.dumps(op)
         item = row["item"]
+        # "sent" only ever goes False -> True. Only a row that was never
+        # attempted starts at False; a row that may have been sent before
+        # (True, or no record in an older journal) keeps that, so a failure
+        # on this attempt never lets a later resume believe the earlier
+        # request provably did not happen.
+        if row.get("state") == "pending" and "sent" not in row:
+            row["sent"] = False
         row["state"] = "sending"
-        row["sent"] = False
         op["status"] = "running"
         _save(op, index)
         before = _rubric(c, q)
@@ -442,6 +477,10 @@ def _run_rows(op, c, q, expected, start=0):
         except Exception as exc:
             row["state"] = "unknown"
             row["error"] = str(exc)
+            if row.get("sent"):
+                # The request may still land; never let session recovery
+                # replay this call and send it again.
+                count_possible_write()
         _save(op, index)
         if row["state"] != "verified":
             op["status"] = "needs_review"
