@@ -482,18 +482,6 @@ def test_legacy_row_without_sent_record_stays_possibly_sent(rubric):
     assert ops.load(p["operation_token"])["rows"][0]["sent"] is True
 
 
-def test_failed_send_blocks_session_recovery_replay(rubric):
-    """A request that raised may still land: count it so the call is not re-run."""
-    from gradescope_mcp import auth
-
-    p = _two_creates()
-    _mark(p, 0, "unknown", sent=True)
-    rubric.fail_before = {"create"}
-    auth._local.writes = 0
-    _resume(p, retry_unconfirmed=True)
-    assert auth._local.writes >= 1
-
-
 def test_resume_preview_flags_duplicate_risk_of_forced_retry(rubric):
     p = _two_creates()
     _mark(p, 0, "unknown", sent=True)

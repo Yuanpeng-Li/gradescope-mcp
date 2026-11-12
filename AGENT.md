@@ -107,7 +107,11 @@ simple CRUD wrappers.
     requests (not GET/HEAD/OPTIONS/TRACE) Gradescope answered with a 2xx in
     `_local.writes`; a write answered with a redirect stays
     `_local.pending_write` until the next response shows whether it hit an
-    expiry.
+    expiry. A write request that raises without any answer (read timeout,
+    reset after sending; not `ConnectTimeout`) is counted by
+    `TimeoutHTTPAdapter.send` in `_local.possible_writes`: Gradescope may
+    still apply it, so it blocks a re-run like an accepted write, and the
+    notice reports it separately ("N write request(s) got no answer").
   - `with_session_recovery(fn)` (applied by `gs_tool` / `gs_resource`) sees
     the flag and calls `reset_connection(expired=<that connection>)`. If no
     write was accepted during the call it re-runs the call once on a fresh

@@ -220,9 +220,19 @@ class TimeoutHTTPAdapter(HTTPAdapter):
     def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
         if timeout is None:
             timeout = self.default_timeout
-        return super().send(
-            request, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies
-        )
+        try:
+            return super().send(
+                request, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies
+            )
+        except requests.exceptions.ConnectTimeout:
+            raise  # never connected, so nothing was sent
+        except Exception:
+            # A write that got no answer (read timeout, reset after sending)
+            # may still be processed by the server. Record it so session
+            # recovery never re-runs the call and sends it a second time.
+            if str(request.method or "GET").upper() not in _SAFE_METHODS:
+                _local.possible_writes = getattr(_local, "possible_writes", 0) + 1
+            raise
 
 
 def _default_timeout() -> tuple[float, float]:
@@ -806,6 +816,7 @@ class _Attempt(NamedTuple):
     result: Any
     exc: BaseException | None
     writes: int  # writes Gradescope accepted during the run (see ``_local``)
+    possible_writes: int = 0  # writes sent that got no answer (outcome unknown)
 
 
 def _writes_this_call() -> int:
@@ -813,9 +824,15 @@ def _writes_this_call() -> int:
     return getattr(_local, "writes", 0) + (1 if getattr(_local, "pending_write", False) else 0)
 
 
+def _possible_writes_this_call() -> int:
+    """Writes sent during the current call that got no answer at all."""
+    return getattr(_local, "possible_writes", 0)
+
+
 def _reset_call_state() -> None:
     _local.expired = None
     _local.writes = 0
+    _local.possible_writes = 0
     _local.pending_write = False
 
 
@@ -824,6 +841,7 @@ class ThreadCallState(NamedTuple):
 
     expired: Any  # the connection whose session expired, or None
     writes: int  # writes Gradescope accepted on the helper thread
+    possible_writes: int = 0  # writes sent there that got no answer
 
 
 def run_with_call_state(fn: Callable[..., T], *args, **kwargs):
@@ -845,21 +863,11 @@ def run_with_call_state(fn: Callable[..., T], *args, **kwargs):
         result = fn(*args, **kwargs)
     except BaseException as e:  # handed back to the caller, which re-raises
         exc = e
-    state = ThreadCallState(getattr(_local, "expired", None), _writes_this_call())
+    state = ThreadCallState(
+        getattr(_local, "expired", None), _writes_this_call(), _possible_writes_this_call()
+    )
     _reset_call_state()
     return result, exc, state
-
-
-def count_possible_write() -> None:
-    """Record a write whose outcome is unknown as if Gradescope accepted it.
-
-    A request that raised (e.g. a read timeout) leaves no response, so
-    ``_note_write`` never counts it, yet Gradescope may still process it.
-    Calling this makes ``with_session_recovery`` refuse to re-run the call
-    after a later session expiry, which could otherwise send a
-    non-idempotent write (such as a rubric create) a second time.
-    """
-    _local.writes = getattr(_local, "writes", 0) + 1
 
 
 def merge_call_state(state: ThreadCallState) -> None:
@@ -874,6 +882,10 @@ def merge_call_state(state: ThreadCallState) -> None:
         _local.expired = state.expired
     if state.writes:
         _local.writes = getattr(_local, "writes", 0) + state.writes
+    if state.possible_writes:
+        _local.possible_writes = (
+            getattr(_local, "possible_writes", 0) + state.possible_writes
+        )
 
 
 def current_expired_connection() -> Any:
@@ -892,20 +904,43 @@ def _call_tracking_expiry(fn, args, kwargs) -> _Attempt:
     except SessionExpiredError as exc:
         expired = getattr(_local, "expired", None)
         return _Attempt(
-            _EXPIRED_UNKNOWN if expired is None else expired, None, exc, _writes_this_call()
+            _EXPIRED_UNKNOWN if expired is None else expired,
+            None,
+            exc,
+            _writes_this_call(),
+            _possible_writes_this_call(),
         )
     except Exception as exc:
         expired = getattr(_local, "expired", None)
         if expired is None:
             raise
-        return _Attempt(expired, None, exc, _writes_this_call())
-    return _Attempt(getattr(_local, "expired", None), result, None, _writes_this_call())
+        return _Attempt(expired, None, exc, _writes_this_call(), _possible_writes_this_call())
+    return _Attempt(
+        getattr(_local, "expired", None),
+        result,
+        None,
+        _writes_this_call(),
+        _possible_writes_this_call(),
+    )
 
 
-def _writes_then_expiry_notice(writes: int) -> str:
+def _write_count_text(writes: int, possible: int = 0) -> str:
+    """'accepted N write request(s)', plus the unanswered ones if any."""
+    parts = []
+    if writes or not possible:
+        parts.append(f"Gradescope had accepted {writes} write request(s)")
+    if possible:
+        parts.append(
+            f"{possible} write request(s) got no answer (Gradescope may or may "
+            "not have applied them)"
+        )
+    return " and ".join(parts)
+
+
+def _writes_then_expiry_notice(writes: int, possible: int = 0) -> str:
     return (
-        "⚠️ The Gradescope session expired during this call after Gradescope had "
-        f"accepted {writes} write request(s), so the call was not re-run "
+        "⚠️ The Gradescope session expired during this call after "
+        f"{_write_count_text(writes, possible)}, so the call was not re-run "
         "automatically (re-running could repeat those writes or report them as "
         "not done). Anything above that failed or could not be read back "
         "because of the expiry is unconfirmed: check the current state with "
@@ -917,12 +952,14 @@ def _report_writes_then_expiry(attempt: _Attempt) -> Any:
     """Return a run that wrote before the session expired, with a notice."""
     if attempt.exc is not None:
         raise SessionExpiredError(
-            "Gradescope session expired during the call after Gradescope had "
-            f"accepted {attempt.writes} write request(s); the call was not re-run. "
-            "Check the current state with the read tools before retrying it."
+            "Gradescope session expired during the call after "
+            f"{_write_count_text(attempt.writes, attempt.possible_writes)}; the "
+            "call was not re-run. Check the current state with the read tools "
+            "before retrying it."
         ) from attempt.exc
     if isinstance(attempt.result, str):
-        return f"{attempt.result.rstrip()}\n\n{_writes_then_expiry_notice(attempt.writes)}"
+        notice = _writes_then_expiry_notice(attempt.writes, attempt.possible_writes)
+        return f"{attempt.result.rstrip()}\n\n{notice}"
     return attempt.result
 
 
@@ -963,6 +1000,10 @@ def with_session_recovery(fn: Callable[..., T]) -> Callable[..., T]:
       that the session expired after N accepted write(s) and that anything
       the call could not confirm (e.g. a read-back) must be checked with the
       read tools. A call that raised gets ``SessionExpiredError`` saying so.
+    - **A write got no answer** (the request was sent but raised, e.g. a read
+      timeout; ``TimeoutHTTPAdapter`` counts it in ``possible_writes``):
+      treated like an accepted write, since Gradescope may still apply it,
+      and the notice says how many writes got no answer.
 
     If the session expires again during the re-run, a re-run that had a
     write accepted is reported the same way: its output plus the notice
@@ -999,11 +1040,11 @@ def with_session_recovery(fn: Callable[..., T]) -> Callable[..., T]:
             if first.expired is None:
                 return first.result
             reset_connection(None if first.expired is _EXPIRED_UNKNOWN else first.expired)
-            if first.writes:
+            if first.writes or first.possible_writes:
                 logger.warning(
-                    "Gradescope session expired during %s after %d accepted write(s); "
-                    "not re-running it.",
-                    fn.__name__, first.writes,
+                    "Gradescope session expired during %s after %d accepted and %d "
+                    "unanswered write(s); not re-running it.",
+                    fn.__name__, first.writes, first.possible_writes,
                 )
                 return _report_writes_then_expiry(first)
 
@@ -1018,7 +1059,7 @@ def with_session_recovery(fn: Callable[..., T]) -> Callable[..., T]:
             logger.warning("Gradescope session expired again during %s after re-login.", fn.__name__)
             if retry.expired is not _EXPIRED_UNKNOWN:
                 reset_connection(retry.expired)
-            if retry.writes:
+            if retry.writes or retry.possible_writes:
                 return _report_writes_then_expiry(retry)
             return _report_failed_recovery(first, retry)
         finally:

@@ -1239,3 +1239,83 @@ def test_single_grade_saved_before_the_expiry_is_reported(grading_server) -> Non
     assert "Grade saved" in text
     assert "accepted 1 write request(s)" in text
     assert state.logins == 1
+
+
+# ---------------------------------------------------------------------------
+# Writes that got no answer: outcome unknown, so never replayed
+# ---------------------------------------------------------------------------
+
+
+def _adapter_raising(monkeypatch, exc):
+    import requests
+    from requests.adapters import HTTPAdapter
+
+    def boom(self, request, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(HTTPAdapter, "send", boom)
+    adapter = auth.TimeoutHTTPAdapter()
+    return adapter, requests
+
+
+@pytest.mark.parametrize(
+    "method, exc_name, counted",
+    [
+        ("POST", "ReadTimeout", 1),
+        ("DELETE", "ConnectionError", 1),
+        ("GET", "ReadTimeout", 0),
+        ("POST", "ConnectTimeout", 0),  # never connected: nothing was sent
+    ],
+)
+def test_unanswered_write_is_counted_as_possible(monkeypatch, method, exc_name, counted):
+    import requests
+
+    exc = getattr(requests.exceptions, exc_name)("x")
+    adapter, _ = _adapter_raising(monkeypatch, exc)
+    auth._reset_call_state()
+    request = requests.Request(method, "https://www.gradescope.com/x").prepare()
+    with pytest.raises(type(exc)):
+        adapter.send(request)
+    assert auth._possible_writes_this_call() == counted
+    assert auth._writes_this_call() == 0  # never claimed as accepted
+    auth._reset_call_state()
+
+
+def test_unanswered_write_blocks_replay_and_says_so(monkeypatch):
+    calls = []
+    conn = object()
+    monkeypatch.setattr(auth, "reset_connection", lambda *a, **k: None)
+
+    @auth.with_session_recovery
+    def tool():
+        calls.append(1)
+        auth._local.possible_writes = 1  # a POST timed out
+        auth._local.expired = conn  # then the verification read expired
+        return "partial result"
+
+    out = tool()
+
+    assert calls == [1]  # not re-run
+    assert "1 write request(s) got no answer" in out
+    assert "accepted 0" not in out
+
+
+def test_accepted_and_unanswered_writes_are_reported_separately(monkeypatch):
+    monkeypatch.setattr(auth, "reset_connection", lambda *a, **k: None)
+
+    @auth.with_session_recovery
+    def tool():
+        auth._local.writes = 2
+        auth._local.possible_writes = 1
+        auth._local.expired = object()
+        return "r"
+
+    out = tool()
+    assert "Gradescope had accepted 2 write request(s) and 1 write request(s) got no answer" in out
+
+
+def test_possible_writes_merge_from_helper_threads():
+    auth._reset_call_state()
+    auth.merge_call_state(auth.ThreadCallState(None, 0, 2))
+    assert auth._possible_writes_this_call() == 2
+    auth._reset_call_state()

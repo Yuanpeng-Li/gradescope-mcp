@@ -4,7 +4,7 @@ import json
 from contextlib import contextmanager
 
 from gradescope_mcp import operations as ops
-from gradescope_mcp.auth import AuthError, count_possible_write
+from gradescope_mcp.auth import AuthError
 from gradescope_mcp.tools import grading_ops as grading
 from gradescope_mcp.tools.markup_check import markup_warnings_for
 from gradescope_mcp.tools.safety import question_write_lock, write_confirmation_required
@@ -477,10 +477,6 @@ def _run_rows(op, c, q, expected, start=0):
         except Exception as exc:
             row["state"] = "unknown"
             row["error"] = str(exc)
-            if row.get("sent"):
-                # The request may still land; never let session recovery
-                # replay this call and send it again.
-                count_possible_write()
         _save(op, index)
         if row["state"] != "verified":
             op["status"] = "needs_review"

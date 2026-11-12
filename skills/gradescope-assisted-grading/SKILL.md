@@ -192,9 +192,11 @@ emailing students and LMS posting are separate approved actions.
   validation errors mean fix the arguments; authentication errors that persist
   after the server's automatic re-login mean ask the user to fix credentials
   or wait out the stated cooldown.
-- A result ending with the notice that the session expired after Gradescope
-  accepted N writes: those writes landed. Re-read the live state, show it, and
-  redo only what is missing with a new preview and approval.
+- A result ending with the notice that the session expired after accepted
+  writes, or after writes that got no answer: accepted writes landed, and
+  unanswered ones may still land. The call was not re-run. Re-read the live
+  state (again later for unanswered writes), show it, and redo only what is
+  still missing with a new preview and approval.
 - A client timeout does not stop the server; a batch keeps writing. Re-read
   before retrying. Live read-back beats any cached summary.
 - An interrupted or needs-review grade plan continues with
