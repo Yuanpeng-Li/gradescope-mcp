@@ -108,7 +108,9 @@ simple CRUD wrappers.
     `_local.writes`; a write answered with a redirect stays
     `_local.pending_write` until the next response shows whether it hit an
     expiry. A write request that raises without any answer (read timeout,
-    reset after sending; not `ConnectTimeout`) is counted by
+    reset after sending; not a connection that was never established, such as a
+    connect timeout, refused connection or DNS failure: `_failed_before_sending`)
+    is counted by
     `TimeoutHTTPAdapter.send` in `_local.possible_writes`: Gradescope may
     still apply it, so it blocks a re-run like an accepted write, and the
     notice reports it separately ("N write request(s) got no answer").

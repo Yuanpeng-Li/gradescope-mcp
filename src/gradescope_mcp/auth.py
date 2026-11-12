@@ -71,6 +71,7 @@ from typing import Any, Callable, NamedTuple, TypeVar
 from urllib.parse import quote, quote_plus, urljoin, urlsplit
 
 import requests
+import urllib3.exceptions as urllib3_exc
 from bs4 import BeautifulSoup, Comment
 from gradescopeapi.classes.account import Account
 from gradescopeapi.classes.connection import GSConnection
@@ -224,15 +225,44 @@ class TimeoutHTTPAdapter(HTTPAdapter):
             return super().send(
                 request, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies
             )
-        except requests.exceptions.ConnectTimeout:
-            raise  # never connected, so nothing was sent
-        except Exception:
+        except Exception as exc:
             # A write that got no answer (read timeout, reset after sending)
             # may still be processed by the server. Record it so session
             # recovery never re-runs the call and sends it a second time.
-            if str(request.method or "GET").upper() not in _SAFE_METHODS:
+            # A connection that was never established sent nothing.
+            if (
+                str(request.method or "GET").upper() not in _SAFE_METHODS
+                and not _failed_before_sending(exc)
+            ):
                 _local.possible_writes = getattr(_local, "possible_writes", 0) + 1
             raise
+
+
+def _failed_before_sending(exc: BaseException) -> bool:
+    """True when ``exc`` proves the request never left this machine.
+
+    requests wraps urllib3's connection-establishment errors
+    (``ConnectTimeoutError`` and its subclasses ``NewConnectionError`` and
+    ``NameResolutionError``: timeout, refused connection, DNS failure) in
+    ``ConnectTimeout`` or ``ConnectionError``, usually via ``MaxRetryError``.
+    Only an unbroken chain to such an error counts; anything else (a reset
+    or read timeout after sending, an unknown error) may have been sent.
+    Retries are off on these adapters (``max_retries`` 0), so the reported
+    error is the only attempt.
+    """
+    seen = set()
+    current: Any = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (requests.exceptions.ConnectTimeout, urllib3_exc.ConnectTimeoutError)):
+            return True
+        if isinstance(current, urllib3_exc.MaxRetryError):
+            current = current.reason
+        elif isinstance(current, requests.exceptions.ConnectionError) and current.args:
+            current = current.args[0]
+        else:
+            return False
+    return False
 
 
 def _default_timeout() -> tuple[float, float]:

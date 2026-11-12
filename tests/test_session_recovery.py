@@ -1319,3 +1319,75 @@ def test_possible_writes_merge_from_helper_threads():
     auth.merge_call_state(auth.ThreadCallState(None, 0, 2))
     assert auth._possible_writes_this_call() == 2
     auth._reset_call_state()
+
+
+def _wrapped(reason):
+    """A requests ConnectionError built the way HTTPAdapter.send builds it."""
+    import requests
+    from urllib3.exceptions import MaxRetryError
+
+    return requests.exceptions.ConnectionError(MaxRetryError(None, "/x", reason=reason))
+
+
+@pytest.mark.parametrize(
+    "make, never_sent",
+    [
+        (lambda e: _wrapped(e.NameResolutionError("gs", None, "dns down")), True),
+        (lambda e: _wrapped(e.NewConnectionError(None, "refused")), True),
+        (lambda e: _wrapped(e.ConnectTimeoutError("slow connect")), True),
+        (lambda e: _wrapped(e.ProtocolError("reset", ConnectionResetError())), False),
+        (lambda e: _wrapped(e.ReadTimeoutError(None, "/x", "read")), False),
+        (lambda e: RuntimeError("unknown"), False),
+    ],
+)
+def test_failed_before_sending_classification(make, never_sent):
+    import urllib3.exceptions as e
+
+    assert auth._failed_before_sending(make(e)) is never_sent
+
+
+def test_refused_connection_is_not_a_possible_write():
+    """Real HTTPAdapter conversion: a refused POST sent nothing."""
+    import socket
+
+    import requests
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]  # closed again below: connections are refused
+    adapter = auth.TimeoutHTTPAdapter(default_timeout=(2, 2))
+    request = requests.Request("POST", f"http://127.0.0.1:{port}/x", data="a").prepare()
+    auth._reset_call_state()
+    with pytest.raises(requests.exceptions.ConnectionError):
+        adapter.send(request)
+    assert auth._possible_writes_this_call() == 0
+    auth._reset_call_state()
+
+
+def test_dns_failure_then_expiry_still_reruns(monkeypatch):
+    """A write that never left the machine must not block a safe re-run."""
+    import requests
+    import urllib3.exceptions as e
+    from requests.adapters import HTTPAdapter
+
+    monkeypatch.setattr(
+        HTTPAdapter, "send",
+        lambda self, request, **kw: (_ for _ in ()).throw(
+            _wrapped(e.NameResolutionError("gs", None, "dns"))
+        ),
+    )
+    monkeypatch.setattr(auth, "reset_connection", lambda *a, **k: None)
+    adapter = auth.TimeoutHTTPAdapter()
+    calls = []
+
+    @auth.with_session_recovery
+    def tool():
+        calls.append(1)
+        if len(calls) == 1:
+            with pytest.raises(requests.exceptions.ConnectionError):
+                adapter.send(requests.Request("PUT", "https://gs.test/x").prepare())
+            auth._local.expired = object()
+            return "first"
+        return "second"
+
+    assert tool() == "second" and calls == [1, 1]
