@@ -64,7 +64,7 @@ from gradescope_mcp.tools.submissions import (
 )
 from gradescope_mcp.tools.extensions import get_extensions, set_extension
 from gradescope_mcp.operations import get_operation, cancel_operation
-from gradescope_mcp.tools.grading_plans import prepare_grade_plan, execute_grade_plan, calibrate_grade_plan
+from gradescope_mcp.tools.grading_plans import prepare_grade_plan, execute_grade_plan, calibrate_grade_plan, resume_operation
 from gradescope_mcp.tools.assignment_admin import get_assignment_admin, prepare_assignment_plan, execute_assignment_plan
 from gradescope_mcp.tools.rubric_plans import export_question_rubric, prepare_rubric_plan, execute_rubric_plan
 from gradescope_mcp.tools.outline import patch_assignment_outline
@@ -839,29 +839,62 @@ def tool_get_assignment_graders(
 
 
 @gs_tool(local_cache_write("Prepare a versioned grading plan", idempotent=False))
-def tool_prepare_grade_plan(course_id: GradescopeID, question_id: GradescopeID, grades: list[GradeRow], evidence: dict | None = None) -> str:
+def tool_prepare_grade_plan(course_id: GradescopeID, question_id: GradescopeID, grades: list[GradeRow], evidence: dict | None = None, verbose: bool = False) -> str:
     """Prepare up to 500 grades as a private local plan; no grades are sent.
 
-    Returns operation_token, request_digest, exact payloads and projected scores.
-    Show these to the user before executing. Blocked rows are never written.
+    Reads the submissions' grading pages concurrently
+    (GRADESCOPE_MCP_READ_CONCURRENCY, default 4). Returns operation_token,
+    request_digest and every proposed grade compactly (projected score,
+    rubric items, point adjustment, comment preview, review flag, advisory
+    markup_warnings for KaTeX/Markdown problems such as doubled $$).
+    verbose=True returns the exact payloads and evidence. Show the proposed
+    grades to the user before executing. Blocked rows are never written.
     """
-    return prepare_grade_plan(course_id, question_id, grades, evidence)
+    return prepare_grade_plan(course_id, question_id, grades, evidence, verbose)
 
 
 @gs_tool(gradescope_write("Execute approved grading plan", idempotent=True))
-def tool_execute_grade_plan(operation_token: str, request_digest: str, confirm_write: bool = False) -> str:
-    """Execute/resume a displayed plan after explicit user approval.
+def tool_execute_grade_plan(operation_token: str, request_digest: str, confirm_write: bool = False, background: bool = False, verbose: bool = False) -> str:
+    """Execute a displayed plan after explicit user approval.
 
-    confirm_write is not user approval. Snapshots and exact payloads are checked;
-    unknown outcomes stop the operation and are never blindly retried. Query the
-    operation after any interruption. Cancellation is cooperative between rows.
+    confirm_write is not user approval. Each row is re-read right before its
+    write; changed rows are marked stale and never overwritten. A row is
+    verified only when the read-back matches what was sent and Gradescope's
+    score equals the projected score. Execution stops at the first row that
+    is not verified; uncertain outcomes are never re-sent here (use
+    tool_resume_operation). Returns a compact summary (progress, rows needing
+    attention); verbose=True returns every row. background=True starts the
+    run in a background thread and returns at once: poll tool_get_operation.
+    Cancellation (tool_cancel_operation) is cooperative between rows.
     """
-    return execute_grade_plan(operation_token, request_digest, confirm_write)
+    return execute_grade_plan(operation_token, request_digest, confirm_write, background, verbose)
+
+
+@gs_tool(gradescope_write("Resume a stopped grading plan", idempotent=True))
+def tool_resume_operation(operation_token: str, request_digest: str, confirm_write: bool = False, background: bool = False, verbose: bool = False) -> str:
+    """Continue an interrupted or needs-review grading plan (kind grade_plan).
+
+    Needs the same explicit user approval as executing; confirm_write is not
+    approval. Verified and blocked rows are skipped; stale rows stay stale
+    for a human. Uncertain rows (sending, unknown, accepted_unverified,
+    score_mismatch) are re-read first: if Gradescope already holds the
+    planned grade with the projected score the row becomes verified without
+    sending; if Gradescope still shows exactly the planned-from state the
+    write never landed and is sent once; anything else becomes stale. Then
+    pending rows continue as in tool_execute_grade_plan. Other operation
+    kinds are refused. background and verbose work as in execute.
+    """
+    return resume_operation(operation_token, request_digest, confirm_write, background, verbose)
 
 
 @gs_tool(read_only("Inspect operation state"))
 def tool_get_operation(operation_token: str, include_details: bool = False, offset: Count = 0, limit: Count = 50) -> str:
-    """Read a private operation journal, including partial and unknown outcomes."""
+    """Read a private operation journal, including partial and unknown outcomes.
+
+    The top level carries status, status_reason, progress (total, checked,
+    written, verified, failed, blocked, current row, timestamps) and
+    executor_active; poll it while a background run is going.
+    """
     return get_operation(operation_token, include_details, offset, limit)
 
 

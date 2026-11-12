@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import re
+import errno
 import secrets
 import stat
+import threading
 from datetime import datetime, timezone
 
 from gradescope_mcp.cache import get_artifact_path, write_artifact
@@ -50,6 +52,111 @@ def load(token):
     if digest(plan["request"]) != plan["request_digest"]:
         raise ValueError("Operation request changed; prepare a new plan")
     return plan
+
+
+class OperationRunningError(Exception):
+    """Another executor (thread or process) is running this operation."""
+
+
+# Tokens whose run lock this process holds (in-process fast path; the file
+# lock below covers other processes sharing the cache root).
+_running: dict[str, int] = {}
+_running_guard = threading.Lock()
+
+
+def _lock_fd(fd, blocking=False):
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        import msvcrt
+
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"0")
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return
+    fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+
+
+def _unlock_fd(fd):
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _run_lock_path(token):
+    path_for(token)  # validates the token
+    return get_artifact_path(f"operation-{token}.run")
+
+
+def acquire_run(token):
+    """Claim the right to execute ``token``; never waits.
+
+    Returns a handle for ``release_run``. The claim is not bound to the
+    acquiring thread, so a tool call can claim an operation and hand it to a
+    background thread. A file lock makes the claim visible to other server
+    processes using the same cache root and is dropped by the OS if this
+    process dies, so a crashed run never blocks ``resume_operation``.
+
+    Raises:
+        OperationRunningError: another executor holds the operation.
+    """
+    with _running_guard:
+        if token in _running:
+            raise OperationRunningError(token)
+        fd = os.open(
+            _run_lock_path(token),
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            _lock_fd(fd)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise OperationRunningError(token) from None
+            raise
+        _running[token] = fd
+        return token
+
+
+def release_run(handle):
+    with _running_guard:
+        fd = _running.pop(handle, None)
+    if fd is not None:
+        try:
+            _unlock_fd(fd)
+        finally:
+            os.close(fd)
+
+
+def is_running(token):
+    """Whether some executor (this process or another) holds ``token``."""
+    with _running_guard:
+        if token in _running:
+            return True
+    path = _run_lock_path(token)
+    if not path.exists():
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return False
+    try:
+        try:
+            _lock_fd(fd)
+        except OSError as exc:
+            return exc.errno in (errno.EACCES, errno.EAGAIN)
+        _unlock_fd(fd)
+        return False
+    finally:
+        os.close(fd)
 
 
 def create(kind, request, snapshots, rows):
@@ -100,7 +207,14 @@ def get_operation(
             offset=offset,
             next_offset=offset + limit if offset + limit < len(rows) else None,
             cancellation_requested=cancelled(operation_token),
+            executor_active=is_running(operation_token),
         )
+        if plan.get("status") == "running" and not result["executor_active"]:
+            result["note"] = (
+                "The journal says running but no executor holds this operation "
+                "(the server may have stopped). Use tool_resume_operation to "
+                "reconcile uncertain rows and continue."
+            )
         result["rows"] = (
             selected
             if include_details

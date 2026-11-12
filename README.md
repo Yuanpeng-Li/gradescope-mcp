@@ -49,7 +49,7 @@ Gradescope data and still decide every change themselves.
 | 📊 **Review & export** | Progress, statistics, anomaly review, score export, Canvas/Brightspace gradebook CSV, archives |
 | 🛡️ **Safety first** | Preview before every write, revision checks, untrusted-text fencing, private local cache |
 
-**At a glance:** 74 MCP tools (34 read-only · 25 that write to Gradescope ·
+**At a glance:** 75 MCP tools (34 read-only · 26 that write to Gradescope ·
 15 that only write to the private local cache), 3 MCP resources and
 7 MCP prompts, plus a ready-made
 [assisted-grading skill](#assisted-grading-skill).
@@ -266,13 +266,14 @@ Gradescope).
 </details>
 
 <details>
-<summary><b>🧭 Grade plans &amp; operations</b> (6)</summary>
+<summary><b>🧭 Grade plans &amp; operations</b> (7)</summary>
 
 | Tool | Kind | Description |
 |------|------|-------------|
-| `tool_prepare_grade_plan` | local cache | Snapshot-bound dry-run grades and exact payloads |
+| `tool_prepare_grade_plan` | local cache | Snapshot-bound dry-run grades (pages read concurrently), compact rows with advisory KaTeX `markup_warnings`; `verbose` for exact payloads |
 | `tool_calibrate_grade_plan` | read-only | Compare proposed scores to human references |
-| `tool_execute_grade_plan` | write | Resumable approved grading with per-row journal |
+| `tool_execute_grade_plan` | write | Approved grading with per-row journal and progress; verifies the read-back score; compact summary; optional `background` run |
+| `tool_resume_operation` | write | Resume a stopped grade plan: re-read uncertain rows, reconcile those already written, re-send only unlanded ones |
 | `tool_get_operation` | read-only | Inspect operation status and uncertain outcomes |
 | `tool_cancel_operation` | local cache | Cooperatively stop future operation rows |
 | `tool_poll_operation` | local cache | Poll and record linked LMS grade-posting jobs |
@@ -425,7 +426,7 @@ In Claude Code, invoke it with `/gradescope-assisted-grading` or by asking
 | Assignment setup | Creation plans, editable settings, PDF template upload, composed assignment copy | Copy excludes student data, LMS links, autograder images and rubric group constraints |
 | Outline/rubric | Partial question patches, PDF crop overlays, identification regions, flat rubric export/import/copy | No automatic OCR-based region approval; review rendered pages |
 | Submissions | Scoped attachment/page downloads, ZIP, PDF count checks, reproducible sampling | Typed-only submissions may have no attachment; 25 MiB/file and 250 MiB/batch caps |
-| Grading | Local evidence-bound plans, calibration, snapshot checks, per-row journal, cancellation/resume | Cancellation does not undo in-flight writes; uncertain outcomes stop for review |
+| Grading | Local evidence-bound plans, calibration, snapshot checks, per-row journal with progress, background runs, cancellation, explicit resume with reconciliation | Cancellation does not undo in-flight writes; uncertain outcomes stop for review until `tool_resume_operation` re-reads them |
 | Grouping | Create, confirm, move/remove members, merge groups | Graded/unknown-state members are refused; no destructive reset |
 | Review | Progress, missing submissions, totals, bonus configuration, evidence/score archives | Mechanical checks are not proof of grading correctness |
 | Publication | Separate publish/unpublish and notification plans | Mail delivery is not proven by submission success |
@@ -538,7 +539,7 @@ existing computed scores.
   rather than read from a guessed column; unknown is not ungraded.
 
 ### Write safety
-- The tools with a `confirm_write` parameter (the `write` kind, 25 of
+- The tools with a `confirm_write` parameter (the `write` kind, 26 of
   them) are the only tools that change Gradescope data. With the default
   `confirm_write=False` they return a preview ("Write confirmation required
   ...") and change nothing.
@@ -831,6 +832,8 @@ since every upload creates a new submission.
 | `GRADESCOPE_MCP_CACHE_DIR` | no | Private cache root (see [Local cache](#local-cache)); must be owned by you with mode 0700 |
 | `GRADESCOPE_MCP_HTTP_TIMEOUT` | no | Read timeout in seconds for Gradescope requests (default 60); the connect timeout is `min(10, value)`. Invalid values are ignored with a warning |
 | `GRADESCOPE_MCP_UPLOAD_ROOT` | no | Absolute paths of existing directories, separated by `os.pathsep` (`:` on Linux/macOS, `;` on Windows), that upload files must resolve inside |
+| `GRADESCOPE_MCP_READ_CONCURRENCY` | no | Grading pages `tool_prepare_grade_plan` reads side by side (1–8, default 4); results keep the input order. Invalid values fall back to the default |
+| `GRADESCOPE_MCP_WRITE_CONCURRENCY` | no | Grade-plan rows `tool_execute_grade_plan` / `tool_resume_operation` process side by side (1–4, default 1). Each row is still re-read right before its write and read back after it; no new row starts after a problem |
 
 At startup, `python -m gradescope_mcp` (and the `gradescope-mcp` console
 script) loads `.env` files with python-dotenv from these places only:
@@ -966,7 +969,10 @@ tool names stay compatible.
   `refresh_credentials()`, which re-reads the credentials from those files
   before each login attempt.
 - `operations.py`: prepared operations, tokens, request digests, per-row
-  journals and cancellation shared by the plan/execute tools.
+  journals and cancellation shared by the plan/execute tools, plus the
+  per-operation run lock (`acquire_run` / `is_running`; a file lock, so a
+  crashed run never blocks a resume) behind `executor_active` and the
+  "already running" refusal.
 
 **Tool modules** (`src/gradescope_mcp/tools/`)
 
@@ -981,7 +987,7 @@ tool names stay compatible.
 | `submission_files.py` | Attachment/page downloads, ZIP batches, PDF checks |
 | `grading.py` | Outline parsing, score exports, grading progress, student submission links |
 | `grading_ops.py` | Grading context, grade writes (single and batch), rubric CRUD, question-submission discovery, navigation |
-| `grading_plans.py` | Grade plans, calibration, resumable execution |
+| `grading_plans.py` | Grade plans (concurrent page reads, advisory markup checks), calibration, execution with progress and score verification, background runs, `resume_operation` |
 | `grading_workflow.py` | Grading artifacts, answer keys, readiness, page caching, smart reading |
 | `rubric_data.py` | Pre-submission rubric normalization |
 | `rubric_plans.py` | Rubric export/import/copy plans |
@@ -1145,6 +1151,7 @@ gradescope-mcp/
     ├── test_dates_extensions_submissions.py
     ├── test_docs_consistency.py
     ├── test_extensions_and_answer_key.py
+    ├── test_grade_executor.py
     ├── test_grading_ops_fixes.py
     ├── test_grading_plans.py
     ├── test_grading_workflow.py

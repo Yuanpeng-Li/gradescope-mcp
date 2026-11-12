@@ -819,6 +819,56 @@ def _reset_call_state() -> None:
     _local.pending_write = False
 
 
+class ThreadCallState(NamedTuple):
+    """Per-call auth state a helper thread hands back to the calling thread."""
+
+    expired: Any  # the connection whose session expired, or None
+    writes: int  # writes Gradescope accepted on the helper thread
+
+
+def run_with_call_state(fn: Callable[..., T], *args, **kwargs):
+    """Run ``fn`` on the current (helper) thread with fresh per-call state.
+
+    Session-expiry and accepted-write tracking (``_local``) is per thread, so
+    work a tool hands to a thread pool is invisible to the
+    ``with_session_recovery`` wrapper on the tool's own thread. Run each
+    piece of pooled work through this function and pass the returned state
+    to ``merge_call_state`` on the calling thread.
+
+    Never raises: returns ``(result, exception, ThreadCallState)``; an
+    unresolved write redirect counts as an accepted write, as it does for a
+    whole call.
+    """
+    _reset_call_state()
+    result = exc = None
+    try:
+        result = fn(*args, **kwargs)
+    except BaseException as e:  # handed back to the caller, which re-raises
+        exc = e
+    state = ThreadCallState(getattr(_local, "expired", None), _writes_this_call())
+    _reset_call_state()
+    return result, exc, state
+
+
+def merge_call_state(state: ThreadCallState) -> None:
+    """Fold a helper thread's ``ThreadCallState`` into the current thread.
+
+    The expiry flag is kept if it is already set (first expiry wins) and the
+    accepted writes are added, so ``with_session_recovery`` on this thread
+    still drops the expired connection and never re-runs a call after a
+    helper thread had a write accepted.
+    """
+    if state.expired is not None and getattr(_local, "expired", None) is None:
+        _local.expired = state.expired
+    if state.writes:
+        _local.writes = getattr(_local, "writes", 0) + state.writes
+
+
+def current_expired_connection() -> Any:
+    """The connection this thread saw expire during the current call, if any."""
+    return getattr(_local, "expired", None)
+
+
 def _call_tracking_expiry(fn, args, kwargs) -> _Attempt:
     """Call ``fn`` and record whether the session expired and what it wrote.
 

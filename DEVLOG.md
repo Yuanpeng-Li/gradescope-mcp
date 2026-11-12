@@ -32,6 +32,53 @@ From a 127-student grading run's feedback.
 
 - **1051 automated tests**, all passing
 
+## Session 16 — 2026-11-11: Grade-plan executor feedback (speed, progress, resume, score check)
+
+Feedback from a 127-student grading run: slow batches, no progress during
+long calls, resume not explicit, numeric score not verified, bulky output.
+
+### What was done
+
+1. **Concurrent reads in `prepare_grade_plan`.** Grading pages are fetched
+   on a pool (`GRADESCOPE_MCP_READ_CONCURRENCY`, 1–8, default 4); rows keep
+   input order and the error reported is the lowest-index failure. Each
+   page carries that submission's evaluation, so it cannot be replaced by
+   one shared rubric read.
+2. **Auth state from pool threads.** `auth.run_with_call_state` /
+   `merge_call_state` hand a worker's expiry flag and accepted-write count
+   back to the tool thread, so `with_session_recovery` still resets the
+   connection and never re-runs a call after a pooled write.
+3. **Execution.** Every row is still re-read right before its write and
+   read back after it. Writes stay sequential by default;
+   `GRADESCOPE_MCP_WRITE_CONCURRENCY` (1–4) runs whole independent rows
+   side by side, with serialized journal saves and no new row after the
+   first problem. Default 1 because writes cannot be undone and
+   Gradescope's tolerance for parallel saves is unmeasured.
+4. **Score verification.** `verified` now also needs the read-back score to
+   equal `projected_score` (1e-6); otherwise `score_mismatch` (actual and
+   projected recorded) or `accepted_unverified` (no score / no projection).
+   Same rule when Gradescope already holds the planned grade.
+5. **Progress and background runs.** The journal carries `progress`
+   (checked, written, verified, failed, blocked, skipped, current row,
+   timestamps), shown by `tool_get_operation` with `executor_active`.
+   `execute_grade_plan(background=True)` returns `running` at once; a
+   per-operation run lock (file lock, released if the process dies) makes
+   a second execute/resume answer "already running" instead of waiting.
+   An auth failure in the background marks the run `interrupted`.
+6. **`tool_resume_operation`** (new write tool, 75 tools): re-reads
+   uncertain rows and verifies those already written, re-sends only rows
+   whose page still equals the planned-from snapshot, marks the rest stale
+   and continues pending rows. Grade plans only; other kinds are refused.
+7. **Compact results.** prepare/execute/resume return counts, progress and
+   at most 20 rows needing attention; `verbose=True` returns full rows.
+   prepare lists every proposed grade compactly with advisory
+   `markup_warnings` (KaTeX/Markdown, e.g. doubled `$$`).
+
+### Current state
+
+- **75 tools** + **3 resources** + **7 prompts**
+- **1062 automated tests** (`uv run pytest -q`), all passing
+
 ---
 
 ## Session 15 — 2026-10-05: Issues #8 (credential refresh) and #7 (LMS gradebook CSV)
