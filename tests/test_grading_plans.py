@@ -70,7 +70,7 @@ def test_snapshot_change_refuses_write(monkeypatch):
     r = json.loads(
         plans.execute_grade_plan(p["operation_token"], p["request_digest"], True)
     )
-    assert r["rows"][0]["state"] == "stale" and not sent
+    assert r["attention_rows"][0]["state"] == "stale" and not sent
 
 
 def test_unknown_save_is_not_repeated(monkeypatch):
@@ -153,7 +153,7 @@ def test_ungraded_readback_is_not_verified(monkeypatch):
     result = json.loads(
         plans.execute_grade_plan(p["operation_token"], p["request_digest"], True)
     )
-    assert result["rows"][0]["state"] == "accepted_unverified"
+    assert result["attention_rows"][0]["state"] == "accepted_unverified"
     assert sent == ["3"]
 
 

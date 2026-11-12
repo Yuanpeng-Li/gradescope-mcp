@@ -13,7 +13,7 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 74 tools (34 read-only, 25 Gradescope writes, 15 local cache writes)
+- 75 tools (34 read-only, 26 Gradescope writes, 15 local cache writes)
 - 3 resources (1 static, 2 URI templates)
 - 7 prompts
 - Offline pytest suite (the current count is recorded in `DEVLOG.md`)
@@ -315,36 +315,38 @@ nothing is sent.
 
 59. `tool_merge_answer_groups`
 
+60. `tool_resume_operation`
+
 ### Local cache writes
 `readOnlyHint=false`, `destructiveHint=false`: they read Gradescope and
 write only to the private cache.
 
-60. `tool_prepare_grading_artifact`
-61. `tool_cache_relevant_pages`
-62. `tool_prepare_answer_key`
-63. `tool_export_lms_gradebook`
+61. `tool_prepare_grading_artifact`
+62. `tool_cache_relevant_pages`
+63. `tool_prepare_answer_key`
+64. `tool_export_lms_gradebook`
 
-64. `tool_prepare_grade_plan`
+65. `tool_prepare_grade_plan`
 
-65. `tool_cancel_operation`
+66. `tool_cancel_operation`
 
-66. `tool_prepare_assignment_plan`
+67. `tool_prepare_assignment_plan`
 
-67. `tool_prepare_rubric_plan`
+68. `tool_prepare_rubric_plan`
 
-68. `tool_preview_outline_regions`
+69. `tool_preview_outline_regions`
 
-69. `tool_download_submission_files`
+70. `tool_download_submission_files`
 
-70. `tool_archive_assignment`
+71. `tool_archive_assignment`
 
-71. `tool_prepare_choice_bonus_plan`
+72. `tool_prepare_choice_bonus_plan`
 
-72. `tool_prepare_assignment_clone`
+73. `tool_prepare_assignment_clone`
 
-73. `tool_prepare_autograder_plan`
+74. `tool_prepare_autograder_plan`
 
-74. `tool_poll_operation`
+75. `tool_poll_operation`
 
 All tools are `openWorldHint=true`.
 
@@ -483,6 +485,7 @@ Current test files:
 - `tests/test_dates_extensions_submissions.py`
 - `tests/test_docs_consistency.py`
 - `tests/test_extensions_and_answer_key.py`
+- `tests/test_grade_executor.py`
 - `tests/test_grading_ops_fixes.py`
 - `tests/test_grading_workflow.py`
 - `tests/test_live_fixes.py`
@@ -543,6 +546,8 @@ Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type
 
 - `tests/test_grading_plans.py`: lifecycle implementation and regression coverage.
 
+- `tests/test_grade_executor.py`: grade-plan executor: pooled reads/writes and auth state merging, progress, background runs, resume reconciliation, score verification, compact output.
+
 - `tools/assignment_admin.py`: lifecycle implementation and regression coverage.
 
 - `tools/rubric_plans.py`: lifecycle implementation and regression coverage.
@@ -573,4 +578,41 @@ Zero-point bonus workflow: preview `tool_set_question_scoring` with scoring_type
 
 - `tools/rubric_data.py`: pre-submission AssignmentRubric normalization.
 
-Lifecycle plans are private operation records in `operations.py`. Prepare/show/approve/execute using request_digest and operation_token; an uncertain or partially accepted write is not permission to replay it. Question writes use shared thread/filesystem locks, requiring a valid private cache and coordinating only processes using that root. Pre-submission rubrics use AssignmentRubric props. Plan preparation and new archives are non-idempotent local operations. Autograder adapters are capability-gated to discovered forms; live programming-assignment validation remains pending. See README lifecycle matrix for supported boundaries.
+Lifecycle plans are private operation records in `operations.py`. Prepare/show/approve/execute using request_digest and operation_token; an uncertain or partially accepted write is not permission to replay it.
+
+Grade plans (`tools/grading_plans.py`):
+- `prepare_grade_plan` reads the grading pages on a pool
+  (`GRADESCOPE_MCP_READ_CONCURRENCY`, 1–8, default 4) through
+  `_concurrent_map`, which keeps input order, raises the lowest-index
+  failure (what a sequential loop would raise) and merges each pool
+  thread's auth call state back (`auth.run_with_call_state` /
+  `auth.merge_call_state`). Any new pooled Gradescope work must do the
+  same, or `with_session_recovery` misses expiries and accepted writes and
+  could re-run a call after a write.
+- Execution re-reads every row right before its write (never a
+  prefetch), journals `sending` before the POST and verifies the read-back:
+  `verified` needs no mismatches, `graded` true and the read-back score
+  equal to `projected_score` (1e-6); otherwise `score_mismatch` or
+  `accepted_unverified` with a `verification_note`. The same rule applies
+  when Gradescope already holds the planned grade (`reconciled`). Rows run
+  one at a time by default; `GRADESCOPE_MCP_WRITE_CONCURRENCY` (1–4) runs
+  whole rows side by side, journal updates serialized by `_Run.lock`, no
+  new row after the first problem, in-flight rows finish.
+- `progress` (per-run counters plus cumulative state counts, current row,
+  timestamps) is saved with every row transition; `get_operation` shows it
+  with `executor_active`.
+- `background=True` claims the operation's run lock in the tool call and
+  hands it to a daemon thread that takes the usual operation/question
+  locks. A second execute/resume gets "already running" at once. The
+  thread has no session recovery: an `AuthError` ends the run as
+  `interrupted` (and drops the expired connection).
+- `execute_grade_plan` never re-sends an uncertain row (`sending`,
+  `unknown`, `accepted_unverified`, `score_mismatch`);
+  `resume_operation` re-reads it: planned grade and score present →
+  verified; still the planned-from snapshot → sent once (`resumed_from`);
+  anything else → stale. These re-reads send nothing, so they do not stop
+  the other rows (the run still ends `needs_review`); a new problem on a
+  row resume sends does. Stale rows are skipped by resume, re-checked by
+  execute. Cancellation is permanent for an operation.
+- Results are compact (`attention_rows`, capped at 20, plus
+  `attention_omitted`); `verbose=True` returns full rows. Question writes use shared thread/filesystem locks, requiring a valid private cache and coordinating only processes using that root. Pre-submission rubrics use AssignmentRubric props. Plan preparation and new archives are non-idempotent local operations. Autograder adapters are capability-gated to discovered forms; live programming-assignment validation remains pending. See README lifecycle matrix for supported boundaries.
