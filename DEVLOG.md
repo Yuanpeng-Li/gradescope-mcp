@@ -73,11 +73,39 @@ long calls, resume not explicit, numeric score not verified, bulky output.
    at most 20 rows needing attention; `verbose=True` returns full rows.
    prepare lists every proposed grade compactly with advisory
    `markup_warnings` (KaTeX/Markdown, e.g. doubled `$$`).
+## Session — 2026-11-11: course discovery and rubric-plan resume (user feedback)
+
+### What was done
+
+1. **`tool_list_courses` parses the account page itself.** A staff account
+   got "No courses found" while it could read a known course. The new
+   `courses._parse_account_courses` walks the page in document order, so
+   every course box (`a[href=/courses/N]` with `courseBox` or a
+   `courseBox--shortname`) gets the nearest preceding `pageHeading` and
+   `courseList--term`, whatever wrappers sit in between. Headings map to
+   instructor/staff, student or "other"; the Create Course button only
+   decides when there is no heading. `/account` falls back to `/`. An
+   HTTP failure, course links that cannot be read, or a page without any
+   course list are errors; only a parsed, empty list says "No courses
+   found" (with a note that known course IDs still work).
+2. **`tool_resume_rubric_plan`** (new write tool, 75 tools). Skips verified
+   rows, reconciles each uncertain row (sending/unknown/stale/needs_review)
+   against the live rubric — an already-created item is adopted by ID and
+   never created again; an unapplied row is sent with the usual pre-send
+   freshness check and post-write verification; ambiguity stops as
+   `needs_review` with a `review_reason`. Cancelled plans are not resumed.
+   `execute_rubric_plan` shares the same runner (rubric state compared by
+   ID, ignoring display order) and its refusal now points to the resume
+   tool. Rubric operation records carry
+   `progress = {total, verified, failed, pending, current_index}`.
+3. **`tool_prepare_rubric_plan`** returns advisory `markup_warnings` for
+   item descriptions (KaTeX delimiter checks; never blocks).
 
 ### Current state
 
 - **75 tools** + **3 resources** + **7 prompts**
 - **1062 automated tests** (`uv run pytest -q`), all passing
+- **1059 automated tests** (`uv run pytest -q`), all passing
 
 ---
 

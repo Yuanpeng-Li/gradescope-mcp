@@ -66,7 +66,7 @@ from gradescope_mcp.tools.extensions import get_extensions, set_extension
 from gradescope_mcp.operations import get_operation, cancel_operation
 from gradescope_mcp.tools.grading_plans import prepare_grade_plan, execute_grade_plan, calibrate_grade_plan, resume_operation
 from gradescope_mcp.tools.assignment_admin import get_assignment_admin, prepare_assignment_plan, execute_assignment_plan
-from gradescope_mcp.tools.rubric_plans import export_question_rubric, prepare_rubric_plan, execute_rubric_plan
+from gradescope_mcp.tools.rubric_plans import export_question_rubric, prepare_rubric_plan, execute_rubric_plan, resume_rubric_plan
 from gradescope_mcp.tools.outline import patch_assignment_outline
 from gradescope_mcp.tools.pdf_regions import preview_outline_regions, inspect_submission_pdf
 from gradescope_mcp.tools.submission_files import download_submission_files
@@ -473,8 +473,10 @@ def _resource_id(value: str, name: str) -> str:
 def tool_list_courses() -> str:
     """List all Gradescope courses for the authenticated user.
 
-    Returns courses grouped by role (instructor vs student),
-    including course ID, name, semester, and assignment count.
+    Returns courses grouped by role (instructor/staff vs student, or
+    "other" when the page names no role), including course ID, name,
+    semester, and assignment count. An account page that cannot be read is
+    an error, never an empty list; a known course ID works directly anyway.
     """
     return list_courses()
 
@@ -962,9 +964,23 @@ def tool_prepare_rubric_plan(course_id: GradescopeID, question_id: GradescopeID,
 def tool_execute_rubric_plan(operation_token: str, request_digest: str, confirm_write: bool = False) -> str:
     """Execute approved rubric edits, recording partial outcomes; confirm_write is not approval.
 
-    Do not replay uncertain creates. Inspect the journal and current rubric first.
+    Runs a plan once. A stopped plan continues only via tool_resume_rubric_plan,
+    which reconciles uncertain rows against the live rubric first.
     """
     return execute_rubric_plan(operation_token, request_digest, confirm_write)
+
+
+@gs_tool(gradescope_write("Resume an interrupted rubric plan", idempotent=True))
+def tool_resume_rubric_plan(operation_token: str, request_digest: str, confirm_write: bool = False) -> str:
+    """Resume a stopped rubric plan: skip verified rows, reconcile uncertain ones, send the rest.
+
+    Re-reads the live rubric first. An uncertain create whose item already
+    exists is marked verified with the found ID and never sent twice; an
+    unapplied row is sent with the same freshness check and verification as
+    execution; ambiguity (two matching items, unrelated edits) stops as
+    needs_review. Cancelled plans cannot be resumed. confirm_write is not approval.
+    """
+    return resume_rubric_plan(operation_token, request_digest, confirm_write)
 
 
 @gs_tool(gradescope_write("Patch selected outline questions", idempotent=True))

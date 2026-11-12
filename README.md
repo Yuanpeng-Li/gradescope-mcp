@@ -49,7 +49,7 @@ Gradescope data and still decide every change themselves.
 | 📊 **Review & export** | Progress, statistics, anomaly review, score export, Canvas/Brightspace gradebook CSV, archives |
 | 🛡️ **Safety first** | Preview before every write, revision checks, untrusted-text fencing, private local cache |
 
-**At a glance:** 75 MCP tools (34 read-only · 26 that write to Gradescope ·
+**At a glance:** 76 MCP tools (34 read-only · 27 that write to Gradescope ·
 15 that only write to the private local cache), 3 MCP resources and
 7 MCP prompts, plus a ready-made
 [assisted-grading skill](#assisted-grading-skill).
@@ -181,7 +181,7 @@ Gradescope).
 
 | Tool | Kind | Description |
 |------|------|-------------|
-| `tool_list_courses` | read-only | List all courses grouped by role (instructor vs student) |
+| `tool_list_courses` | read-only | List all courses grouped by role (instructor/staff vs student); an unreadable account page is an error, not an empty list |
 | `tool_get_assignments` | read-only | List a course's assignments with dates; status and grade for student accounts (N/A for staff) |
 | `tool_get_assignment_details` | read-only | One assignment's name and dates (status and grade for student accounts) |
 | `tool_get_course_roster` | read-only | Roster grouped by role: name, email, SID, user ID, submission count, sections |
@@ -288,6 +288,7 @@ Gradescope).
 | `tool_export_question_rubric` | read-only | Flat rubric export with source revision |
 | `tool_prepare_rubric_plan` | local cache | Prepare rubric import/copy/update/delete plan |
 | `tool_execute_rubric_plan` | write | Verified rubric changes with partial journal |
+| `tool_resume_rubric_plan` | write | Resume a stopped rubric plan: skip verified rows, reconcile uncertain ones without duplicate creates |
 | `tool_create_rubric_item` | write | Create a rubric item (positive weight; ADD/DEDUCT shown in the preview) |
 | `tool_update_rubric_item` | write | Update an existing rubric item's description or weight |
 | `tool_delete_rubric_item` | write | Delete a rubric item (removes it from every submission) |
@@ -444,6 +445,8 @@ prepared, sending, verified/completed, accepted_unverified, unknown, stale,
 needs_review and cancelled states. Never interpret HTTP acceptance as completed
 mail delivery, a finished autograder run or a successful LMS job. Query journals
 and the corresponding read tool before retrying. No universal rollback is claimed.
+A stopped rubric plan is continued with `tool_resume_rubric_plan`, which
+reconciles uncertain rows against the live rubric before sending anything.
 
 Plan preparation returns a new local operation each time and is marked
 non-idempotent. Keep and reuse its token instead of preparing duplicate operations.
@@ -539,7 +542,7 @@ existing computed scores.
   rather than read from a guessed column; unknown is not ungraded.
 
 ### Write safety
-- The tools with a `confirm_write` parameter (the `write` kind, 26 of
+- The tools with a `confirm_write` parameter (the `write` kind, 27 of
   them) are the only tools that change Gradescope data. With the default
   `confirm_write=False` they return a preview ("Write confirmation required
   ...") and change nothing.
@@ -1148,6 +1151,7 @@ gradescope-mcp/
     ├── test_autograder.py
     ├── test_blueprints.py
     ├── test_common.py
+    ├── test_course_list_parser.py
     ├── test_dates_extensions_submissions.py
     ├── test_docs_consistency.py
     ├── test_extensions_and_answer_key.py
