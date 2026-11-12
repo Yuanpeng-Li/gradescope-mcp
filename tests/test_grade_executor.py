@@ -598,3 +598,63 @@ def test_parallel_rows_complete_with_consistent_journal(monkeypatch):
     assert result["status"] == "completed" and sorted(world.sent) == sids
     assert result["progress"]["verified"] == 12 and result["progress"]["written"] == 12
     assert result["progress"]["write_concurrency"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups
+# ---------------------------------------------------------------------------
+
+
+def test_background_start_does_not_overwrite_a_newer_journal(monkeypatch):
+    """A caller that loaded the plan before another run journaled an uncertain
+    row must not reset that row to pending and re-send it."""
+    world = World(monkeypatch)
+    p = world.prepare()
+    real_acquire = operations.acquire_run
+
+    def other_run_finished_first(token):
+        op = operations.load(token)
+        op["rows"][0]["state"] = "unknown"  # another run lost a response
+        operations.save(op)
+        return real_acquire(token)
+
+    monkeypatch.setattr(operations, "acquire_run", other_run_finished_first)
+    _execute(p, background=True)
+    assert plans._join_background(p["operation_token"], 5)
+    op = operations.load(p["operation_token"])
+    assert op["rows"][0]["state"] == "unknown" and world.sent == []
+    assert op["status"] == "needs_review"
+
+
+def test_reconcile_needs_the_raw_graded_flag(monkeypatch):
+    world = World(monkeypatch)
+    p = world.prepare()
+
+    def landed_without_flag(sid, payload):
+        world.post_hook = None
+        world.land(sid, payload)
+        world.states[sid]["submission"]["graded"] = None  # score present only
+        raise TimeoutError("lost response after save")
+
+    world.post_hook = landed_without_flag
+    _execute(p)
+    result = _resume(p)
+    row = operations.load(p["operation_token"])["rows"][0]
+    assert row["state"] == "accepted_unverified" and row["reconciled"] is True
+    assert world.sent == ["3", "4"] and result["status"] == "needs_review"
+
+
+def test_parallel_execute_writes_nothing_while_a_row_is_uncertain(monkeypatch):
+    monkeypatch.setenv(plans.WRITE_CONCURRENCY_ENV, "2")
+    world = World(monkeypatch, ("3", "4", "5"), {"3": 0.1})
+    p = world.prepare()
+    op = operations.load(p["operation_token"])
+    op["rows"][0]["state"] = "unknown"
+    operations.save(op)
+    result = _execute(p)
+    assert result["status"] == "needs_review" and world.sent == []
+    assert [r["state"] for r in operations.load(p["operation_token"])["rows"]] == [
+        "unknown",
+        "pending",
+        "pending",
+    ]

@@ -613,6 +613,7 @@ Grade plans (`tools/grading_plans.py`):
   anything else → stale. These re-reads send nothing, so they do not stop
   the other rows (the run still ends `needs_review`); a new problem on a
   row resume sends does. Stale rows are skipped by resume, re-checked by
-  execute. Cancellation is permanent for an operation.
+  execute. Uncertain rows are processed first, one at a time, before any
+  other row is dispatched. Cancellation is permanent for an operation.
 - Results are compact (`attention_rows`, capped at 20, plus
   `attention_omitted`); `verbose=True` returns full rows. Question writes use shared thread/filesystem locks, requiring a valid private cache and coordinating only processes using that root. Pre-submission rubrics use AssignmentRubric props. Plan preparation and new archives are non-idempotent local operations. Autograder adapters are capability-gated to discovered forms; live programming-assignment validation remains pending. See README lifecycle matrix for supported boundaries.

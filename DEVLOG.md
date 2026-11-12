@@ -51,7 +51,7 @@ long calls, resume not explicit, numeric score not verified, bulky output.
 ### Current state
 
 - **75 tools** + **3 resources** + **7 prompts**
-- **1059 automated tests** (`uv run pytest -q`), all passing
+- **1062 automated tests** (`uv run pytest -q`), all passing
 
 ---
 

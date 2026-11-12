@@ -566,8 +566,17 @@ def _process_row(run, index):
     if same_payload and grading._already_holds(props, plan):
         # Gradescope already holds the planned grade (an earlier attempt
         # landed, or someone entered it): check the score, send nothing.
-        score = (props.get("submission") or {}).get("score")
-        state, extra = _score_outcome(score, row.get("projected_score"))
+        # Same rule as a read-back: the raw graded flag must be True (not
+        # inferred from a present score) and the score must match.
+        submission = props.get("submission") or {}
+        state, extra = _verification_outcome(
+            {
+                "graded": submission.get("graded"),
+                "score": submission.get("score"),
+                "mismatches": [],
+            },
+            row.get("projected_score"),
+        )
         run.set(row, state, reconciled=True, **extra)
         if state != "verified" and not reconciling:
             run.halt("needs_review", f"submission {sid}: {extra['verification_note']}")
@@ -641,6 +650,15 @@ def _dispatch(run):
     skip = ("verified", "blocked") + (("stale",) if run.resume else ())
     todo = [i for i, row in enumerate(rows) if row["state"] not in skip]
     run.counters["skipped"] = len(rows) - len(todo)
+    # Rows with uncertain earlier outcomes go first, one at a time: execute
+    # must stop on them before any other row is written, and resume settles
+    # them before new writes start.
+    uncertain = [i for i in todo if rows[i]["state"] in UNCERTAIN_STATES]
+    for index in uncertain:
+        if run.halted:
+            return
+        _process_row(run, index)
+    todo = [i for i in todo if i not in set(uncertain)]
     workers = write_concurrency()
     if workers <= 1:
         for index in todo:
@@ -833,6 +851,11 @@ def _start(action, token, request_digest, confirm_write, background, verbose, re
             )
         if background:
             try:
+                # Reload under the run lock: the copy loaded above may predate
+                # another run's journal updates and must not overwrite them.
+                op = ops.load(token)
+                if request_digest != op["request_digest"]:
+                    raise ValueError("request digest mismatch")
                 op["status"] = "running"
                 op["status_reason"] = "started in the background"
                 ops.save(op)
