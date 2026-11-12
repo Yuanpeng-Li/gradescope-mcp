@@ -26,12 +26,16 @@ What MCP clients see:
   messages are ordinary results. Invalid arguments are rejected by the
   schema with ``isError: true``. Resource reads raise a JSON-RPC error for
   the same failure prefixes.
-- **Output.** Tools return plain text content only (no ``outputSchema`` /
-  ``structuredContent``): the text is markdown or, where a tool offers
-  ``output_format="json"``, a JSON document.
+- **Output.** Every result has text content: markdown or, where a tool
+  returns JSON (e.g. ``output_format="json"`` or the plan/operation tools),
+  a JSON document. When the whole text of a successful result is one JSON
+  object, the same object is also sent as ``structuredContent``. Tools
+  publish no ``outputSchema``; markdown results and error results carry no
+  ``structuredContent``.
 """
 
 import functools
+import json
 import logging
 import re
 from importlib.metadata import PackageNotFoundError, version
@@ -250,15 +254,63 @@ def is_error_text(text: str) -> bool:
     return bool(_ERROR_PREFIX_RE.match(text.lstrip()))
 
 
+# Larger JSON results are sent as text only: structuredContent repeats the
+# whole payload, so it would double an already large message.
+MAX_STRUCTURED_TEXT = 1024 * 1024
+
+
+def _reject_constant(name: str):
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def structured_json(text: str) -> dict | None:
+    """The JSON object a tool's whole text result encodes, or ``None``.
+
+    Only a text that is exactly one JSON object (surrounding whitespace
+    allowed) qualifies: markdown, JSON arrays or scalars, ``NaN`` /
+    ``Infinity`` (not valid JSON on the wire), texts over
+    ``MAX_STRUCTURED_TEXT`` characters, and JSON followed by anything else
+    do not. The last case covers ``with_session_recovery``'s notice
+    appended after a JSON result ("session expired after N accepted
+    write(s)"): such a result stays text only, so a client that reads
+    ``structuredContent`` cannot take the JSON without the notice that
+    parts of it are unconfirmed.
+    """
+    if len(text) > MAX_STRUCTURED_TEXT or not text.lstrip().startswith("{"):
+        return None
+    try:
+        value = json.loads(text, parse_constant=_reject_constant)
+    except ValueError:  # includes json.JSONDecodeError
+        return None
+    if not isinstance(value, dict):
+        return None
+    if "\\u" in text:
+        # An escaped lone surrogate parses but cannot be encoded as UTF-8
+        # when the result is sent; keep such a result text only.
+        try:
+            json.dumps(value, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+    return value
+
+
 def _signal_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Return handled failures to the client as ``isError: true`` results.
+    """Shape a tool's text result into the ``CallToolResult`` sent to clients.
 
     The tool modules report failures as text starting with ``Error``,
     ``Authentication error`` or ``❌``. Those become a ``CallToolResult``
-    with ``is_error=True`` and the original text. (Raising ``ToolError``
-    instead would prefix the text with "Error executing tool ...".) An
-    ``AuthError`` that escapes a tool is reported the same way instead of as
-    an opaque crash. Other results are returned unchanged.
+    with ``is_error=True`` and the original text (no ``structuredContent``).
+    (Raising ``ToolError`` instead would prefix the text with "Error
+    executing tool ...".) An ``AuthError`` that escapes a tool is reported
+    the same way instead of as an opaque crash.
+
+    A successful result whose whole text is one JSON object
+    (``structured_json``) is returned with that text unchanged plus the
+    parsed object as ``structuredContent``, so clients that read structured
+    results get the same data without parsing the text. Other results
+    (markdown, previews, notices) are returned unchanged and stay text only.
+    The tools are registered without an ``outputSchema``, so the SDK passes
+    the ``CallToolResult`` through without validating it.
     """
 
     @functools.wraps(fn)
@@ -267,10 +319,17 @@ def _signal_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
             result = fn(*args, **kwargs)
         except AuthError as e:
             result = f"Authentication error: {e}"
-        if isinstance(result, str) and is_error_text(result):
-            return CallToolResult(
-                content=[TextContent(type="text", text=result)], is_error=True
-            )
+        if isinstance(result, str):
+            if is_error_text(result):
+                return CallToolResult(
+                    content=[TextContent(type="text", text=result)], is_error=True
+                )
+            structured = structured_json(result)
+            if structured is not None:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=result)],
+                    structured_content=structured,
+                )
         return result
 
     return wrapper
@@ -357,10 +416,12 @@ def gs_tool(annotations: ToolAnnotations):
     output (or the re-run's, if the first attempt raised). The function is
     then wrapped in
     ``_signal_errors``, which returns handled failures with ``isError:
-    true``. Both wrappers keep the function's name, docstring and
-    signature, so the input schema is built from the function itself. The
-    tool is registered with ``annotations`` (its ``title`` is also the
-    tool's title) and without structured output: results are text only.
+    true`` and adds ``structuredContent`` to a successful result whose whole
+    text is a JSON object. Both wrappers keep the function's name, docstring
+    and signature, so the input schema is built from the function itself.
+    The tool is registered with ``annotations`` (its ``title`` is also the
+    tool's title) and with ``structured_output=False``: no ``outputSchema``
+    is published or validated, and the text content is always present.
     """
 
     def decorator(fn):
@@ -1512,7 +1573,10 @@ def tool_apply_grade_batch(
       re-sent. A row whose grading page belongs to another submission fails
       without a write. Returns
       succeeded / failed / skipped / needs-review counts with per-row
-      scores read back from Gradescope and any read-back mismatches.
+      scores read back from Gradescope; a saved row is verified only when
+      the read-back matches what was sent and the projected score, else it
+      is listed under "Needs check". Comments with suspicious KaTeX
+      delimiters get advisory formatting warnings (never blocking).
 
     Args:
         course_id: The Gradescope course ID.

@@ -34,6 +34,7 @@ from gradescope_mcp.tools.common import (
 )
 from gradescope_mcp.tools.rubric_data import assignment_rubric_props
 from gradescope_mcp.tools.grading import _build_question_tree, _get_outline_data
+from gradescope_mcp.tools.markup_check import markup_warnings_for
 from gradescope_mcp.tools.safety import write_confirmation_required
 
 logger = logging.getLogger(__name__)
@@ -1403,6 +1404,61 @@ def _score_text(plan: dict, readback: dict | None, weight: Any) -> str:
     return text
 
 
+# Read-back score tolerance: Gradescope stores scores as decimals, so a
+# projected score that matches up to rounding noise counts as equal.
+_SCORE_TOLERANCE = 1e-6
+
+
+def _readback_problems(plan: dict, readback: dict | None) -> list[str]:
+    """Why a saved grade is not verified by its read-back (``[]`` = verified).
+
+    Verified means the grading page re-read after the save shows the rubric
+    items, point adjustment and comment that were sent (no ``mismatches``)
+    AND a score equal to the projected score. A failed read-back, a missing
+    score or projection, or a score that differs from the projection (for
+    example because the scoring direction was assumed) leaves the write
+    saved but in need of a check.
+    """
+    readback = readback or {}
+    if readback.get("error"):
+        return [f"read-back failed: {readback['error']}"]
+    problems = list(readback.get("mismatches") or [])
+    projected = plan.get("projected_score")
+    actual = _to_float(readback.get("score"))
+    if actual is None:
+        problems.append(
+            "Gradescope's page showed no score after the save, so the "
+            "projected score could not be confirmed"
+        )
+    elif projected is None:
+        problems.append(
+            f"score {_format_score(actual)} could not be compared: no "
+            "projected score (question weight unknown)"
+        )
+    elif abs(actual - projected) > _SCORE_TOLERANCE:
+        problems.append(
+            f"score on Gradescope is {_format_score(actual)}, projected "
+            f"{_format_score(projected)}"
+        )
+    return problems
+
+
+def _markup_notes(fields: dict) -> list[str]:
+    """Advisory Markdown/KaTeX warnings for text a write sends (never blocks).
+
+    Only non-empty strings are checked (``None`` keeps the current text,
+    ``""`` clears it). Returns one line per field with problems.
+    """
+    found = markup_warnings_for(
+        {name: value for name, value in fields.items() if isinstance(value, str) and value}
+    )
+    return [
+        f"⚠️ Formatting warning ({name}; advisory, the write is not blocked): "
+        + "; ".join(warnings)
+        for name, warnings in found.items()
+    ]
+
+
 @serialize_question_write
 def apply_grade(
     course_id: str,
@@ -1591,6 +1647,7 @@ def apply_grade(
             f"projected_score={_format_score(plan['projected_score'])}/{weight}"
         )
         details.extend(_projection_notes(props, plan, weight))
+        details.extend(_markup_notes({"comment": comment}))
         if confidence is not None:
             details.append(f"confidence={_confidence_note(confidence)}")
         return write_confirmation_required("apply_grade", details)
@@ -1637,6 +1694,19 @@ def apply_grade(
         lines.append(f"**Confidence:** {_confidence_note(confidence)}")
     for mismatch in readback.get("mismatches") or []:
         lines.append(f"⚠️ **Read-back mismatch:** {mismatch}")
+    problems = _readback_problems(plan, readback)
+    if problems:
+        lines.append(
+            "⚠️ **Needs check:** saved, but the read-back does not confirm "
+            "it: " + "; ".join(problems)
+            + ". Check it with `tool_get_submission_grading_context`."
+        )
+    else:
+        lines.append(
+            "**Read-back:** verified (rubric items, adjustment, comment and "
+            "score match)"
+        )
+    lines.extend(_markup_notes({"comment": comment}))
     return "\n".join(lines)
 
 
@@ -1753,6 +1823,26 @@ def _batch_rubric_problems(rows: list[dict], rubric: list[dict]) -> list[str]:
 
 def _is_low_confidence(row: dict) -> bool:
     return row["confidence"] is not None and row["confidence"] < CONFIDENCE_REJECT_BELOW
+
+
+def _batch_markup_notes(rows: list[dict]) -> list[str]:
+    """One advisory formatting line listing every row whose comment looks wrong."""
+    flagged = []
+    for row in rows:
+        found = markup_warnings_for(
+            {"comment": row["comment"]} if row.get("comment") else {}
+        )
+        if found:
+            flagged.append(
+                f"`{row['submission_id']}`: " + "; ".join(found["comment"])
+            )
+    if not flagged:
+        return []
+    return [
+        f"⚠️ Formatting warnings in {len(flagged)} comment(s) (advisory, the "
+        "write is not blocked; Gradescope renders comments as Markdown with "
+        "KaTeX math): " + " | ".join(flagged)
+    ]
 
 
 def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
@@ -1962,6 +2052,7 @@ def _batch_preview(course_id: str, question_id: str, rows: list[dict]) -> str:
             f"{CONFIDENCE_REVIEW_UP_TO} and will be flagged NEEDS HUMAN REVIEW: "
             + ", ".join(f"`{s}`" for s in review)
         )
+    details.extend(_batch_markup_notes([row for row, _props, _plan in planned]))
     return (
         write_confirmation_required("apply_grade_batch", details)
         + "\n\n"
@@ -2004,7 +2095,13 @@ def apply_grade_batch(
     projected score, and rows that are already graded. On
     ``confirm_write=True`` returns an execution summary (succeeded / failed
     / skipped-by-confidence / skipped-already-graded / needs-review) with
-    per-row scores read back from Gradescope.
+    per-row scores read back from Gradescope. A saved row counts as
+    verified only when the read-back shows the rubric items, adjustment
+    and comment sent and a score equal to the projected score (within
+    1e-6); otherwise it is listed under "Needs check". Comments with
+    suspicious Markdown/KaTeX math delimiters (e.g. ``$$`` doubled) get an
+    advisory formatting warning in the preview and the result; the write
+    is never blocked by it.
 
     Overwrite approval is per row. Each row is re-read right before its
     write; a row that is graded then is written only if it carries
@@ -2139,11 +2236,13 @@ def apply_grade_batch(
         except Exception as e:
             failed.append((sid, f"{type(e).__name__}: {e}"))
 
-    mismatched = [
-        (sid, readback["mismatches"])
-        for sid, _score, _plan, readback in succeeded
-        if readback.get("mismatches")
-    ]
+    # A saved row is verified only when the read-back matches what was sent
+    # (rubric items, adjustment, comment) AND shows the projected score.
+    needs_check = {
+        sid: problems
+        for sid, _score, plan, readback in succeeded
+        if (problems := _readback_problems(plan, readback))
+    }
 
     lines = [
         f"## Batch grade result for question `{question_id}`",
@@ -2167,8 +2266,15 @@ def apply_grade_batch(
             f"- **needs human review (confidence {CONFIDENCE_REJECT_BELOW}–"
             f"{CONFIDENCE_REVIEW_UP_TO}):** {len(review)}"
         )
-    if mismatched:
-        lines.append(f"- **read-back mismatches:** {len(mismatched)}")
+    if succeeded:
+        lines.append(
+            "- **verified (read back: rubric items, adjustment, comment and "
+            f"score match):** {len(succeeded) - len(needs_check)}"
+        )
+    if needs_check:
+        lines.append(
+            f"- **needs check (saved, read-back does not confirm it):** {len(needs_check)}"
+        )
     if succeeded:
         lines.append("")
         lines.append("### Saved")
@@ -2208,14 +2314,26 @@ def apply_grade_batch(
         )
         for sid, cf in review:
             lines.append(f"- `{sid}`: confidence={cf:.2f}")
-    if mismatched:
+    if needs_check:
         lines.append("")
         lines.append(
-            "### ⚠️ Read-back mismatches (Gradescope holds something other "
-            "than what was sent)"
+            "### ⚠️ Needs check (saved, but the read-back does not confirm "
+            "the grade sent and the projected score)"
         )
-        for sid, mismatches in mismatched:
-            lines.append(f"- `{sid}`: " + "; ".join(mismatches))
+        lines.append(
+            "Re-read these with `tool_get_submission_grading_context` before "
+            "re-sending anything: the save was accepted."
+        )
+        for sid, problems in needs_check.items():
+            lines.append(f"- `{sid}`: " + "; ".join(problems))
+    markup = _batch_markup_notes([
+        {"submission_id": sid, "comment": plan["comment"]}
+        for sid, _score, plan, _readback in succeeded
+    ])
+    if markup:
+        lines.append("")
+        lines.append("### ⚠️ Formatting warnings (advisory)")
+        lines.extend(f"- {note}" for note in markup)
     if failed:
         lines.append("")
         lines.append("### Failed")
@@ -2365,6 +2483,7 @@ def create_rubric_item(
                 "⚠️ an item with this description already exists: "
                 + _describe_items(duplicates)
             )
+        details.extend(_markup_notes({"description": description}))
         details.append("⚠️ The new item becomes available for ALL submissions of this question.")
         return write_confirmation_required("create_rubric_item", details)
 
@@ -2401,13 +2520,14 @@ def create_rubric_item(
             f"{(resp.text or '')[:200]}"
         )
     created_weight = _to_float(item.get("weight"))
-    return (
-        f"✅ Rubric item created!\n"
-        f"**ID:** `{item['id']}`\n"
-        f"**Description:** {item.get('description', description)}\n"
-        f"**Weight:** {item.get('weight', weight_f)}\n"
-        f"**Effect:** {_weight_effect(created_weight if created_weight is not None else weight_f, scoring_type)}"
-    )
+    return "\n".join([
+        "✅ Rubric item created!",
+        f"**ID:** `{item['id']}`",
+        f"**Description:** {item.get('description', description)}",
+        f"**Weight:** {item.get('weight', weight_f)}",
+        f"**Effect:** {_weight_effect(created_weight if created_weight is not None else weight_f, scoring_type)}",
+        *_markup_notes({"description": description}),
+    ])
 
 
 def list_question_submissions(
@@ -2858,6 +2978,7 @@ def update_rubric_item(
             details.append(f"new_weight={weight}")
             details.append(f"effect: {_weight_effect(weight_f, scoring_type)}")
         details.append(f"request: PUT {path}")
+        details.extend(_markup_notes({"description": description}))
         details.append("⚠️ This will affect ALL submissions with this rubric item applied.")
         return write_confirmation_required("update_rubric_item", details)
 
@@ -2913,6 +3034,7 @@ def update_rubric_item(
         )
     if weight_f is not None:
         lines.append(f"**Effect:** {_weight_effect(weight_f, scoring_type)}")
+    lines.extend(_markup_notes({"description": description}))
     lines.append("⚠️ All submissions with this item have been recalculated.")
     return "\n".join(lines)
 

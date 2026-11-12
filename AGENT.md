@@ -50,8 +50,10 @@ simple CRUD wrappers.
   - `gs_tool(annotations)` registers a tool: it wraps the function in
     `with_session_recovery`, then `_signal_errors` (handled-failure text
     becomes `isError: true`; an escaped `AuthError` becomes an
-    `Authentication error: ...` result), and registers it with the
-    annotations, a title and `structured_output=False`.
+    `Authentication error: ...` result; a successful result whose whole
+    text is one JSON object also gets it as `structuredContent`, see
+    `structured_json`), and registers it with the annotations, a title and
+    `structured_output=False` (no `outputSchema`).
   - Annotation helpers: `read_only(title)`, `gradescope_write(title,
     idempotent=...)` and `local_cache_write(title)`.
   - `gs_resource(uri)` registers a resource with session recovery; failure
@@ -416,7 +418,12 @@ All tools are `openWorldHint=true`.
   `isError: true` and unchanged text
 - Schema validation failures come back as
   `Error executing tool <name>: ... validation error ...` with `isError: true`
-- Tools publish no `outputSchema` and return text only
+- Tools publish no `outputSchema`. Every result has text content; a
+  successful result whose whole text is one JSON object (at most
+  `MAX_STRUCTURED_TEXT`, 1 MiB; no `NaN`) also carries that object as
+  `structuredContent`. Markdown, error results, and JSON followed by a
+  session-expiry notice stay text only (so the notice cannot be lost by a
+  client that reads only `structuredContent`)
 
 ### ID semantics
 - All IDs are ASCII digit strings without leading zeros (numbers accepted
@@ -493,6 +500,7 @@ Current test files:
 - `tests/test_round3_runtime.py`
 - `tests/test_server_mcp.py`
 - `tests/test_session_recovery.py`
+- `tests/test_structured_output.py`
 - `tests/test_workflow_fixes.py`
 - `tests/test_write_safety.py`
 

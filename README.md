@@ -567,9 +567,11 @@ existing computed scores.
   members.
 
 ### Error signalling
-- Tools return text: markdown, or a JSON document when a tool offers
-  `output_format="json"`. They publish no `outputSchema` and return no
-  `structuredContent`.
+- Tools return text: markdown, or a JSON document (with
+  `output_format="json"`, and from the plan/operation tools). When the
+  whole text of a successful result is one JSON object, the same object is
+  also returned as `structuredContent`; markdown and error results are text
+  only. Tools publish no `outputSchema`.
 - A handled failure starts with `Error`, `Authentication error` or `❌` (a
   write Gradescope rejected) and is returned with `isError: true`; the text
   is unchanged.
@@ -696,7 +698,9 @@ existing computed scores.
   `comment`, `confidence` and `overwrite`. The preview loads every row and
   marks already graded rows as SKIPPED (or OVERWRITTEN when the row has
   `"overwrite": true`); execution re-reads each row before saving it and
-  reports the scores read back from Gradescope. Leave rows the preview
+  reports the scores read back from Gradescope; a row counts as verified
+  only when the read-back matches the grade sent and the projected score,
+  otherwise it is listed under "Needs check". Leave rows the preview
   marked SKIPPED out of the confirmed call: execution cannot know what the
   preview showed, so such a row is written if its grade was cleared in
   the meantime.
@@ -1158,6 +1162,7 @@ gradescope-mcp/
     ├── test_rubric_plans.py
     ├── test_server_mcp.py
     ├── test_session_recovery.py
+    ├── test_structured_output.py
     ├── test_workflow_fixes.py
     └── test_write_safety.py
 ```

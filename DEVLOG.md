@@ -6,6 +6,34 @@
 
 ---
 
+## 2026-11-11: Grading feedback — structuredContent, markup preflight, score check
+
+From a 127-student grading run's feedback.
+
+1. **structuredContent.** `server._signal_errors` now also returns a
+   `CallToolResult` with `structuredContent` when a successful tool's whole
+   text is one JSON object (`server.structured_json`: objects only, no
+   `NaN`/`Infinity`, at most `MAX_STRUCTURED_TEXT` = 1 MiB). The text is
+   unchanged and tools still publish no `outputSchema`
+   (`structured_output=False`, so the SDK passes the result through).
+   Markdown, errors, and JSON followed by the session-expiry notice stay
+   text only, so a structured-only client cannot drop that notice.
+2. **Markup preflight.** `apply_grade`, `apply_grade_batch`,
+   `create_rubric_item` and `update_rubric_item` add advisory
+   `markup_check` warnings (doubled `$$`, unclosed `$`, unbalanced braces)
+   for the comment / description they send, in the preview and the
+   result. Writes are never blocked.
+3. **Score check.** `apply_grade` and `apply_grade_batch` count a saved
+   grade as verified only when the read-back matches the rubric items,
+   adjustment and comment sent and its score equals the projected score
+   (tolerance 1e-6, `_readback_problems`); otherwise it is reported as
+   "Needs check" (the batch's old "Read-back mismatches" section is folded
+   into it). `_read_back_grade`'s return shape is unchanged.
+
+- **1051 automated tests**, all passing
+
+---
+
 ## Session 15 — 2026-10-05: Issues #8 (credential refresh) and #7 (LMS gradebook CSV)
 
 ### What was done
