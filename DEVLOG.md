@@ -6,6 +6,14 @@
 
 ---
 
+## Grading previews and page links
+
+Adapted #2, #3 and #4 to the current grade planner. Markdown image links
+are opt-in, capped scores show their original value, and full-credit writes
+resolve and display the checked item and zero adjustment. Scoring-direction
+changes preview the affected items (#23). Added the pre-submission duplicate
+rubric preview regression from #22.
+
 ## 2026-11-11: Codex review fixes and leaner agent guidance
 
 Codex review of the grading-feedback branch found four real problems, all fixed

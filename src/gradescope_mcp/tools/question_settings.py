@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 from gradescope_mcp.tools.safety import serialize_question_write, question_write_lock
 from gradescope_mcp.auth import AuthError, get_connection
-from gradescope_mcp.tools.grading_ops import _load_question_rubric_context
+from gradescope_mcp.tools.grading_ops import _describe_items, _load_question_rubric_context, _resolve_rubric
 from gradescope_mcp.tools.grading_workflow import _fetch_assignment_questions
 from gradescope_mcp.tools.safety import serialized_write, write_confirmation_required
 
@@ -119,11 +119,18 @@ def set_question_scoring(
                     if k != "weight"
                 }
             }
+            preview_state = dict(before)
+            if before["scoring_type"] != after["scoring_type"]:
+                affected = [item for item in _resolve_rubric(ctx["props"])
+                            if float(item["weight"]) != 0]
+                if affected:
+                    direction = "will add points" if scoring_type == "positive" else "will deduct points"
+                    preview_state[direction] = _describe_items(affected)
             preview = _preview(
                 "set_question_scoring",
                 course_id,
                 question_id,
-                before,
+                preview_state,
                 payload,
                 expected_revision,
                 confirm_write,
