@@ -266,7 +266,7 @@ def test_get_submission_grading_context_markdown_shows_real_pages_only(monkeypat
     assert "Rubric items **deduct** points" in result
     assert "- **next_submission**: qid=`2`, sid=`100`" in result
     assert "**Relevant pages:** [3]" in result
-    assert "- Page 2: [View](https://example.com/page2.jpg)" in result
+    assert "- Page 2" in result and "https://example.com/page2.jpg" not in result
     assert "- _...and 1 more pages_" in result
     assert "missing_pdf" not in result
 

@@ -292,7 +292,7 @@ def _plan_row(course_id, question_id, row, evidence):
         if problem:
             raise ValueError(problem)
         plan = grading._plan_grade_write(
-            props, row["rubric_item_ids"], row["point_adjustment"], row["comment"]
+            props, row["rubric_item_ids"], row["point_adjustment"], row["comment"], row["full_credit"]
         )
     except AuthError:
         raise
@@ -553,6 +553,7 @@ def _process_row(run, index):
             original["rubric_item_ids"],
             original["point_adjustment"],
             original["comment"],
+            original.get("full_credit", False),
         )
     except ValueError as exc:
         run.fail(row, "stale", str(exc), stale_reason=str(exc))
