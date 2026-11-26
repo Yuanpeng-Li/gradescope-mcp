@@ -6,6 +6,10 @@
 
 ---
 
+## Staff uploads (#16)
+
+Replacement forms must identify the approved submission. A successful write requires the new submission ID in a fresh scores export for the intended student alone. Tests use an offline course with two students.
+
 ## 2026-11-11: Codex review fixes and leaner agent guidance
 
 Codex review of the grading-feedback branch found four real problems, all fixed

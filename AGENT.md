@@ -13,7 +13,7 @@ simple CRUD wrappers.
 
 ## Current Snapshot
 
-- 76 tools (34 read-only, 27 Gradescope writes, 15 local cache writes)
+- 78 tools (35 read-only, 28 Gradescope writes, 15 local cache writes)
 - 3 resources (1 static, 2 URI templates)
 - 7 prompts
 - Offline pytest suite (the current count is recorded in `DEVLOG.md`)
@@ -274,6 +274,7 @@ Grouped by annotation class. `tests/test_server_mcp.py` pins these sets.
 33. `tool_get_autograder_status`
 
 34. `tool_get_autograder_results`
+35. `tool_inspect_submission_upload_form`
 
 ### Gradescope writes
 `destructiveHint=true`, exactly the tools with `confirm_write`.
@@ -285,78 +286,79 @@ the first call graded the members (without `overwrite_graded`, or with
 an `expected_graded_ids` that no longer matches the graded members);
 nothing is sent.
 
-35. `tool_upload_submission`
-36. `tool_set_extension`
-37. `tool_modify_assignment_dates`
-38. `tool_rename_assignment`
-39. `tool_update_autograder_image`
-40. `tool_apply_grade`
-41. `tool_apply_grade_batch`
-42. `tool_create_rubric_item`
-43. `tool_update_rubric_item`
-44. `tool_delete_rubric_item`
-45. `tool_grade_answer_group`
+36. `tool_upload_submission`
+37. `tool_upload_submission_for_student`
+38. `tool_set_extension`
+39. `tool_modify_assignment_dates`
+40. `tool_rename_assignment`
+41. `tool_update_autograder_image`
+42. `tool_apply_grade`
+43. `tool_apply_grade_batch`
+44. `tool_create_rubric_item`
+45. `tool_update_rubric_item`
+46. `tool_delete_rubric_item`
+47. `tool_grade_answer_group`
 
-46. `tool_update_assignment_outline`
+48. `tool_update_assignment_outline`
 
-47. `tool_set_question_scoring`
-48. `tool_set_question_grading_method`
-49. `tool_create_answer_group`
+49. `tool_set_question_scoring`
+50. `tool_set_question_grading_method`
+51. `tool_create_answer_group`
 
-50. `tool_execute_grade_plan`
+52. `tool_execute_grade_plan`
 
-51. `tool_execute_assignment_plan`
+53. `tool_execute_assignment_plan`
 
-52. `tool_execute_rubric_plan`
+54. `tool_execute_rubric_plan`
 
-53. `tool_resume_rubric_plan`
+55. `tool_resume_rubric_plan`
 
-54. `tool_patch_assignment_outline`
+56. `tool_patch_assignment_outline`
 
-55. `tool_respond_regrade_request`
+57. `tool_respond_regrade_request`
 
-56. `tool_modify_extension_options`
+58. `tool_modify_extension_options`
 
-57. `tool_set_answer_group_members`
+59. `tool_set_answer_group_members`
 
-58. `tool_execute_assignment_clone`
+60. `tool_execute_assignment_clone`
 
-59. `tool_execute_autograder_plan`
+61. `tool_execute_autograder_plan`
 
-60. `tool_merge_answer_groups`
+62. `tool_merge_answer_groups`
 
-61. `tool_resume_operation`
+63. `tool_resume_operation`
 
 ### Local cache writes
 `readOnlyHint=false`, `destructiveHint=false`: they read Gradescope and
 write only to the private cache.
 
-62. `tool_prepare_grading_artifact`
-63. `tool_cache_relevant_pages`
-64. `tool_prepare_answer_key`
-65. `tool_export_lms_gradebook`
+64. `tool_prepare_grading_artifact`
+65. `tool_cache_relevant_pages`
+66. `tool_prepare_answer_key`
+67. `tool_export_lms_gradebook`
 
-66. `tool_prepare_grade_plan`
+68. `tool_prepare_grade_plan`
 
-67. `tool_cancel_operation`
+69. `tool_cancel_operation`
 
-68. `tool_prepare_assignment_plan`
+70. `tool_prepare_assignment_plan`
 
-69. `tool_prepare_rubric_plan`
+71. `tool_prepare_rubric_plan`
 
-70. `tool_preview_outline_regions`
+72. `tool_preview_outline_regions`
 
-71. `tool_download_submission_files`
+73. `tool_download_submission_files`
 
-72. `tool_archive_assignment`
+74. `tool_archive_assignment`
 
-73. `tool_prepare_choice_bonus_plan`
+75. `tool_prepare_choice_bonus_plan`
 
-74. `tool_prepare_assignment_clone`
+76. `tool_prepare_assignment_clone`
 
-75. `tool_prepare_autograder_plan`
+77. `tool_prepare_autograder_plan`
 
-76. `tool_poll_operation`
+78. `tool_poll_operation`
 
 All tools are `openWorldHint=true`.
 
@@ -642,3 +644,5 @@ Grade plans (`tools/grading_plans.py`):
   other row is dispatched. Cancellation is permanent for an operation.
 - Results are compact (`attention_rows`, capped at 20, plus
   `attention_omitted`); `verbose=True` returns full rows. Question writes use shared thread/filesystem locks, requiring a valid private cache and coordinating only processes using that root. Pre-submission rubrics use AssignmentRubric props. Plan preparation and new archives are non-idempotent local operations. Autograder adapters are capability-gated to discovered forms; live programming-assignment validation remains pending. See README lifecycle matrix for supported boundaries.
+
+- `tests/test_staff_upload.py` covers staff-upload form targeting and per-student ownership verification.
