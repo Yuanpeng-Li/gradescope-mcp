@@ -49,7 +49,7 @@ Gradescope data and still decide every change themselves.
 | 📊 **Review & export** | Progress, statistics, anomaly review, score export, Canvas/Brightspace gradebook CSV, archives |
 | 🛡️ **Safety first** | Preview before every write, revision checks, untrusted-text fencing, private local cache |
 
-**At a glance:** 76 MCP tools (34 read-only · 27 that write to Gradescope ·
+**At a glance:** 78 MCP tools (35 read-only · 28 that write to Gradescope ·
 15 that only write to the private local cache), 3 MCP resources and
 7 MCP prompts, plus a ready-made
 [assisted-grading skill](#assisted-grading-skill).
@@ -232,6 +232,8 @@ Gradescope).
 | `tool_list_question_submissions` | read-only | Question Submission IDs; `filter` = `all` / `ungraded` / `graded` (`graded: null` rows, state unknown, appear only under `all`) |
 | `tool_sample_question_submissions` | read-only | Reproducible sample for human/agent calibration |
 | `tool_get_assignment_graders` | read-only | Staff who last graded a question's submissions, with counts (not the assigned graders) |
+| `tool_inspect_submission_upload_form` | read-only | Inspect staff upload forms for a specific assignment or submission |
+| `tool_upload_submission_for_student` | write | Upload for a roster student using a single matching form and verify ownership in the scores export |
 | `tool_upload_submission` | write | Upload local files as a new submission from the logged-in account (path restrictions and success check below) |
 | `tool_download_submission_files` | local cache | Validated original attachments, page images and batch ZIP |
 | `tool_inspect_submission_pdf` | read-only | Check PDF page counts and required pages |
@@ -1164,6 +1166,7 @@ gradescope-mcp/
     ├── test_common.py
     ├── test_course_list_parser.py
     ├── test_dates_extensions_submissions.py
+    ├── test_staff_upload.py
     ├── test_docs_consistency.py
     ├── test_extensions_and_answer_key.py
     ├── test_grade_executor.py

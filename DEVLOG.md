@@ -6,6 +6,10 @@
 
 ---
 
+## Staff uploads (#16)
+
+Replacement forms must identify the approved submission. A successful write requires the new submission ID in a fresh scores export for the intended student alone. Tests use an offline course with two students.
+
 ## Grading previews and page links
 
 Adapted #2, #3 and #4 to the current grade planner. Markdown image links
