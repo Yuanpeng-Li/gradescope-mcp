@@ -6,6 +6,10 @@
 
 ---
 
+## Browser-session authentication (#17)
+
+Cookie validation requires the HTTPS account page and an account container. A redirect to institutional sign-in requires a fresh export. Coverage uses offline responses.
+
 ## Grading previews and page links
 
 Adapted #2, #3 and #4 to the current grade planner. Markdown image links

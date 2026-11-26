@@ -25,9 +25,10 @@ warning instead.
 Credentials are re-read later as well. When ``main()`` loaded the files with
 ``remember_credentials=True``, ``refresh_credentials()`` (called by
 ``auth.get_connection()`` before every login attempt) reads
-``GRADESCOPE_EMAIL`` and ``GRADESCOPE_PASSWORD`` from the same files again,
-so fixing a password in ``.env`` takes effect on the next tool call instead
-of after a restart. Only the credential variables that came from ``.env`` at
+``GRADESCOPE_EMAIL``, ``GRADESCOPE_PASSWORD`` and the SSO cookie variables
+``GRADESCOPE_COOKIE_HEADER`` / ``GRADESCOPE_SESSION_COOKIE`` from the same
+files again, so fixing a password or exporting a fresh cookie into ``.env``
+takes effect on the next tool call instead of after a restart. Only the credential variables that came from ``.env`` at
 startup are refreshed; ones set in the process environment (an MCP client's
 ``env`` block) still win and need a restart to change.
 """
@@ -41,7 +42,12 @@ from pathlib import Path
 
 from dotenv import dotenv_values, load_dotenv
 
-CREDENTIAL_KEYS = ("GRADESCOPE_EMAIL", "GRADESCOPE_PASSWORD")
+CREDENTIAL_KEYS = (
+    "GRADESCOPE_EMAIL",
+    "GRADESCOPE_PASSWORD",
+    "GRADESCOPE_COOKIE_HEADER",
+    "GRADESCOPE_SESSION_COOKIE",
+)
 
 
 @dataclass(frozen=True)
