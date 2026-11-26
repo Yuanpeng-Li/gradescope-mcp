@@ -241,3 +241,19 @@ def test_scoring_url_rejects_other_question(scoring, monkeypatch):
         "1", "2", "positive", False
     )
     assert not scoring[1]
+
+
+def test_direction_change_previews_affected_items_and_binds_them(scoring, monkeypatch):
+    load = qs._load_question_rubric_context
+    items = [{"id": 1, "description": "Correct", "weight": 0},
+             {"id": 2, "description": "Units", "weight": 2}]
+    def with_items(*args):
+        ctx = load(*args)
+        ctx["props"]["rubric_items"] = items
+        return ctx
+    monkeypatch.setattr(qs, "_load_question_rubric_context", with_items)
+    preview = qs.set_question_scoring("1", "2", "positive")
+    assert "will add points" in preview and "Units" in preview and "Correct" not in preview
+    items[1]["weight"] = 3
+    assert "changed" in qs.set_question_scoring("1", "2", "positive", expected_revision=revision(preview), confirm_write=True)
+    assert not scoring[1]

@@ -486,7 +486,7 @@ def test_grading_context_passes_output_format(monkeypatch) -> None:
         "course_id": "1", "question_id": "2", "submission_id": "3", "output_format": "json",
     })
 
-    assert seen["args"] == ("1", "2", "3", "json")
+    assert seen["args"] == ("1", "2", "3", "json", False)
 
 
 def test_batch_rows_are_typed_and_strict() -> None:
@@ -498,7 +498,7 @@ def test_batch_rows_are_typed_and_strict() -> None:
     assert row["required"] == ["submission_id"]
     assert set(row["properties"]) == {
         "submission_id", "rubric_item_ids", "point_adjustment", "comment", "confidence",
-        "overwrite",
+        "overwrite", "full_credit",
     }
     # Overwrite approval is per row; there is no batch-wide flag.
     assert "overwrite_graded" not in schema["properties"]
