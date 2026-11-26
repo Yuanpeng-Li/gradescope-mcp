@@ -6,6 +6,10 @@
 
 ---
 
+## Browser-session authentication (#17)
+
+Cookie validation requires the HTTPS account page and an account container. A redirect to institutional sign-in requires a fresh export. Coverage uses offline responses.
+
 ## 2026-11-11: Codex review fixes and leaner agent guidance
 
 Codex review of the grading-feedback branch found four real problems, all fixed
