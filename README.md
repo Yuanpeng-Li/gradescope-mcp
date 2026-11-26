@@ -243,7 +243,7 @@ Gradescope).
 
 | Tool | Kind | Description |
 |------|------|-------------|
-| `tool_get_submission_grading_context` | read-only | Rubric (IDs, applied state), score, typed answer, crop pages ±1; `output_format="json"` available |
+| `tool_get_submission_grading_context` | read-only | Rubric (IDs, applied state), score, typed answer, crop pages ±1 (signed Markdown links with `include_page_urls=True`); `output_format="json"` available |
 | `tool_get_next_ungraded` | read-only | Grading context of the next ungraded submission of the same question |
 | `tool_get_question_rubric` | read-only | Rubric items and scoring type without a submission ID |
 | `tool_get_grading_progress` | read-only | Per-question graded counts, numbered as in the outline |
@@ -671,6 +671,13 @@ existing computed scores.
   nothing.
 
 ### Grades and confidence
+
+- On a negative-scoring question, `full_credit=True` selects the unique
+  zero-point item and explicitly sets the adjustment to zero. The single and
+  batch previews show the item and final score. Unknown scoring modes and
+  ambiguous benchmarks require an explicit grade.
+- A single or batch preview reports both the raw and capped score when
+  the question floor or ceiling changes the result.
 - `rubric_item_ids` is the exact set of items to check; every other item is
   unchecked. In `tool_apply_grade` and batch rows, `null` keeps the current
   rubric state and `[]` clears it. In `tool_grade_answer_group` the list is

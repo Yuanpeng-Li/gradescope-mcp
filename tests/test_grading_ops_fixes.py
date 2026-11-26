@@ -1178,6 +1178,9 @@ def test_context_links_the_crop_page_and_neighbours(monkeypatch) -> None:
     markdown = grading_ops.get_submission_grading_context(C, Q, "500")
     as_json = json.loads(grading_ops.get_submission_grading_context(C, Q, "500", "json"))
 
+    assert "https://img/" not in markdown
+    assert "- Page 7 (crop region)" in markdown
+    markdown = grading_ops.get_submission_grading_context(C, Q, "500", include_page_urls=True)
     assert "**Relevant pages:** [7]" in markdown
     assert "- Page 6: [View](https://img/p6.jpg)" in markdown
     assert "- Page 7 (crop region): [View](https://img/p7.jpg)" in markdown
@@ -1195,7 +1198,7 @@ def test_context_without_crop_links_every_real_page(monkeypatch) -> None:
 
     assert "### Submission Pages (4)" in markdown
     assert [line for line in markdown.splitlines() if line.startswith("- Page")] == [
-        f"- Page {i}: [View](https://img/p{i}.jpg)" for i in range(2, 6)
+        f"- Page {i}" for i in range(2, 6)
     ]
     assert "more pages" not in markdown
 
@@ -2462,3 +2465,56 @@ def test_group_expected_graded_ids_schema_takes_ids_only() -> None:
         anyio.run(server.mcp.call_tool, "tool_grade_answer_group", {
             **GROUP_OVERWRITE, "expected_graded_ids": ["abc"],
         })
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_full_credit_previews_and_writes_zero_item_and_adjustment(monkeypatch, batch):
+    world = FakeGradescope({"500": _sub(evaluation={"points": -2})}).install(monkeypatch)
+    world.score_after_save["500"] = 10
+    row = {"submission_id": "500", "full_credit": True}
+    def grade(confirm):
+        if batch:
+            return grading_ops.apply_grade_batch(C, Q, [row], confirm_write=confirm)
+        return grading_ops.apply_grade(C, Q, **row, confirm_write=confirm)
+    preview = grade(False)
+    assert "Correct" in preview and "10/10" in preview and not world.writes()
+    grade(True)
+    saved = world.saved["500"]
+    assert saved["rubric_items"]["100"] == {"score": "true"}
+    assert saved["question_submission_evaluation"]["points"] == 0
+
+
+@pytest.mark.parametrize("scoring,weights", [(None, [0]), ("positive", [0]), ("negative", [0, 0])])
+def test_full_credit_refuses_ambiguous_scoring_or_benchmark(monkeypatch, scoring, weights):
+    world = FakeGradescope({"500": _sub()}, question={"scoring_type": scoring},
+                           rubric=[{"id": i+1, "weight": w} for i,w in enumerate(weights)]).install(monkeypatch)
+    assert "Error:" in grading_ops.apply_grade(C, Q, "500", full_credit=True, confirm_write=True)
+    assert not world.writes()
+
+
+def test_both_previews_report_uncapped_score(monkeypatch):
+    world = FakeGradescope({"500": _sub()}).install(monkeypatch)
+    row = {"submission_id": "500", "point_adjustment": 3}
+    for preview in (grading_ops.apply_grade(C, Q, **row), grading_ops.apply_grade_batch(C, Q, [row])):
+        assert "ceiling clamps 13 to 10" in preview
+    assert not world.writes()
+
+
+def test_pre_submission_duplicate_preview_from_editor_link(monkeypatch):
+    editor = {"course": {"id": 1}, "assignment": {"id": 8},
+              "questions": [{"id": 2, "scoring_type": "negative", "weight": "2.0"}],
+              "rubric_items": [{"id": 21, "question_id": 2, "description": "Incorrect", "weight": 2}],
+              "urls": {"question_urls": {"2": {}}}}
+    def get(url, **kwargs):
+        if url.endswith("/rubric/edit"):
+            data = html.escape(json.dumps(editor), quote=True)
+            body = f'<div data-react-class="AssignmentRubric" data-react-props="{data}"></div>'
+        elif url.endswith("/submissions"):
+            body = '<a href="/courses/1/assignments/8/rubric/edit">Create Rubric</a>'
+        else:
+            return SimpleNamespace(status_code=404, text="", url=url)
+        return SimpleNamespace(status_code=200, text=body, url=url)
+    conn = SimpleNamespace(gradescope_base_url=BASE, session=SimpleNamespace(get=get))
+    monkeypatch.setattr(grading_ops, "get_connection", lambda: conn)
+    result = grading_ops.create_rubric_item(C, Q, "incorrect", 2)
+    assert "already exists" in result
